@@ -25,12 +25,15 @@ class TestWobbleWeights:
         assert ('A', 'T') in WOBBLE_W_PRIMER
         assert ('G', 'C') in WOBBLE_W_PRIMER
 
-    def test_ss_wobble_no_wc_pairs(self):
-        """WOBBLE_W_SS must NOT have WC complement pairs (same-strand comparison)."""
+    def test_ss_wobble_no_pure_wc_pairs(self):
+        """WOBBLE_W_SS should not contain (A,T), (G,C), or (C,G).
+
+        Note: (T,A) IS present because (T,T) is a wobble pair in
+        hybridization coords → same-strand (T, complement(T)) = (T,A).
+        """
         assert ('A', 'T') not in WOBBLE_W_SS
         assert ('G', 'C') not in WOBBLE_W_SS
         assert ('C', 'G') not in WOBBLE_W_SS
-        assert ('T', 'A') not in WOBBLE_W_SS
 
 
 class TestWobbleMismatchCount:
