@@ -1,39 +1,36 @@
 """Tests for wobble-aware probe matching utilities."""
 
 import pytest
-from qprimer_designer.utils.probe import (
-    WOBBLE_W_PROBE,
+from qprimer_designer.utils.wobble import (
+    WOBBLE_W_SS,
     WOBBLE_W_PRIMER,
+    WOBBLE_WEIGHT,
     wobble_mismatch_count,
     wobble_mismatch_count_gapped,
     wobble_mismatch_count_cols,
-    build_match_string,
-    slide_probe_match,
 )
+from qprimer_designer.utils.probe import build_match_string, slide_probe_match
 
 
 class TestWobbleWeights:
     """Verify wobble weight dictionaries."""
 
-    def test_probe_wobble_only_two_pairs(self):
-        """WOBBLE_W_PROBE should only have (G,A) and (T,C) wobble pairs."""
-        assert set(WOBBLE_W_PROBE.keys()) == {('G', 'A'), ('T', 'C')}
-
-    def test_probe_wobble_values(self):
-        assert WOBBLE_W_PROBE[('G', 'A')] == 0.50
-        assert WOBBLE_W_PROBE[('T', 'C')] == 0.50
+    def test_ss_wobble_values(self):
+        """WOBBLE_W_SS entries should all equal WOBBLE_WEIGHT."""
+        for pair, val in WOBBLE_W_SS.items():
+            assert val == WOBBLE_WEIGHT
 
     def test_primer_wobble_has_wc_pairs(self):
         """WOBBLE_W_PRIMER should have WC pairs (used for hybridization scoring)."""
         assert ('A', 'T') in WOBBLE_W_PRIMER
         assert ('G', 'C') in WOBBLE_W_PRIMER
 
-    def test_probe_wobble_no_wc_pairs(self):
-        """WOBBLE_W_PROBE must NOT have WC complement pairs (same-strand comparison)."""
-        assert ('A', 'T') not in WOBBLE_W_PROBE
-        assert ('G', 'C') not in WOBBLE_W_PROBE
-        assert ('C', 'G') not in WOBBLE_W_PROBE
-        assert ('T', 'A') not in WOBBLE_W_PROBE
+    def test_ss_wobble_no_wc_pairs(self):
+        """WOBBLE_W_SS must NOT have WC complement pairs (same-strand comparison)."""
+        assert ('A', 'T') not in WOBBLE_W_SS
+        assert ('G', 'C') not in WOBBLE_W_SS
+        assert ('C', 'G') not in WOBBLE_W_SS
+        assert ('T', 'A') not in WOBBLE_W_SS
 
 
 class TestWobbleMismatchCount:
@@ -52,25 +49,26 @@ class TestWobbleMismatchCount:
         assert indels == 0
 
     def test_wobble_ga(self):
-        """G->A wobble on same strand = 0.50 penalty."""
+        """G->A wobble on same strand = 0.20 penalty (1.0 - 0.80)."""
         mm, indels = wobble_mismatch_count("GATG", "AATG")
-        assert mm == 0.50
+        assert mm == pytest.approx(1.0 - WOBBLE_WEIGHT)
         assert indels == 0
 
     def test_wobble_tc(self):
-        """T->C wobble on same strand = 0.50 penalty."""
+        """T->C wobble on same strand = 0.20 penalty."""
         mm, indels = wobble_mismatch_count("TATG", "CATG")
-        assert mm == 0.50
+        assert mm == pytest.approx(1.0 - WOBBLE_WEIGHT)
         assert indels == 0
 
     def test_mixed_mismatches(self):
         """Mix of wobble and full mismatches."""
-        # pos0: G vs A = 0.50 wobble
+        # pos0: G vs A = wobble penalty
         # pos1: A vs A = 0.0 match
-        # pos2: T vs C = 0.50 wobble
+        # pos2: T vs C = wobble penalty
         # pos3: A vs C = 1.0 full mismatch
+        expected = 2 * (1.0 - WOBBLE_WEIGHT) + 1.0
         mm, indels = wobble_mismatch_count("GATA", "AACC")
-        assert mm == pytest.approx(2.0)
+        assert mm == pytest.approx(expected)
         assert indels == 0
 
     def test_wc_complement_is_full_mismatch(self):
@@ -84,9 +82,9 @@ class TestWobbleMismatchCount:
         assert mm == 1.0
 
     def test_single_wobble_penalty_value(self):
-        """Verify exact penalty: 1.0 - 0.50 = 0.50."""
+        """Verify exact penalty: 1.0 - WOBBLE_WEIGHT."""
         mm, _ = wobble_mismatch_count("G", "A")
-        assert mm == pytest.approx(0.50)
+        assert mm == pytest.approx(1.0 - WOBBLE_WEIGHT)
 
 
 class TestWobbleMismatchCountGapped:
@@ -123,14 +121,14 @@ class TestWobbleMismatchCountGapped:
         probe = "GATG"
         target_row = "AATG"
         mm, indels = wobble_mismatch_count_gapped(probe, target_row, 0, 4)
-        assert mm == pytest.approx(0.50)
+        assert mm == pytest.approx(1.0 - WOBBLE_WEIGHT)
         assert indels == 0
 
     def test_mixed_gaps_and_mismatches(self):
         probe = "GATC"
-        target_row = "A-TC"  # pos0: G vs A = 0.50 wobble, pos1: gap = indel, pos2: T=T, pos3: C=C
+        target_row = "A-TC"  # pos0: G vs A = wobble, pos1: gap = indel, pos2: T=T, pos3: C=C
         mm, indels = wobble_mismatch_count_gapped(probe, target_row, 0, 4)
-        assert mm == pytest.approx(0.50)
+        assert mm == pytest.approx(1.0 - WOBBLE_WEIGHT)
         assert indels == 1
 
 
@@ -223,19 +221,21 @@ class TestSlideProbeMatch:
         assert any(h['start_pos'] == 2 for h in rc_hits)
 
     def test_wobble_within_threshold(self):
-        """Wobble mismatch (0.50) should be found with max_mismatches >= 0.50."""
+        """Wobble mismatch should be found with max_mismatches >= penalty."""
         probe = "GATG"
-        target = "AATG"  # G->A = 0.50 wobble
-        hits = slide_probe_match(probe, target, max_mismatches=0.5)
+        target = "AATG"  # G->A = wobble
+        penalty = 1.0 - WOBBLE_WEIGHT
+        hits = slide_probe_match(probe, target, max_mismatches=penalty)
         fwd_hits = [h for h in hits if h['orientation'] == '+']
         assert len(fwd_hits) == 1
-        assert fwd_hits[0]['mismatches'] == pytest.approx(0.50)
+        assert fwd_hits[0]['mismatches'] == pytest.approx(penalty)
 
     def test_wobble_below_threshold(self):
-        """Wobble mismatch should NOT be found with max_mismatches < 0.50."""
+        """Wobble mismatch should NOT be found with max_mismatches < penalty."""
         probe = "GATG"
         target = "AATG"
-        hits = slide_probe_match(probe, target, max_mismatches=0.4)
+        penalty = 1.0 - WOBBLE_WEIGHT
+        hits = slide_probe_match(probe, target, max_mismatches=penalty - 0.01)
         fwd_hits = [h for h in hits if h['orientation'] == '+']
         assert len(fwd_hits) == 0
 
