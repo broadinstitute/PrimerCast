@@ -5,15 +5,7 @@ Wobble definitions and mismatch counting live in wobble.py.
 """
 
 from .sequences import reverse_complement_dna
-from .wobble import (
-    WOBBLE_PAIRS,
-    WOBBLE_WEIGHT,
-    WOBBLE_W,
-    WOBBLE_W_PRIMER,
-    wobble_mismatch_count,
-    wobble_mismatch_count_cols,
-    wobble_mismatch_count_gapped,
-)
+from .wobble import WOBBLE_PAIRS
 
 # Watson-Crick pairs for hybridization display
 _WC_PAIRS = {('A', 'T'), ('T', 'A'), ('G', 'C'), ('C', 'G')}
@@ -53,13 +45,13 @@ def build_match_string(probe_seq, target_complement):
 def slide_probe_match(probe_seq, target_seq, max_mismatches, max_indels=0):
     """Slide a probe across a target sequence, checking both orientations.
 
-    Uses wobble-aware mismatch counting at each position. Returns all
-    positions where effective_mismatches <= max_mismatches.
+    Uses strict Watson-Crick mismatch counting (no wobble tolerance).
+    Returns all positions where mismatches <= max_mismatches.
 
     Args:
         probe_seq: Probe sequence (ungapped, uppercase)
         target_seq: Target sequence (ungapped, uppercase)
-        max_mismatches: Maximum wobble-weighted mismatches allowed
+        max_mismatches: Maximum mismatches allowed
         max_indels: Maximum indels allowed (always 0 for ungapped comparison)
 
     Returns:
@@ -77,13 +69,13 @@ def slide_probe_match(probe_seq, target_seq, max_mismatches, max_indels=0):
                               ('-', reverse_complement_dna(probe_seq).upper())]:
         for i in range(target_len - probe_len + 1):
             window = target_upper[i:i + probe_len]
-            mm, indels = wobble_mismatch_count(seq, window)
-            if mm <= max_mismatches and indels <= max_indels:
+            mm = sum(1.0 for pb, tb in zip(seq, window) if pb != tb)
+            if mm <= max_mismatches:
                 hits.append({
                     'start_pos': i,
                     'orientation': orientation,
-                    'mismatches': round(mm, 2),
-                    'indels': indels,
+                    'mismatches': mm,
+                    'indels': 0,
                 })
 
     return hits

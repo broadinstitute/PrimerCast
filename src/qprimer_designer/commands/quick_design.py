@@ -218,8 +218,18 @@ def generate_primer_variants(aligned_seqs, start_col, primer_len, strand, n_vari
 
 
 def _best_probe_base(template_freqs):
-    """Pick probe base with highest effective frequency against template."""
-    return _best_primer_base(template_freqs)
+    """Pick probe base with highest WC match frequency against template.
+
+    Strict Watson-Crick only: only exact complement pairs score 1.0.
+    """
+    _WC = {('A', 'T'): 1.0, ('T', 'A'): 1.0, ('G', 'C'): 1.0, ('C', 'G'): 1.0}
+    best_base, best_score = 'N', -1.0
+    for pb in 'ATGC':
+        score = sum(_WC.get((pb, tb), 0) * f for tb, f in template_freqs.items())
+        if score > best_score:
+            best_score = score
+            best_base = pb
+    return best_base, best_score
 
 
 def generate_probe_variants(aligned_seqs, msa_cols, strand, n_variants=5,
@@ -266,7 +276,8 @@ def generate_probe_variants(aligned_seqs, msa_cols, strand, n_variants=5,
         wob_base, wob_score = _best_probe_base(template_freqs)
         wobble_bases.append(wob_base)
 
-        cons_score = sum(_WOBBLE_W.get((cons_base, tb), 0) * f
+        _WC = {('A', 'T'): 1.0, ('T', 'A'): 1.0, ('G', 'C'): 1.0, ('C', 'G'): 1.0}
+        cons_score = sum(_WC.get((cons_base, tb), 0) * f
                          for tb, f in template_freqs.items())
         gains.append((i, wob_score - cons_score))
 

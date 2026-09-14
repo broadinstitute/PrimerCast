@@ -220,22 +220,20 @@ class TestSlideProbeMatch:
         assert len(rc_hits) >= 1
         assert any(h['start_pos'] == 2 for h in rc_hits)
 
-    def test_wobble_within_threshold(self):
-        """Wobble mismatch should be found with max_mismatches >= penalty."""
+    def test_single_mismatch_within_threshold(self):
+        """Single mismatch (1.0) should be found with max_mismatches >= 1."""
         probe = "GATG"
-        target = "AATG"  # G->A = wobble
-        penalty = 1.0 - WOBBLE_WEIGHT
-        hits = slide_probe_match(probe, target, max_mismatches=penalty)
+        target = "AATG"  # G->A = 1 mismatch (strict WC)
+        hits = slide_probe_match(probe, target, max_mismatches=1)
         fwd_hits = [h for h in hits if h['orientation'] == '+']
         assert len(fwd_hits) == 1
-        assert fwd_hits[0]['mismatches'] == pytest.approx(penalty)
+        assert fwd_hits[0]['mismatches'] == 1.0
 
-    def test_wobble_below_threshold(self):
-        """Wobble mismatch should NOT be found with max_mismatches < penalty."""
+    def test_single_mismatch_below_threshold(self):
+        """Single mismatch should NOT be found with max_mismatches < 1."""
         probe = "GATG"
         target = "AATG"
-        penalty = 1.0 - WOBBLE_WEIGHT
-        hits = slide_probe_match(probe, target, max_mismatches=penalty - 0.01)
+        hits = slide_probe_match(probe, target, max_mismatches=0)
         fwd_hits = [h for h in hits if h['orientation'] == '+']
         assert len(fwd_hits) == 0
 
