@@ -31,7 +31,8 @@ from qprimer_designer.utils import (
     get_probe_params,
     sanitize_iupac,
     WOBBLE_W_PRIMER,
-    WOBBLE_W_PROBE,
+    WOBBLE_WEIGHT,
+    GAP_WEIGHT,
     wobble_mismatch_count_cols,
     wobble_mismatch_count_gapped,
 )
@@ -82,11 +83,10 @@ full pipeline would take too long.
 PRIMERS_PER_BATCH = 100  # primers per batch (fwd+rev combined)
 CONSENSUS_QUOTA_FRAC = 0.2  # consensus gets 20% of batch slots
 MAX_BATCHES = 5
-TOP_PAIRS = 1000  # top primer pairs to evaluate (after Tm/GC/dG filtering)
-N_POSITIONS = 100  # amplicon positions to score (multi-region mode)
-N_VARIANTS = 10   # primer variants per position per direction
+TOP_PAIRS = 2500  # top primer pairs to evaluate (after Tm/GC/dG filtering)
+N_POSITIONS = 2500  # amplicon positions to score
+N_VARIANTS = 5     # primer variants per direction (consensus + wobble)
 
-# Primer scoring uses the more lenient wobble weights (ML validates further)
 _WOBBLE_W = WOBBLE_W_PRIMER
 _COMPLEMENT = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G'}
 
@@ -218,26 +218,15 @@ def generate_primer_variants(aligned_seqs, start_col, primer_len, strand, n_vari
 
 
 def _best_probe_base(template_freqs):
-    """Pick probe base with highest effective frequency against template.
-
-    Uses WOBBLE_W_PROBE (stricter: G-T/A-G = 0.50) since probes have no ML layer.
-    """
-    best_base, best_score = 'N', -1.0
-    for pb in 'ATGC':
-        score = sum(WOBBLE_W_PROBE.get((pb, tb), 0) * f
-                    for tb, f in template_freqs.items())
-        if score > best_score:
-            best_score = score
-            best_base = pb
-    return best_base, best_score
+    """Pick probe base with highest effective frequency against template."""
+    return _best_primer_base(template_freqs)
 
 
 def generate_probe_variants(aligned_seqs, msa_cols, strand, n_variants=5,
                              _freq_cache=None):
     """Generate consensus + wobble-optimized probe variants at a position.
 
-    Same diversification logic as generate_primer_variants but uses
-    WOBBLE_W_PROBE (stricter wobble weights).
+    Same diversification logic as generate_primer_variants.
 
     Args:
         aligned_seqs: list of MSA row strings
@@ -277,7 +266,7 @@ def generate_probe_variants(aligned_seqs, msa_cols, strand, n_variants=5,
         wob_base, wob_score = _best_probe_base(template_freqs)
         wobble_bases.append(wob_base)
 
-        cons_score = sum(WOBBLE_W_PROBE.get((cons_base, tb), 0) * f
+        cons_score = sum(_WOBBLE_W.get((cons_base, tb), 0) * f
                          for tb, f in template_freqs.items())
         gains.append((i, wob_score - cons_score))
 
@@ -335,225 +324,219 @@ def generate_probe_variants(aligned_seqs, msa_cols, strand, n_variants=5,
     return result
 
 
-def score_amplicon_positions(aligned_seqs, primer_len, min_amp_len, max_amp_len,
+def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
+                             min_amp_len, max_amp_len,
                              min_gc=0.35, max_gc=0.65,
-                             gap_threshold=0.50, min_primer_score=0.80,
-                             top_n=200, out_csv=None):
-    """Score amplicon positions across the full MSA using gap-aware conservation.
+                             min_primer_score=0.80,
+                             top_n=5000, out_csv=None):
+    """Score amplicon positions across a gap-pre-filtered MSA.
 
-    1. Columns with gap fraction > gap_threshold are skipped.
-    2. Per-column identity_frac = most_common_count / non_gap_count.
-    3. Consensus is built only from kept (non-gap-dominant) columns.
-    4. 20-mer positions are scored by mean conservation within contiguous
-       blocks of kept columns (no gap_score multiplication).
-    5. GC filter on consensus.
+    Enumerates all (fwd_start, fwd_len, rev_start, rev_len) combinations
+    within the amplicon size range, with primer lengths from primer_len_min
+    to primer_len_max.  Each column is scored using wobble-aware conservation
+    with explicit gap penalty (GAP_WEIGHT).  Assumes gap-dominant columns
+    have already been removed by the caller.
+
+    Args:
+        aligned_seqs: list of aligned sequence strings (gap-dominant cols removed)
+        primer_len_min: minimum primer length (e.g. 18)
+        primer_len_max: maximum primer length (e.g. 22)
+        min_amp_len: minimum amplicon length
+        max_amp_len: maximum amplicon length
+        min_gc: minimum GC fraction for primer windows
+        max_gc: maximum GC fraction for primer windows
+        min_primer_score: prune positions below this score (performance)
+        top_n: return at most this many pairs (0 = unlimited)
+        out_csv: optional path to save per-column scores
 
     Returns:
-        positions: sorted list of (fwd_start_msa, rev_start_msa, score)
-        consensus_aligned: gap-aware consensus string (full MSA length,
-            '-' at skipped columns)
-        kept_cols: boolean array indicating which MSA columns are kept
+        positions: sorted list of (fwd_start, fwd_len, rev_start, rev_len, score)
+        consensus_aligned: consensus string (same length as input MSA)
+        kept_cols: boolean array (all True after pre-filtering)
     """
+    import heapq
+
     seq_len = len(aligned_seqs[0])
     n_seqs = len(aligned_seqs)
 
-    # Vectorize: convert to numpy array for fast column operations
+    # Vectorize MSA for fast column operations
     _msa = np.array([list(s.upper()) for s in aligned_seqs], dtype='U1')
-
-    # Per-column base counts using vectorized operations
-    identity = np.zeros(seq_len, dtype=np.float64)
-    gap_frac = np.zeros(seq_len, dtype=np.float64)
-    consensus_bases = []
 
     _is_gap = (_msa == '-') | (_msa == 'N')
     _gap_counts = _is_gap.sum(axis=0)
     gap_frac = _gap_counts / n_seqs
 
-    # Count each base per column
     _base_A = (_msa == 'A').sum(axis=0)
     _base_T = (_msa == 'T').sum(axis=0)
     _base_G = (_msa == 'G').sum(axis=0)
     _base_C = (_msa == 'C').sum(axis=0)
     _n_bases = _base_A + _base_T + _base_G + _base_C
 
+    # Per-column scores (separate for fwd and rev primer directions)
+    fwd_identity = np.zeros(seq_len, dtype=np.float64)
+    rev_identity = np.zeros(seq_len, dtype=np.float64)
+    consensus_bases = []
+    gc_flag = np.zeros(seq_len, dtype=np.float64)
+
     for col in range(seq_len):
-        if _n_bases[col] > 0 and gap_frac[col] <= gap_threshold:
+        if _n_bases[col] > 0:
             counts = {'A': int(_base_A[col]), 'T': int(_base_T[col]),
                        'G': int(_base_G[col]), 'C': int(_base_C[col])}
             most_common_base = max(counts, key=counts.get)
             consensus_bases.append(most_common_base)
+            gc_flag[col] = 1.0 if most_common_base in 'GC' else 0.0
+
             sense_freqs = {b: c / n_seqs for b, c in counts.items() if c > 0}
             anti_freqs = {_COMPLEMENT.get(b, b): f for b, f in sense_freqs.items()}
-            _, fwd_score = _best_primer_base(anti_freqs)
-            _, rev_score = _best_primer_base(sense_freqs)
-            identity[col] = max(fwd_score, rev_score)
+            _, fwd_sc = _best_primer_base(anti_freqs)
+            _, rev_sc = _best_primer_base(sense_freqs)
+
+            gap_penalty = gap_frac[col] * GAP_WEIGHT
+            fwd_identity[col] = fwd_sc + gap_penalty
+            rev_identity[col] = rev_sc + gap_penalty
         else:
             consensus_bases.append('-')
-            identity[col] = 0.0
     del _msa, _is_gap, _gap_counts, _base_A, _base_T, _base_G, _base_C, _n_bases
 
-    # Boolean mask: kept columns (not gap-dominant)
-    kept_cols = np.array([b != '-' for b in consensus_bases], dtype=bool)
-    n_kept = kept_cols.sum()
-    n_skipped = seq_len - n_kept
-    print(f"  Gap-aware filtering: {n_kept} columns kept, {n_skipped} skipped "
-          f"(gap fraction > {gap_threshold})")
-
-    # Build consensus aligned string (full MSA length, '-' at skipped positions)
+    kept_cols = np.ones(seq_len, dtype=bool)
     consensus_aligned = ''.join(consensus_bases)
 
-    # Identify contiguous blocks of kept columns for valid primer placement
-    # A valid 20-mer must sit entirely within a contiguous block of kept columns.
-    # Use cumsum of kept_cols to efficiently check: for a window [start, start+primer_len),
-    # all columns must be kept → sum of kept_cols in window == primer_len
-    max_start = seq_len - primer_len + 1
-    if max_start <= 0:
-        return [], consensus_aligned, kept_cols
+    # Cumulative sums for efficient windowed scoring
+    cum_fwd = np.concatenate([[0.0], np.cumsum(fwd_identity)])
+    cum_rev = np.concatenate([[0.0], np.cumsum(rev_identity)])
+    cum_gc = np.concatenate([[0.0], np.cumsum(gc_flag)])
 
-    cum_kept = np.concatenate([[0], np.cumsum(kept_cols.astype(np.int32))])
-    kept_in_window = cum_kept[primer_len:max_start + primer_len] - cum_kept[:max_start]
-    valid_pos = (kept_in_window == primer_len)  # True if all columns in window are kept
-
-    # Per-primer-position: mean conservation (only for valid positions)
-    cum_id = np.concatenate([[0.0], np.cumsum(identity)])
-    mean_cons = (cum_id[primer_len:max_start + primer_len] - cum_id[:max_start]) / primer_len
-
-    # Primer scores = mean conservation (no gap_score multiplication)
-    primer_scores = mean_cons.copy()
-    # Zero out invalid positions (those spanning gap-dominant columns)
-    primer_scores[~valid_pos] = 0.0
-
-    # Save per-position scores CSV
+    # Save per-column scores CSV (mid-range primer length for diagnostics)
     if out_csv:
         import csv
-        half_w = primer_len // 2
-        with open(out_csv, 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(['msa_position', 'conservation', 'valid', 'primer_score'])
-            for pos in range(len(primer_scores)):
-                center = pos + half_w
-                w.writerow([center, f'{mean_cons[pos]:.6f}',
-                           '1' if valid_pos[pos] else '0',
-                           f'{primer_scores[pos]:.6f}'])
-        print(f"  Saved position scores: {out_csv} ({len(primer_scores)} positions, "
-              f"{valid_pos.sum()} valid)")
+        mid_len = (primer_len_min + primer_len_max) // 2
+        max_start = seq_len - mid_len + 1
+        if max_start > 0:
+            mean_fwd = (cum_fwd[mid_len:max_start + mid_len] - cum_fwd[:max_start]) / mid_len
+            with open(out_csv, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['msa_position', 'fwd_score', 'primer_len'])
+                for pos in range(len(mean_fwd)):
+                    w.writerow([pos + mid_len // 2, f'{mean_fwd[pos]:.6f}', mid_len])
+            print(f"  Saved position scores: {out_csv}")
 
-    # GC content per primer position (from consensus, only for valid positions)
-    gc_arr = np.array([1.0 if b in 'GC' else 0.0 for b in consensus_bases])
-    cum_gc = np.concatenate([[0.0], np.cumsum(gc_arr)])
-    primer_gc = (cum_gc[primer_len:max_start + primer_len] - cum_gc[:max_start]) / primer_len
-
-    # For each fwd_start, find best rev within valid amplicon range
-    min_gap = 10
-    results = []
-    for fwd_start in range(len(primer_scores)):
-        if not valid_pos[fwd_start]:
+    # Precompute per-length arrays: fwd/rev scores, gc fractions
+    primer_data = {}
+    for plen in range(primer_len_min, primer_len_max + 1):
+        max_start = seq_len - plen + 1
+        if max_start <= 0:
             continue
-        fwd_score = primer_scores[fwd_start]
-        if fwd_score < min_primer_score:
-            continue
-        fwd_gc = primer_gc[fwd_start]
-        if fwd_gc < min_gc or fwd_gc > max_gc:
-            continue
+        fwd_scores = (cum_fwd[plen:max_start + plen] - cum_fwd[:max_start]) / plen
+        rev_scores = (cum_rev[plen:max_start + plen] - cum_rev[:max_start]) / plen
+        gc_fracs = (cum_gc[plen:max_start + plen] - cum_gc[:max_start]) / plen
+        primer_data[plen] = (fwd_scores, rev_scores, gc_fracs)
 
-        rev_lo = fwd_start + min_amp_len - primer_len
-        rev_hi = fwd_start + max_amp_len - primer_len + 1
-        rev_lo = max(0, rev_lo)
-        rev_hi = min(len(primer_scores), rev_hi)
-        if rev_lo >= rev_hi:
-            continue
+    # Enumerate all valid (fwd_start, fwd_len, rev_start, rev_len) pairs
+    heap = []  # min-heap of (score, fwd_start, fwd_len, rev_start, rev_len)
 
-        # Filter rev positions: must be valid and pass score/GC
-        rev_valid_mask = valid_pos[rev_lo:rev_hi]
-        rev_score_mask = primer_scores[rev_lo:rev_hi] >= min_primer_score
-        rev_slice = primer_scores[rev_lo:rev_hi].copy()
-        rev_gc_slice = primer_gc[rev_lo:rev_hi]
-        gc_mask = ((rev_gc_slice >= min_gc) & (rev_gc_slice <= max_gc)
-                   & rev_valid_mask & rev_score_mask)
-        if not gc_mask.any():
-            continue
-        rev_slice[~gc_mask] = -1.0
+    for fwd_len, (fwd_scores, _, fwd_gc, ) in primer_data.items():
+        fwd_mask = ((fwd_scores >= min_primer_score)
+                    & (fwd_gc >= min_gc) & (fwd_gc <= max_gc))
+        fwd_indices = np.where(fwd_mask)[0]
 
-        best_rev_local = np.argmax(rev_slice)
-        best_rev_idx = rev_lo + best_rev_local
-        if rev_slice[best_rev_local] < 0:
-            continue
+        for fwd_start in fwd_indices:
+            fwd_sc = float(fwd_scores[fwd_start])
 
-        amp_score = fwd_score + primer_scores[best_rev_idx]
-        results.append((fwd_start, best_rev_idx, amp_score))
+            for rev_len, (_, rev_scores, rev_gc) in primer_data.items():
+                # amplicon = rev_start + rev_len - fwd_start
+                rev_lo = int(fwd_start) + min_amp_len - rev_len
+                rev_hi = int(fwd_start) + max_amp_len - rev_len + 1
+                rev_lo = max(0, rev_lo)
+                rev_hi = min(len(rev_scores), rev_hi)
+                if rev_lo >= rev_hi:
+                    continue
 
-    results.sort(key=lambda x: -x[2])
+                mask = ((rev_scores[rev_lo:rev_hi] >= min_primer_score)
+                        & (rev_gc[rev_lo:rev_hi] >= min_gc)
+                        & (rev_gc[rev_lo:rev_hi] <= max_gc))
+                if not mask.any():
+                    continue
 
-    # Deduplicate: skip positions within min_gap of a higher-scoring one
-    filtered = []
-    used_fwd = []
-    for fwd_start, rev_start, score in results:
-        if any(abs(fwd_start - u) < min_gap for u in used_fwd):
-            continue
-        used_fwd.append(fwd_start)
-        filtered.append((fwd_start, rev_start, score))
+                rev_sc_slice = rev_scores[rev_lo:rev_hi]
+                for idx in np.where(mask)[0]:
+                    pair_score = fwd_sc + float(rev_sc_slice[idx])
+                    rev_start = rev_lo + int(idx)
+                    entry = (pair_score, fwd_start, fwd_len, rev_start, rev_len)
 
-    return filtered[:top_n], consensus_aligned, kept_cols
+                    if top_n > 0:
+                        if len(heap) < top_n:
+                            heapq.heappush(heap, entry)
+                        elif pair_score > heap[0][0]:
+                            heapq.heapreplace(heap, entry)
+                    else:
+                        heap.append(entry)
+
+    # Sort by score descending
+    heap.sort(key=lambda x: -x[0])
+    positions = [(fs, fl, rs, rl, sc) for sc, fs, fl, rs, rl in heap]
+
+    print(f"  Top amplicon pairs: {len(positions)}")
+    for i, (fs, fl, rs, rl, sc) in enumerate(positions[:5]):
+        print(f"    #{i+1}: fwd={fs}({fl}bp) rev={rs}({rl}bp) "
+              f"amp={rs+rl-fs}bp score={sc:.4f}")
+
+    return positions, consensus_aligned, kept_cols
 
 
 def extract_primers_at_positions(aligned_seqs, positions, primer_len,
                                  min_tm, max_tm, max_gc, min_dg,
-                                 n_variants=N_VARIANTS, max_pri_len=None):
-    """Generate wobble-optimized primer variants at scored positions.
+                                 n_variants=2, max_pri_len=None):
+    """Generate consensus + wobble primer variants at scored positions.
 
-    For each position, generates up to n_variants fwd and rev primers
-    at each length from primer_len to max_pri_len, mixing consensus
-    and wobble-tolerant bases.  Filters Tm/GC/dG.
+    Each position is a 5-tuple (fwd_start, fwd_len, rev_start, rev_len, score).
+    For each, generates 2 variants per direction (consensus + wobble-optimal),
+    filters by Tm/GC/dG, and builds fwd×rev pairs.
 
     Returns list of primer pair dicts and features dict.
     """
-    if max_pri_len is None:
-        max_pri_len = primer_len
-    primer_lengths = list(range(primer_len, max_pri_len + 1))
-
     primers = []
     features = {}
 
     fwd_candidates = []  # (pos_idx, var_idx, seq, tm, gc, pos_score)
     rev_candidates = []
 
-    # Pre-compute column frequencies for all columns needed across all positions
+    # Pre-compute column frequencies for all needed columns
     seq_len = len(aligned_seqs[0])
     needed_cols = set()
-    for fwd_start, rev_start, _ in positions:
-        for plen in primer_lengths:
-            for i in range(plen):
-                if fwd_start + i < seq_len:
-                    needed_cols.add(fwd_start + i)
-                if rev_start + i < seq_len:
-                    needed_cols.add(rev_start + i)
+    for fwd_start, fwd_len, rev_start, rev_len, _ in positions:
+        for i in range(fwd_len):
+            if fwd_start + i < seq_len:
+                needed_cols.add(fwd_start + i)
+        for i in range(rev_len):
+            if rev_start + i < seq_len:
+                needed_cols.add(rev_start + i)
     freq_cache = {}
     for col in needed_cols:
         freq_cache[col] = _column_sense_freqs(aligned_seqs, col)
 
-    for pos_idx, (fwd_start, rev_start, pos_score) in enumerate(positions):
-        for plen in primer_lengths:
-            if fwd_start + plen > seq_len or rev_start + plen > seq_len:
-                continue
-            fwd_vars = generate_primer_variants(aligned_seqs, fwd_start, plen, 'fwd', n_variants,
-                                                 _freq_cache=freq_cache)
-            for vi, fwd_seq in enumerate(fwd_vars):
-                if 'N' in fwd_seq:
-                    continue
-                tm = get_tm(fwd_seq)
-                gc = gc_fraction(fwd_seq)
-                if min_tm <= tm <= max_tm and gc <= max_gc / 100.0:
-                    fwd_candidates.append((pos_idx, vi, fwd_seq, tm, gc, pos_score))
+    for pos_idx, (fwd_start, fwd_len, rev_start, rev_len, pos_score) in enumerate(positions):
+        if fwd_start + fwd_len > seq_len or rev_start + rev_len > seq_len:
+            continue
 
-            rev_vars = generate_primer_variants(aligned_seqs, rev_start, plen, 'rev', n_variants,
-                                                 _freq_cache=freq_cache)
-            for vi, rev_seq in enumerate(rev_vars):
-                if 'N' in rev_seq:
-                    continue
-                tm = get_tm(rev_seq)
-                gc = gc_fraction(rev_seq)
-                if min_tm <= tm <= max_tm and gc <= max_gc / 100.0:
-                    rev_candidates.append((pos_idx, vi, rev_seq, tm, gc, pos_score))
+        fwd_vars = generate_primer_variants(aligned_seqs, fwd_start, fwd_len, 'fwd',
+                                             n_variants, _freq_cache=freq_cache)
+        for vi, fwd_seq in enumerate(fwd_vars):
+            if 'N' in fwd_seq:
+                continue
+            tm = get_tm(fwd_seq)
+            gc = gc_fraction(fwd_seq)
+            if min_tm <= tm <= max_tm and gc <= max_gc / 100.0:
+                fwd_candidates.append((pos_idx, vi, fwd_seq, tm, gc, pos_score))
+
+        rev_vars = generate_primer_variants(aligned_seqs, rev_start, rev_len, 'rev',
+                                             n_variants, _freq_cache=freq_cache)
+        for vi, rev_seq in enumerate(rev_vars):
+            if 'N' in rev_seq:
+                continue
+            tm = get_tm(rev_seq)
+            gc = gc_fraction(rev_seq)
+            if min_tm <= tm <= max_tm and gc <= max_gc / 100.0:
+                rev_candidates.append((pos_idx, vi, rev_seq, tm, gc, pos_score))
 
     # Batch self-dG
     all_seqs = [c[2] for c in fwd_candidates] + [c[2] for c in rev_candidates]
@@ -584,13 +567,13 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
 
     # Build all fwd×rev pairs at each position
     candidate_pairs = []
-    for pos_idx, (fwd_start, rev_start, pos_score) in enumerate(positions):
+    for pos_idx, (fwd_start, fwd_len, rev_start, rev_len, pos_score) in enumerate(positions):
         pos_fwd = [(vi, info) for (pi, vi), info in fwd_passed.items() if pi == pos_idx]
         pos_rev = [(vi, info) for (pi, vi), info in rev_passed.items() if pi == pos_idx]
         for fwd_vi, _ in pos_fwd:
             for rev_vi, _ in pos_rev:
                 candidate_pairs.append((pos_idx, fwd_vi, rev_vi,
-                                        fwd_start, rev_start, pos_score))
+                                        fwd_start, fwd_len, rev_start, rev_len, pos_score))
 
     # Batch cross-dimer dG
     if candidate_pairs:
@@ -600,7 +583,8 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
     else:
         cross_dgs = []
 
-    for (pos_idx, fwd_vi, rev_vi, fwd_start, rev_start, pos_score), cross_dg in zip(candidate_pairs, cross_dgs):
+    for cp, cross_dg in zip(candidate_pairs, cross_dgs):
+        pos_idx, fwd_vi, rev_vi, fwd_start, fwd_len, rev_start, rev_len, pos_score = cp
         if cross_dg < min_dg:
             continue
         fwd_info = fwd_passed[(pos_idx, fwd_vi)]
@@ -611,7 +595,9 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
             'seq_id': f"var_f{fwd_vi}_r{rev_vi}",
             'is_consensus': (fwd_vi == 0 and rev_vi == 0),
             'fwd_start_msa': fwd_start,
+            'fwd_len': fwd_len,
             'rev_start_msa': rev_start,
+            'rev_len': rev_len,
             'fwd_seq': fwd_info['seq'],
             'rev_seq': rev_info['seq'],
             'fwd_tm': fwd_info['tm'],
@@ -627,7 +613,7 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
     return primers, features
 
 
-def group_into_batches(primers, primer_len, max_ref_span=500):
+def group_into_batches(primers, primer_len=None, max_ref_span=500):
     """Group primers by MSA position proximity, ensuring each batch's bowtie2
     reference stays compact (within max_ref_span MSA columns).
 
@@ -643,21 +629,21 @@ def group_into_batches(primers, primer_len, max_ref_span=500):
     current_batch = [sorted_primers[0]]
     batch_min_fwd = sorted_primers[0]['fwd_start_msa']
 
+    def _rev_end(p):
+        return p['rev_start_msa'] + p.get('rev_len', primer_len or 20)
+
     for p in sorted_primers[1:]:
-        rev_end = p['rev_start_msa'] + primer_len
-        # Check if adding this primer would make the reference too wide
+        rev_end = _rev_end(p)
         if rev_end - batch_min_fwd > max_ref_span:
-            # Finalize current batch
-            max_rev = max(pp['rev_start_msa'] + primer_len for pp in current_batch)
+            max_rev = max(_rev_end(pp) for pp in current_batch)
             batches.append((current_batch, batch_min_fwd, max_rev))
             current_batch = [p]
             batch_min_fwd = p['fwd_start_msa']
         else:
             current_batch.append(p)
 
-    # Finalize last batch
     if current_batch:
-        max_rev = max(pp['rev_start_msa'] + primer_len for pp in current_batch)
+        max_rev = max(_rev_end(pp) for pp in current_batch)
         batches.append((current_batch, batch_min_fwd, max_rev))
 
     return batches
@@ -1260,12 +1246,37 @@ def _merge_windows(conserved_starts, probe_len_max, cum_var):
     return regions
 
 
+def _wc_mismatch_count(probe_sense, target_row, msa_cols=None,
+                       msa_start=None, msa_end=None):
+    """Count strict Watson-Crick mismatches (no wobble tolerance).
+
+    Returns (mismatches, indels) where any non-identical base pair scores 1.0.
+    """
+    mm = 0.0
+    indels = 0
+    if msa_cols is not None:
+        for pb, col in zip(probe_sense, msa_cols):
+            tb = target_row[col]
+            if tb in ('-', 'N', 'n'):
+                indels += 1
+            elif pb != tb.upper():
+                mm += 1.0
+    else:
+        window = target_row[msa_start:msa_end]
+        for pb, tb in zip(probe_sense, window):
+            if tb in ('-', 'N', 'n'):
+                indels += 1
+            elif pb != tb.upper():
+                mm += 1.0
+    return mm, indels
+
+
 def _score_probes_by_coverage(probes, aligned_seqs, max_mismatches,
                               max_indels=0, seq_ids=None):
     """Score each probe by fraction of sequences matching within thresholds.
 
-    Uses wobble-aware mismatch counting: G-T and A-G pairs contribute 0.20
-    instead of 1.0, and gap positions are counted as indels.
+    Uses strict Watson-Crick mismatch counting: any non-identical base pair
+    counts as a full mismatch (1.0). Gap/N positions are counted as indels.
 
     Adds 'coverage' field to each probe dict.
     When seq_ids is provided, also adds 'covered_seq_ids' (set of matching IDs).
@@ -1288,12 +1299,9 @@ def _score_probes_by_coverage(probes, aligned_seqs, max_mismatches,
         covered = set()
         for idx, seq_row in enumerate(aligned_seqs):
             row_upper = seq_row.upper()
-            if msa_cols is not None:
-                mm, indels = wobble_mismatch_count_cols(
-                    sense_seq, row_upper, msa_cols)
-            else:
-                mm, indels = wobble_mismatch_count_gapped(
-                    sense_seq, row_upper, start, end)
+            mm, indels = _wc_mismatch_count(
+                sense_seq, row_upper, msa_cols=msa_cols,
+                msa_start=start, msa_end=end)
             if mm <= max_mismatches and indels <= max_indels:
                 n_matching += 1
                 if seq_ids is not None:
@@ -1750,7 +1758,8 @@ def _run_probe_first(args, params, primer_params, cov_min, act_min, min_pairs, s
     # Step 4: Compute primer conservation and find flanking positions
     print("Step 4: Scoring flanking primer positions...")
     scored, consensus_aligned, kept_cols = score_amplicon_positions(
-        aligned_seqs, primer_len, min_amp_len, max_amp_len,
+        aligned_seqs, primer_params["min_pri_len"], primer_params["max_pri_len"],
+        min_amp_len, max_amp_len,
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=0,
     )
@@ -1908,7 +1917,7 @@ def _run_probe_first(args, params, primer_params, cov_min, act_min, min_pairs, s
                 continue
 
             # Coverage filter
-            filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.90)
+            filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.80)
             if filtered_path.stat().st_size == 0:
                 print("  No primers pass coverage filter. Skipping.")
                 continue
@@ -2053,7 +2062,8 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
           f"{n_kept} after removing {n_raw_cols - n_kept} gap-dominant columns")
 
     scored, consensus_aligned, kept_cols = score_amplicon_positions(
-        aligned_seqs, primer_len, min_amp_len, max_amp_len,
+        aligned_seqs, primer_params["min_pri_len"], primer_params["max_pri_len"],
+        min_amp_len, max_amp_len,
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions,
     )
@@ -2062,8 +2072,6 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).touch()
         return
-
-    print(f"  Top amplicon positions: {len(scored)}")
 
     # Step 2: Generate primer variants
     print("Step 2: Generating wobble-optimized primer variants...")
@@ -2165,7 +2173,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 print("  No alignments found. Skipping.")
                 continue
 
-            filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.90)
+            filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.80)
             if filtered_path.stat().st_size == 0:
                 print("  No primers pass coverage filter. Skipping.")
                 continue
@@ -2466,7 +2474,8 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
           f"{n_kept} after removing {n_raw_cols - n_kept} gap-dominant columns")
 
     scored, consensus_aligned, kept_cols = score_amplicon_positions(
-        aligned_seqs, primer_len, min_amp_len, max_amp_len,
+        aligned_seqs, primer_params["min_pri_len"], primer_params["max_pri_len"],
+        min_amp_len, max_amp_len,
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions,
     )
@@ -2475,10 +2484,6 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).touch()
         return
-
-    print(f"  Top amplicon positions: {len(scored)}")
-    for i, (fwd, rev, score) in enumerate(scored[:5]):
-        print(f"    #{i+1}: fwd={fwd} rev={rev} (score={score:.4f})")
 
     # Step 2: Generate wobble-optimized primer variants
     print("Step 2: Generating wobble-optimized primer variants...")
@@ -2580,7 +2585,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
                 continue
 
             # Coverage filter
-            filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.90)
+            filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.80)
             if filtered_path.stat().st_size == 0:
                 print("  No primers pass coverage filter. Skipping.")
                 continue

@@ -590,7 +590,7 @@ def _render_sidebar():
 
 def _page_home():
     st.markdown(
-        "<h1 style='text-align: center; margin-top: -2rem; margin-bottom: 0;'>qPrimer Designer</h1>"
+        "<h1 style='text-align: center; margin-top: -2rem; margin-bottom: 0;'>PrimerCast</h1>"
         "<p style='text-align: center; font-size: 1.2em; color: gray; margin-bottom: 0;'>"
         "ML-guided PCR primer design and evaluation"
         "</p>"

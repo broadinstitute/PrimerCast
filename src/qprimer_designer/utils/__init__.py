@@ -10,15 +10,18 @@ from .sequences import (
 )
 from .params import parse_params, get_primer_params, get_probe_params, get_evaluation_params
 from .encoding import one_hot_encode, encode_primer_pair, encode_batch_parallel
-from .probe import (
+from .wobble import (
+    WOBBLE_PAIRS,
+    WOBBLE_WEIGHT,
+    GAP_WEIGHT,
     WOBBLE_W,
     WOBBLE_W_PRIMER,
-    WOBBLE_W_PROBE,
+    WOBBLE_W_SS,
     wobble_mismatch_count,
     wobble_mismatch_count_cols,
     wobble_mismatch_count_gapped,
-    slide_probe_match,
 )
+from .probe import slide_probe_match
 
 __all__ = [
     "reverse_complement_dna",
@@ -34,9 +37,12 @@ __all__ = [
     "one_hot_encode",
     "encode_primer_pair",
     "encode_batch_parallel",
+    "WOBBLE_PAIRS",
+    "WOBBLE_WEIGHT",
+    "GAP_WEIGHT",
     "WOBBLE_W",
     "WOBBLE_W_PRIMER",
-    "WOBBLE_W_PROBE",
+    "WOBBLE_W_SS",
     "wobble_mismatch_count",
     "wobble_mismatch_count_cols",
     "wobble_mismatch_count_gapped",
