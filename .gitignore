@@ -96,3 +96,48 @@ monitor/
 
 # Virus map cached data (download via fetch_virus_map_data.py)
 gui/virus_map_data/
+
+# Snakemake / workflow caches
+.snakemake/
+.delphy_cache/
+
+# Analysis outputs and run directories
+runs/
+evaluate/
+eval_sc2n/
+benchmark_realworld/
+test_benchmark_v2/
+test_h5_lasv/
+test_sc2n/
+fig3/
+ispcr_test/
+primer3_results/
+20260519_193224/
+Andes/
+
+# Raw/original target sequences (large FASTA files)
+target_seqs/original/
+target_seqs/encode_expression_files/
+target_seqs/*.tsv
+
+# Standalone model checkpoints (not package data)
+*.pth
+!src/qprimer_designer/data/*.pth
+
+# Documents and presentations
+*.pptx
+*.docx
+docs/methods_quick_mode.md
+
+# Miscellaneous scripts and tools
+bedJoinTabOffset.py
+fixStepToBedGraph.pl
+varStepToBedGraph.pl
+vai.pl
+primer3_ml_eval.py
+FOOTER.txt
+README.txt
+schematic.png
+
+# Vendored / external source
+src/gget-virfetch-main/

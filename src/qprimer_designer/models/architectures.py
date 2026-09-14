@@ -163,6 +163,10 @@ class Janus(nn.Module):
         return x
 
 
+# Alias for backward-compatible loading of models saved as JanusReg
+JanusReg = Janus
+
+
 class MLP(nn.Module):
     """Simple multi-layer perceptron."""
 

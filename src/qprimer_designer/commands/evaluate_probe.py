@@ -1,8 +1,8 @@
-"""Evaluate probes by direct wobble-aware matching against reference sequences.
+"""Evaluate probes by direct matching against reference sequences.
 
 Replaces bowtie2-based probe alignment for evaluate mode. For each primer pair,
 extracts the amplicon region from each target sequence and slides the probe
-across it using wobble-weighted mismatch counting.
+across it using strict Watson-Crick mismatch counting.
 """
 
 import ast
@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 from Bio import SeqIO
 
-from qprimer_designer.utils.probe import build_match_string, slide_probe_match, wobble_mismatch_count
+from qprimer_designer.utils.probe import build_match_string, slide_probe_match
 from qprimer_designer.utils.sequences import complement_dna, reverse_complement_dna
 
 
@@ -19,11 +19,11 @@ def register(subparsers):
     """Register the evaluate-probe subcommand."""
     parser = subparsers.add_parser(
         "evaluate-probe",
-        help="Evaluate probes by direct wobble-aware matching",
+        help="Evaluate probes by direct matching",
         description=(
             "Match probes against amplicon regions extracted from reference "
-            "sequences using wobble-aware mismatch counting (G-T/A-G = 0.20 "
-            "penalty). Replaces bowtie2-based probe alignment."
+            "sequences using strict Watson-Crick mismatch counting. "
+            "Replaces bowtie2-based probe alignment."
         ),
     )
     parser.add_argument("--probe-fa", dest="probe_fa", required=True,
@@ -36,7 +36,7 @@ def register(subparsers):
                         help="Output probe mapping CSV")
     parser.add_argument("--max-mismatches", dest="max_mismatches", type=float,
                         default=3.0,
-                        help="Max wobble-adjusted mismatches (default: 3.0)")
+                        help="Max mismatches allowed (default: 3.0)")
     parser.add_argument("--max-indels", dest="max_indels", type=int, default=0,
                         help="Max indels allowed (default: 0)")
     parser.set_defaults(func=run)
@@ -129,9 +129,9 @@ def run(args):
                     probe_len = len(match_seq)
                     for i in range(len(amplicon) - probe_len + 1):
                         window = amplicon[i:i + probe_len]
-                        mm, indels = wobble_mismatch_count(
-                            match_seq.upper(), window.upper())
-                        if mm <= max_mm and indels <= max_indels:
+                        mm = sum(1.0 for pb, tb in zip(match_seq.upper(), window.upper()) if pb != tb)
+                        indels = 0
+                        if mm <= max_mm:
                             abs_pos = amp_start + i
                             window_comp = complement_dna(window.upper())
                             match_str = build_match_string(
