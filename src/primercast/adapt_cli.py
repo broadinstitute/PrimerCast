@@ -9,12 +9,13 @@ import shutil
 import smtplib
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
-from primercast.utils.diagnostics import explain_run
+from primercast.utils.diagnostics import explain_run, run_warnings
 from primercast.utils.params import parse_params, parse_list_param
 
 
@@ -127,10 +128,23 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
     print(f"Running: {' '.join(cmd)}")
     print(f"Working directory: {run_dir.resolve()}", flush=True)
 
+    started_at = time.time()
     result = subprocess.run(cmd, cwd=str(run_dir))
-    if result.returncode != 0 and not dry_run:
-        _print_failure_explanation(run_dir)
+    if not dry_run:
+        _print_run_warnings(run_dir, since=started_at)
+        if result.returncode != 0:
+            _print_failure_explanation(run_dir)
     return result.returncode
+
+
+def _print_run_warnings(run_dir: Path, since: float | None = None) -> None:
+    """Evaluate-mode warnings: zero on-target coverage, rescue re-evaluation."""
+    warnings = run_warnings(run_dir, since=since)
+    if not warnings:
+        return
+    print("\nWARNINGS:", file=sys.stderr)
+    for w in warnings:
+        print(f"  - {w.message}", file=sys.stderr)
 
 
 def _print_failure_explanation(run_dir: Path) -> None:

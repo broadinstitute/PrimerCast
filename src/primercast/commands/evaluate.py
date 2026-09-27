@@ -2,9 +2,11 @@
 
 import argparse
 import ast
+import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,11 @@ from torch.utils.data import DataLoader
 
 from primercast.models import load_models, PcrDataset, FEATURE_COLUMNS
 from primercast.utils import encode_batch_parallel
+from primercast.utils.diagnostics import StageDiagnostics, diagnostics_path, format_message
+
+# Per-pair coverage is saved in the diagnostics only for small evaluations
+# (evaluate mode); design runs score thousands of pairs.
+MAX_DETAIL_PAIRS = 50
 
 
 def register(subparsers):
@@ -33,12 +40,70 @@ ranked table with coverage, activity, and score.
     parser.add_argument("--ref", dest="reference", required=True, help="Reference FASTA")
     parser.add_argument("--reftype", dest="reftype", required=True, choices=["on", "off"], help="on-target or off-target")
     parser.add_argument("--threads", type=int, default=1, help="Number of threads for encoding")
+    parser.add_argument(
+        "--fail-if-empty", action="store_true",
+        help="On-target only: stop (exit 3) with an explanation if no target "
+             "sequence is predicted to amplify. Without it, the diagnostics are "
+             "only recorded (evaluate mode reports them as a warning).",
+    )
     parser.set_defaults(func=run)
+
+
+def _reach_hint(input_path):
+    """Why no target was reached, from prepare-input's diagnostics if it has one."""
+    try:
+        data = json.loads(diagnostics_path(input_path).read_text())
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict) and data.get("empty"):
+        return f"Cause: {format_message(data)}"
+    return ("Primers must align to a target, in the right orientation, "
+            "within the amplicon length range.")
+
+
+def _coverage_diagnostics(args, tnames, reached, clstbl):
+    """Target-level funnel for on-target evaluation (None for off-target)."""
+    if args.reftype != "on":
+        return None
+    diag = StageDiagnostics(
+        "evaluate", target=Path(args.reference).stem, unit="target sequences",
+        fatal=bool(getattr(args, "fail_if_empty", False)),
+    )
+    diag.record("Target sequences in reference", len(tnames))
+    diag.record("Reached by a primer pair (aligned, oriented, amplicon length)",
+                len(reached), hint=_reach_hint(args.input))
+    active = clstbl > .5 if clstbl is not None else None
+    diag.record(
+        "Predicted to amplify (classifier > 0.5)",
+        int(active.any(axis=0).sum()) if active is not None else 0,
+        hint="The model predicts no amplification of any target; mismatches "
+             "(especially near the primer 3' ends) are the usual cause.",
+    )
+    if active is not None and len(active) <= MAX_DETAIL_PAIRS:
+        diag.details["pair_coverage"] = {
+            f"{f}/{r}": int(n) for (f, r), n in active.sum(axis=1).items()
+        }
+    return diag
+
+
+def _finish_diagnostics(diag, output):
+    """Save the funnel; warn (non-fatal) or stop (fatal) when coverage is zero."""
+    if diag is None:
+        return
+    if diag.empty and not diag.fatal:
+        print(f"WARNING: {diag.message()}", file=sys.stderr, flush=True)
+    diag.finish(output)
 
 
 def run(args):
     """Run the evaluate command."""
     tnames = [s.id for s in SeqIO.parse(args.reference, "fasta")]
+
+    if os.path.getsize(args.input) == 0:
+        print(f"No primer pairs to evaluate in {args.input}.")
+        open(args.output, "w").close()
+        _finish_diagnostics(_coverage_diagnostics(args, tnames, set(), None), args.output)
+        sys.exit()
 
     # Load models
     scaler, classifier, regressor, device = load_models()
@@ -49,16 +114,14 @@ def run(args):
     print(f"Evaluating {args.input} with {device} ({args.threads} threads)...")
     start_time = time.time()
 
-    if os.path.getsize(args.input) == 0:
-        open(args.output, "w").close()
-        sys.exit()
-
     header_flag = True
     mode = 'w'
     clstbl, regtbl = [], []
+    reached = set()
 
     for i, chunk in enumerate(pd.read_csv(args.input, chunksize=20000)):
         chunk['targets'] = chunk['targets'].apply(ast.literal_eval)
+        reached.update(t for targets in chunk['targets'] for t in targets)
 
         inps_fe = chunk[FEATURE_COLUMNS]
         inps_fe = scaler.transform(inps_fe)
@@ -135,3 +198,5 @@ def run(args):
 
     runtime = time.time() - start_time
     print(f"Wrote {len(res)} lines to {args.output} ({runtime:.1f} sec)")
+
+    _finish_diagnostics(_coverage_diagnostics(args, tnames, reached, clstbl), args.output)

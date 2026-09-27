@@ -587,6 +587,7 @@ rule evaluate_pset:
         "--out '{output}' "
         "--names {params.ids} "
         "{params.probe_args} "
+        "--primer-fasta '{input.fasta}' "
         f"--ref 'target_seqs/original/{PRIMARY_TARGET}.fa'"
 
 
@@ -749,9 +750,10 @@ rule prepare_input:
             f"--prev '{input.prev[0]}'"
             if input.prev else ""
         ),
-        # On-target pairing must yield pairs; stop with an explanation if not.
-        # Off-target references are expected to yield none.
-        fail_arg=lambda wc: "--fail-if-empty" if (wc.virus == wc.target or (EVALUATE and wc.target == PRIMARY_TARGET)) else ""
+        # Design on-target pairing must yield pairs; stop with an explanation if
+        # not. Off-target references are expected to yield none, and evaluate
+        # mode still reports (0 coverage, with a warning) instead of stopping.
+        fail_arg=lambda wc: "--fail-if-empty" if wc.virus == wc.target else ""
     shell:
         "primercast prepare-input "
         "--in '{input.mapped}' {params.prev_arg} --out '{output}' "
@@ -773,12 +775,15 @@ rule evaluate:
     resources:
         gpu=1
     params:
-        ref_type=lambda wc: "on" if (wc.virus == wc.target or EVALUATE) else "off"
+        ref_type=lambda wc: "on" if (wc.virus == wc.target or EVALUATE) else "off",
+        # Design: stop if no target is predicted to amplify. Evaluate mode
+        # records it and warns instead.
+        fail_arg=lambda wc: "--fail-if-empty" if wc.virus == wc.target else ""
     shell:
         "primercast evaluate "
         "--in '{input.inp}' --out '{output}' "
         "--ref '{input.ref}' --reftype {params.ref_type} "
-        "--threads {threads}"
+        "--threads {threads} {params.fail_arg}"
 
 
 rule rescue_evaluate:

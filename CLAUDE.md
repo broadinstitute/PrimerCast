@@ -60,7 +60,11 @@ Filtering steps record a funnel (candidates left after each filter) with
 `utils.diagnostics.StageDiagnostics`, written to `<output>.diagnostics.json`.
 `finish()` exits with code 3 and a "NO CANDIDATES: ..." message when a required
 step ends up empty; the GUI and `adapt` CLI show it via `explain_run(run_dir)`.
-Off-target steps use `fatal=False` (`prepare-input` is only fatal with `--fail-if-empty`).
+Off-target steps use `fatal=False` (`prepare-input` and `evaluate` are only fatal with
+`--fail-if-empty`, passed for design on-target only). Evaluate mode never stops on an
+empty step: it still writes a report (0 coverage, targets listed as unmapped), and
+`run_warnings(run_dir)` surfaces zero on-target coverage plus rescue re-evaluations
+(`<eval>.rescue.json`) as warnings in the GUI and CLI.
 
 ### Adding New Subcommands
 1. Create module in `src/primercast/commands/`

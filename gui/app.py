@@ -110,7 +110,7 @@ from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
 from gui import error_report
 from primercast.utils.params import parse_params
-from primercast.utils.diagnostics import explain_run
+from primercast.utils.diagnostics import explain_run, run_warnings
 from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
@@ -2233,6 +2233,8 @@ def _tab_run():
         else:
             st.error(f"Pipeline failed with exit code {rc}.")
             _render_failure_diagnosis()
+        _render_pipeline_warnings()
+        if rc != 0:
             with st.expander("Show error log"):
                 last_lines = "\n".join(log.splitlines()[-50:])
                 st.code(last_lines, language="text")
@@ -2263,6 +2265,8 @@ def _tab_run():
         else:
             st.error(f"Pipeline failed with exit code {rc}.")
             _render_failure_diagnosis()
+        _render_pipeline_warnings()
+        if rc != 0:
             log = st.session_state.get("pipeline_log", "")
             if log:
                 with st.expander("Show error log"):
@@ -2277,21 +2281,45 @@ def _pipeline_diagnoses(run_id: str) -> list:
     return explain_run(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
 
 
+def _render_funnel_table(steps: list):
+    st.table([
+        {
+            "Filter": step.get("filter", ""),
+            "Remaining": f"{step.get('remaining', 0):,}",
+            "Controlled by": ", ".join(
+                f"{k}={v}" for k, v in (step.get("params") or {}).items()),
+        }
+        for step in steps
+    ])
+
+
 def _render_failure_diagnosis():
     """Name the filter that stopped the pipeline, with its candidate funnel."""
     for diagnosis in _pipeline_diagnoses(st.session_state.get("pipeline_run_id", "")):
         st.error(f"**No candidates left.** {diagnosis.message}")
         with st.expander(f"Filter funnel: {diagnosis.stage_label}"
                          + (f" ({diagnosis.target})" if diagnosis.target else "")):
-            st.table([
-                {
-                    "Filter": step.get("filter", ""),
-                    "Remaining": f"{step.get('remaining', 0):,}",
-                    "Controlled by": ", ".join(
-                        f"{k}={v}" for k, v in (step.get("params") or {}).items()),
-                }
-                for step in diagnosis.steps
-            ])
+            _render_funnel_table(diagnosis.steps)
+
+
+def _render_run_warnings(run_dir: Path, since: float | None = None):
+    """Evaluate-mode warnings: zero on-target coverage, rescue re-evaluation."""
+    for warning in run_warnings(run_dir, since=since):
+        if warning.kind == "rescue":
+            st.warning(warning.message, icon="🔁")
+            continue
+        st.warning(f"**No predicted coverage.** {warning.message}")
+        with st.expander("Coverage funnel"
+                         + (f" ({warning.target})" if warning.target else "")):
+            _render_funnel_table(warning.steps)
+
+
+def _render_pipeline_warnings():
+    """Warnings for the pipeline run started from this session."""
+    run_id = st.session_state.get("pipeline_run_id", "")
+    if run_id:
+        _render_run_warnings(RUNS_DIR / run_id,
+                             since=st.session_state.get("pipeline_started_at"))
 
 
 # ---------------------------------------------------------------------------
@@ -2886,6 +2914,8 @@ def _tab_results():
     # --- Evaluate reports (evaluate/monitor workflows only) ---
     if workflow in ("evaluate", "monitor"):
         st.subheader("Evaluation reports")
+        if workflow == "evaluate" and run_dir and run_dir.exists():
+            _render_run_warnings(run_dir)
 
         if workflow == "monitor" and run_id and (MONITOR_DIR / run_id).exists():
             xlsx_files = sorted((MONITOR_DIR / run_id).glob("*.xlsx"), reverse=True)
@@ -4895,6 +4925,8 @@ def _build_error_report(run_id: str, context: str, message: str, email: str) -> 
                 st.session_state.get("pipeline_rule_done_targets", {}).items()
             },
             "no_candidates": [d.message for d in _pipeline_diagnoses(run_id)],
+            "warnings": [w.message for w in run_warnings(
+                RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))],
         }
 
     return {

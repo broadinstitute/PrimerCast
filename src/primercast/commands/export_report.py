@@ -36,6 +36,10 @@ Creates one Excel file per primer set with:
     parser.add_argument("--probe-mapping-off", nargs="*", default=[], help="Probe mapping CSVs for off-targets")
     parser.add_argument("--probe-seqs", default=None, help="Probe FASTA file")
     parser.add_argument("--ref", default=None, help="On-target reference FASTA (for counting total sequences)")
+    parser.add_argument("--primer-fasta", default=None,
+                        help="Primer FASTA (<id>_for/_rev). With --ref, a primer set that "
+                             "has no on-target alignment still gets a report listing every "
+                             "reference sequence as unmapped (0 coverage).")
     parser.add_argument("--probe-max-mismatches", type=int, default=2,
                         help="Maximum mismatches for probe to count as matched (default: 2)")
     parser.add_argument("--probe-max-indels", type=int, default=0,
@@ -586,6 +590,39 @@ def add_unmapped_rows(df, ref_seq_ids):
     return pd.concat([df, unmapped_df], axis=0)
 
 
+def load_primer_seqs(primer_fasta):
+    """Primer sequences by FASTA record id (empty if no file is given)."""
+    if not primer_fasta:
+        return {}
+    return {rec.id: str(rec.seq) for rec in SeqIO.parse(primer_fasta, "fasta")}
+
+
+def unaligned_on_target_df(pid, target, ref_seq_ids, primer_seqs, has_probe=False):
+    """On-target rows for a primer set that aligned to no reference sequence.
+
+    Every reference sequence is listed as unmapped, so the report shows
+    0 coverage instead of being skipped. Returns None if the primer
+    sequences or reference ids are unavailable.
+    """
+    fseq = primer_seqs.get(f"{pid}_for")
+    rseq = primer_seqs.get(f"{pid}_rev")
+    if not ref_seq_ids or fseq is None or rseq is None:
+        return None
+    df = add_unmapped_rows(
+        pd.DataFrame({"eval_type": pd.Series(dtype=object), "target": pd.Series(dtype=object)}),
+        ref_seq_ids,
+    )
+    df.index.name = "seq_id"
+    df["eval_type"] = "on"
+    df["target"] = target
+    df["pname_f"], df["pname_r"] = f"{pid}_for", f"{pid}_rev"
+    df["pseq_f"], df["pseq_r"] = fseq, rseq
+    if has_probe:
+        df["probe"] = 0
+        df["align_p"] = ""
+    return df
+
+
 def load_probe_seq(probe_seqs_path, pid):
     """Load probe sequence for a given primer set ID from FASTA."""
     if not probe_seqs_path:
@@ -620,6 +657,7 @@ def run(args):
     # Load reference seq_ids for unmapped row detection
     ref_seq_ids = _get_ref_seq_ids(args.ref) if args.ref else None
     ref_total = len(ref_seq_ids) if ref_seq_ids else None
+    primer_seqs = load_primer_seqs(getattr(args, "primer_fasta", None))
 
     # Build off-target reference totals: target_name → seq count
     off_ref_totals = {}
@@ -651,20 +689,31 @@ def run(args):
 
         # Process on-target evaluation
         try:
-            df_on = eval_to_target_df(
-                eval_path=args.on,
-                pid=pid,
-                eval_type="on"
-            )
-            df_on["eval_type"] = "on"
-            df_on["target"] = get_target_name(args.on)
-            if has_probe:
-                probe_src = mapped_on or probe_mapping_on
-                df_on = annotate_probe(df_on, probe_src, pid, probe_max_mm, probe_max_indel)
-            # Add unmapped sequences from reference
-            df_on = add_unmapped_rows(df_on, ref_seq_ids)
+            try:
+                df_on = eval_to_target_df(
+                    eval_path=args.on,
+                    pid=pid,
+                    eval_type="on"
+                )
+            except (FileNotFoundError, pd.errors.EmptyDataError, ValueError) as e:
+                # No alignment for this primer set (no .full file, or no rows
+                # for it): report 0 coverage rather than skipping the set.
+                df_on = unaligned_on_target_df(pid, get_target_name(args.on), ref_seq_ids,
+                                               primer_seqs, has_probe)
+                if df_on is None:
+                    raise
+                print(f"[WARNING] {pid} has no on-target alignment ({e}); "
+                      f"reporting all {len(df_on)} reference sequence(s) as unmapped.")
+            else:
+                df_on["eval_type"] = "on"
+                df_on["target"] = get_target_name(args.on)
+                if has_probe:
+                    probe_src = mapped_on or probe_mapping_on
+                    df_on = annotate_probe(df_on, probe_src, pid, probe_max_mm, probe_max_indel)
+                # Add unmapped sequences from reference
+                df_on = add_unmapped_rows(df_on, ref_seq_ids)
             df_on = add_decision_columns(df_on, has_probe)
-            dfs.append(df_on[cols].sort_values(
+            dfs.append(df_on.reindex(columns=cols).sort_values(
                 "regressor", ascending=False,
                 key=lambda s: pd.to_numeric(s, errors="coerce"),
             ))

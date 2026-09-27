@@ -9,6 +9,9 @@ later step crash on an empty file) with a message naming the filter that
 removed the last candidate and the params that control it.
 
 The GUI and CLI find these files under the run directory with ``explain_run``.
+Evaluate mode never stops on these: ``run_warnings`` instead reports on-target
+evaluations with zero predicted coverage, and rescue re-evaluations (whose
+summary is written to ``<eval>.rescue.json``), as warnings.
 
 This module depends only on the standard library.
 """
@@ -22,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 SUFFIX = ".diagnostics.json"
+RESCUE_SUFFIX = ".rescue.json"
 # Exit code used when a step stops because a filter removed every candidate.
 NO_CANDIDATES_EXIT_CODE = 3
 
@@ -32,6 +36,7 @@ STAGE_LABELS = {
     "generate_probe": "Probe generation",
     "quick_design": "Quick design",
     "prepare_input": "Primer binding and pairing",
+    "evaluate": "ML evaluation",
     "filter": "Primer pair filtering",
     "build_output": "Final output",
 }
@@ -56,6 +61,8 @@ class StageDiagnostics:
     fatal: bool = True
     unit: str = "candidates"
     steps: list[dict[str, Any]] = field(default_factory=list)
+    # Extra step-specific data saved alongside the funnel (e.g. per-pair coverage).
+    details: dict[str, Any] = field(default_factory=dict)
 
     def record(
         self,
@@ -93,7 +100,7 @@ class StageDiagnostics:
         return self.blocking_step() is not None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "stage": self.stage,
             "stage_label": STAGE_LABELS.get(self.stage, self.stage),
             "target": self.target,
@@ -102,6 +109,9 @@ class StageDiagnostics:
             "empty": self.empty,
             "steps": self.steps,
         }
+        if self.details:
+            data["details"] = self.details
+        return data
 
     def write(self, output_path: str | Path) -> Path:
         path = diagnostics_path(output_path)
@@ -122,6 +132,35 @@ class StageDiagnostics:
         if self.fatal and self.empty:
             print(f"\nNO CANDIDATES: {self.message()}\n", file=sys.stderr, flush=True)
             sys.exit(NO_CANDIDATES_EXIT_CODE)
+
+
+def append_step(
+    output_path: str | Path,
+    filter_name: str,
+    remaining: int,
+    hint: str = "",
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Add a later step to an existing diagnostics file.
+
+    Used when a follow-up step revises a count (rescue re-evaluation can
+    recover targets), so ``empty`` follows the new last step rather than the
+    first zero. Returns the updated data, or None if there is no file.
+    """
+    path = diagnostics_path(output_path)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    step: dict[str, Any] = {"filter": filter_name, "remaining": int(remaining)}
+    if hint:
+        step["hint"] = hint
+    data.setdefault("steps", []).append(step)
+    data["empty"] = int(remaining) == 0
+    if details:
+        data.setdefault("details", {}).update(details)
+    path.write_text(json.dumps(data, indent=2))
+    return data
 
 
 def format_message(data: dict[str, Any]) -> str:
@@ -205,6 +244,51 @@ def explain_run(
             path=path,
         ))
     found.sort(key=lambda d: order.index(d.stage) if d.stage in order else len(order))
+    return found
+
+
+@dataclass
+class RunWarning:
+    """Something a successful run's user should know about (evaluate mode)."""
+
+    kind: str  # "no_coverage" or "rescue"
+    target: str
+    message: str
+    steps: list[dict[str, Any]]
+    path: Path
+
+
+def run_warnings(run_dir: str | Path, since: float | None = None) -> list[RunWarning]:
+    """Warnings for a finished run: zero on-target coverage, rescue re-evaluation.
+
+    Zero-coverage warnings come from non-fatal ``evaluate`` diagnostics (fatal
+    ones stop the run and are reported by ``explain_run``). ``since`` and error
+    handling work as in ``explain_run``.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return []
+    found: list[RunWarning] = []
+    for pattern, kind in ((f"*{SUFFIX}", "no_coverage"), (f"*{RESCUE_SUFFIX}", "rescue")):
+        for path in sorted(run_dir.rglob(pattern)):
+            try:
+                if since is not None and path.stat().st_mtime < since:
+                    continue
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if kind == "no_coverage":
+                if data.get("stage") != "evaluate" or data.get("fatal", True) or not data.get("empty"):
+                    continue
+                message = format_message(data)
+            else:
+                message = data.get("message", "")
+            if message:
+                found.append(RunWarning(kind=kind, target=data.get("target", ""),
+                                        message=message, steps=data.get("steps") or [],
+                                        path=path))
     return found
 
 
