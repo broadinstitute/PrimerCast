@@ -19,7 +19,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   GAR_REGION: us-central1
   GAR_PROJECT: sabeti-adapt
-  GAR_REGISTRY: us-central1-docker.pkg.dev/sabeti-adapt/qprimer-designer/qprimer-designer
+  GAR_REGISTRY: us-central1-docker.pkg.dev/sabeti-adapt/primercast/primercast
 
 # Two images are produced from one Dockerfile (see the TORCH_VARIANT build arg):
 #   GHCR  -> multi-arch (amd64+arm64), GPU-enabled. Used by training + the
@@ -278,7 +278,7 @@ jobs:
         # is owned by terraform/cloud_run.tf.
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: qprimer-designer
+          service: primercast
           region: us-central1
           image: ${{ env.GAR_REGISTRY }}:${{ github.ref_name }}
 
@@ -313,7 +313,7 @@ jobs:
 
       - name: Deploy to staging
         run: |
-          SERVICE=qprimer-designer-staging
+          SERVICE=primercast-staging
           # --no-traffic is rejected on a service's first-ever revision (Cloud Run
           # requires the first revision to take traffic). terraform creates the
           # service shell first, so it normally exists; guard anyway for safety.
@@ -345,7 +345,7 @@ jobs:
 
       - name: Show staging URL
         run: |
-          BASE_URL=$(gcloud run services describe qprimer-designer-staging \
+          BASE_URL=$(gcloud run services describe primercast-staging \
             --region="${{ env.GAR_REGION }}" --project="${{ env.GAR_PROJECT }}" \
             --format='value(status.url)')
           HOST="${BASE_URL#https://}"

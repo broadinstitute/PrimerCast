@@ -48,4 +48,6 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "streamlit run --server.port=${PORT:-8080} --server.address=0.0.0.0 /app/gui/app.py"]
+# If QPRIMER_REDIRECT_URL is set, serve a 301 redirect to it instead of the app.
+# Used by the legacy qprimer-designer Cloud Run service after the move to primercast.
+CMD ["sh", "-c", "if [ -n \"$QPRIMER_REDIRECT_URL\" ]; then exec python /app/gui/redirect_server.py; else exec streamlit run --server.port=${PORT:-8080} --server.address=0.0.0.0 /app/gui/app.py; fi"]

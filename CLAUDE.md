@@ -77,7 +77,7 @@ Two images are built from the single `Dockerfile` via the `TORCH_VARIANT` build 
   docker pull ghcr.io/broadinstitute/qprimer_designer:latest
   docker run --rm ghcr.io/broadinstitute/qprimer_designer:latest qprimer --help
   ```
-- **GAR — `us-central1-docker.pkg.dev/sabeti-adapt/qprimer-designer/qprimer-designer`**:
+- **GAR — `us-central1-docker.pkg.dev/sabeti-adapt/primercast/primercast`**:
   amd64-only, **CPU**-only (slim, ~1.5–2 GB compressed). Runs the Streamlit web app on
   Cloud Run; it has no CUDA (Cloud Run has no GPU). Not for GPU/CLI use.
 
@@ -95,15 +95,15 @@ CPU→GAR.
 
 The Streamlit GUI (`gui/app.py`) is served publicly on Google Cloud Run in project
 `sabeti-adapt`. Infrastructure is Terraform (`terraform/`, see `terraform/README.md`):
-an Artifact Registry repo, a runtime service account, and `qprimer-designer` (prod) +
-`qprimer-designer-staging` services. CI deploys the CPU/GAR image — every branch push
+an Artifact Registry repo, a runtime service account, and `primercast` (prod) +
+`primercast-staging` services. CI deploys the CPU/GAR image — every branch push
 creates a per-branch staging revision; pushing a `v*` tag deploys production.
 
 URLs:
-- **Production**: `https://qprimer-designer.sabeti.broadinstitute.org`
-- **Staging base**: `https://qprimer-designer-staging-soitfyremq-uc.a.run.app`
-- **Per-branch preview**: `https://<branch>---qprimer-designer-staging-soitfyremq-uc.a.run.app`
-  (e.g. branch `my-feature` → `https://my-feature---qprimer-designer-staging-soitfyremq-uc.a.run.app`)
+- **Production**: `https://primercast.sabeti.broadinstitute.org`
+- **Staging base**: `https://primercast-staging-soitfyremq-uc.a.run.app`
+- **Per-branch preview**: `https://<branch>---primercast-staging-soitfyremq-uc.a.run.app`
+  (e.g. branch `my-feature` → `https://my-feature---primercast-staging-soitfyremq-uc.a.run.app`)
 
 Each pipeline run executes in an isolated scratch working directory
 (`gui/run_isolation.py`) so concurrent users don't share a Snakefile / `.snakemake`
