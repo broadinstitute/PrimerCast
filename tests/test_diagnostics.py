@@ -359,6 +359,22 @@ def test_export_report_without_alignment_reports_zero_coverage(mock_dg, tmp_path
 def test_adapt_cli_prints_warnings(tmp_path, capsys):
     (tmp_path / f"a.virusA.eval{RESCUE_SUFFIX}").write_text(
         json.dumps({"message": "Rescue re-evaluation was triggered for virusA"}))
-    adapt_cli._print_run_warnings(tmp_path)
+    assert adapt_cli._print_run_warnings(tmp_path) == 1
     err = capsys.readouterr().err
     assert "WARNINGS:" in err and "Rescue re-evaluation was triggered for virusA" in err
+
+
+@pytest.mark.parametrize("warn", [True, False])
+def test_adapt_cli_run_with_warnings_is_not_reported_as_clean(tmp_path, capsys, warn):
+    def fake_snakemake(cmd, cwd):
+        if warn:
+            (tmp_path / f"a.virusA.eval{RESCUE_SUFFIX}").write_text(
+                json.dumps({"message": "Rescue re-evaluation was triggered for virusA"}))
+        return argparse.Namespace(returncode=0)
+
+    with patch.object(adapt_cli.subprocess, "run", side_effect=fake_snakemake):
+        rc = adapt_cli._run_snakemake(tmp_path, [], cores=1, dry_run=False)
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert ("Pipeline finished with 1 warning(s)" in err) is warn

@@ -2227,13 +2227,11 @@ def _tab_run():
         progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
         status_area.caption(f"Completed in {mins}m {secs}s")
 
-        _save_run_config(status="succeeded" if rc == 0 else f"failed (exit code {rc})")
-        if rc == 0:
-            st.success("Pipeline finished successfully!")
-        else:
-            st.error(f"Pipeline failed with exit code {rc}.")
-            _render_failure_diagnosis()
-        _render_pipeline_warnings()
+        warnings = _pipeline_warnings()
+        _save_run_config(status=(f"failed (exit code {rc})" if rc != 0
+                                 else "succeeded with warnings" if warnings
+                                 else "succeeded"))
+        _render_pipeline_outcome(rc, warnings)
         if rc != 0:
             with st.expander("Show error log"):
                 last_lines = "\n".join(log.splitlines()[-50:])
@@ -2260,12 +2258,7 @@ def _tab_run():
                 lines.append(f"⚪ &nbsp; {label}")
         st.markdown("<br>".join(lines), unsafe_allow_html=True)
 
-        if rc == 0:
-            st.success("Pipeline finished successfully!")
-        else:
-            st.error(f"Pipeline failed with exit code {rc}.")
-            _render_failure_diagnosis()
-        _render_pipeline_warnings()
+        _render_pipeline_outcome(rc, _pipeline_warnings())
         if rc != 0:
             log = st.session_state.get("pipeline_log", "")
             if log:
@@ -2297,29 +2290,41 @@ def _render_failure_diagnosis():
     """Name the filter that stopped the pipeline, with its candidate funnel."""
     for diagnosis in _pipeline_diagnoses(st.session_state.get("pipeline_run_id", "")):
         st.error(f"**No candidates left.** {diagnosis.message}")
-        with st.expander(f"Filter funnel: {diagnosis.stage_label}"
+        with st.expander(f"Filter stage: {diagnosis.stage_label}"
                          + (f" ({diagnosis.target})" if diagnosis.target else "")):
             _render_funnel_table(diagnosis.steps)
 
 
-def _render_run_warnings(run_dir: Path, since: float | None = None):
+def _render_run_warnings(warnings: list):
     """Evaluate-mode warnings: zero on-target coverage, rescue re-evaluation."""
-    for warning in run_warnings(run_dir, since=since):
+    for warning in warnings:
         if warning.kind == "rescue":
-            st.warning(warning.message, icon="🔁")
+            st.warning(warning.message)
             continue
         st.warning(f"**No predicted coverage.** {warning.message}")
-        with st.expander("Coverage funnel"
+        with st.expander("Filter stages"
                          + (f" ({warning.target})" if warning.target else "")):
             _render_funnel_table(warning.steps)
 
 
-def _render_pipeline_warnings():
+def _pipeline_warnings() -> list:
     """Warnings for the pipeline run started from this session."""
     run_id = st.session_state.get("pipeline_run_id", "")
-    if run_id:
-        _render_run_warnings(RUNS_DIR / run_id,
-                             since=st.session_state.get("pipeline_started_at"))
+    if not run_id:
+        return []
+    return run_warnings(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
+
+
+def _render_pipeline_outcome(rc: int, warnings: list):
+    """Final status of a pipeline run. A run with warnings is not reported as a success."""
+    if rc != 0:
+        st.error(f"Pipeline failed with exit code {rc}.")
+        _render_failure_diagnosis()
+    elif warnings:
+        st.warning(f"**Pipeline finished with {len(warnings)} warning(s).** ")
+    else:
+        st.success("Pipeline finished successfully!")
+    _render_run_warnings(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -2915,7 +2920,7 @@ def _tab_results():
     if workflow in ("evaluate", "monitor"):
         st.subheader("Evaluation reports")
         if workflow == "evaluate" and run_dir and run_dir.exists():
-            _render_run_warnings(run_dir)
+            _render_run_warnings(run_warnings(run_dir))
 
         if workflow == "monitor" and run_id and (MONITOR_DIR / run_id).exists():
             xlsx_files = sorted((MONITOR_DIR / run_id).glob("*.xlsx"), reverse=True)
@@ -4668,6 +4673,7 @@ def _run_monitor():
     ]
 
     all_xlsx: list[Path] = []
+    monitor_warnings: list[str] = []
     email_body_parts = [f"ADAPT Monitor Report — {date_str}\n{'=' * 50}\n"]
 
     if targets_with_new:
@@ -4775,6 +4781,9 @@ def _run_monitor():
                 email_body_parts.append("Evaluate failed.\n")
                 continue
 
+            eval_warnings = [w.message for w in run_warnings(eval_dir)]
+            monitor_warnings.extend(f"{target_name}: {m}" for m in eval_warnings)
+
             # Collect Excel files
             xlsx_files = sorted(eval_dir.rglob("*.xlsx"))
             for xlsx in xlsx_files:
@@ -4787,8 +4796,15 @@ def _run_monitor():
                 email_body_parts.append(f"\n  --- {xlsx.stem} ---")
                 summary_text = _read_excel_summary(xlsx)
                 email_body_parts.append(summary_text)
+            if eval_warnings:
+                email_body_parts.append("\nWarnings:")
+                email_body_parts.extend(f"  - {m}" for m in eval_warnings)
 
-        progress_lines[-1] = f"✅ &nbsp; Evaluation complete — {len(all_xlsx)} report(s)"
+        if monitor_warnings:
+            progress_lines[-1] = (f"Evaluation finished with {len(monitor_warnings)} "
+                                  f"warning(s) — {len(all_xlsx)} report(s)")
+        else:
+            progress_lines[-1] = f"✅ &nbsp; Evaluation complete — {len(all_xlsx)} report(s)"
         _update(progress_lines)
     else:
         progress_lines.append("✅ &nbsp; No new sequences — evaluation skipped")
@@ -4819,7 +4835,7 @@ def _run_monitor():
         if ok:
             progress_lines[-1] = f"✅ &nbsp; Email sent to {', '.join(email_recipients)}"
         else:
-            progress_lines[-1] = "⚠️ &nbsp; Email sending failed"
+            progress_lines[-1] = "Email sending failed"
         _update(progress_lines)
     elif not email_sender or not _email_password:
         progress_lines.append("⚪ &nbsp; Email skipped (not configured)")
@@ -4836,8 +4852,11 @@ def _run_monitor():
     st.session_state.pipeline_running = False
     st.session_state.pipeline_return_code = 0
     st.session_state.monitor_results_dir = str(date_dir)
+    st.session_state.monitor_warnings = monitor_warnings
 
-    if all_xlsx:
+    if all_xlsx and monitor_warnings:
+        _render_monitor_warnings(monitor_warnings, f"{len(all_xlsx)} report(s) generated. ")
+    elif all_xlsx:
         st.success(f"Monitor complete — {len(all_xlsx)} report(s) generated.")
     elif total_new == 0:
         st.info("No new sequences found. Nothing to evaluate.")
@@ -4893,10 +4912,21 @@ def _tab_run_monitor():
 
     elif not running and st.session_state.get("pipeline_return_code") is not None:
         rc = st.session_state.pipeline_return_code
-        if rc == 0:
-            st.success("Monitor completed successfully!")
-        else:
+        monitor_warnings = st.session_state.get("monitor_warnings", [])
+        if rc != 0:
             st.error("Monitor failed.")
+        elif monitor_warnings:
+            _render_monitor_warnings(monitor_warnings)
+        else:
+            st.success("Monitor completed successfully!")
+
+
+def _render_monitor_warnings(warnings: list[str], detail: str = ""):
+    """Monitor status when an evaluation produced warnings (not a success)."""
+    st.warning(f"**Monitor finished with {len(warnings)} warning(s).** {detail}"
+               "Review them before using the results.")
+    for message in warnings:
+        st.warning(message)
 
 
 # ---------------------------------------------------------------------------
