@@ -103,6 +103,7 @@ gui/virus_map_data/
 
 # Analysis outputs and run directories
 runs/
+error_reports/
 evaluate/
 eval_sc2n/
 benchmark_realworld/

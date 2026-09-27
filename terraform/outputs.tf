@@ -33,3 +33,8 @@ output "custom_domain_dns_records" {
     []
   ) : []
 }
+
+output "error_report_bucket" {
+  description = "Private bucket holding \"Report a problem\" bundles (runtime SA can only create objects)."
+  value       = "gs://${google_storage_bucket.error_reports.name}"
+}

@@ -30,6 +30,13 @@ This stack creates:
   the records from the `custom_domain_dns_records` output (a CNAME to
   `ghs.googlehosted.com`) must be added to the `sabeti.broadinstitute.org` Cloud DNS zone.
 
+- **Error reports:** a private GCS bucket (`sabeti-adapt-primercast-error-reports`, objects
+  deleted after 90 days) that the runtime SA can only *create* objects in, plus a Cloud
+  Logging alert that emails the team whenever the app logs `error_report_submitted`
+  (see `error_reports.tf` and `gui/error_report.py`). Prod gets `QPRIMER_REPORT_BUCKET` /
+  `QPRIMER_REPORT_PREFIX` from terraform; staging gets them from CI's `staging-deploy` flags.
+  Reports submitted within the same 5 minutes are folded into one email (alert rate limit).
+
 It does **not** create the GPU image (that lives in GHCR) or any GCS bucket (see Deferred).
 
 ## Image split (why GAR is CPU-only)

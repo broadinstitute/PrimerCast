@@ -20,6 +20,9 @@ env:
   GAR_REGION: us-central1
   GAR_PROJECT: sabeti-adapt
   GAR_REGISTRY: us-central1-docker.pkg.dev/sabeti-adapt/primercast/primercast
+  # "Report a problem" bucket (terraform/error_reports.tf). Prod gets its env
+  # vars from terraform; staging's are set by the staging-deploy flags below.
+  REPORT_BUCKET: sabeti-adapt-primercast-error-reports
 
 # Two images are produced from one Dockerfile (see the TORCH_VARIANT build arg):
 #   GHCR  -> multi-arch (amd64+arm64), GPU-enabled. Used by training + the
@@ -340,6 +343,7 @@ jobs:
             --cpu-boost \
             --session-affinity \
             --timeout=600 \
+            --update-env-vars="QPRIMER_REPORT_BUCKET=${{ env.REPORT_BUCKET }},QPRIMER_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }}" \
             --quiet \
             "${EXTRA_FLAGS[@]}"
 

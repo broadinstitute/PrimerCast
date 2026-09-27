@@ -130,6 +130,10 @@ snakemake -s Snakefile.example --dry-run
   project root (and the image's writable `/app`). Point at a mounted volume to persist
   results, e.g. on Cloud Run (optional). Reference inputs (`target_seqs/`) always stay
   under the project root.
+- `QPRIMER_REPORT_BUCKET` / `QPRIMER_REPORT_PREFIX`: GCS bucket + object prefix for the
+  GUI's "Report a problem" bundles (`gui/error_report.py`; set by terraform for prod and
+  by CI for staging). Unset (local dev) → bundles are saved under `DATA_DIR/error_reports/`
+  and offered as a download.
 - `QPRIMER_FONT_PATH`: Custom font directory for training plots (optional)
 - `QPRIMER_TOOLPATH`: Custom tool installation path for training scripts (optional)
 - `RNASTRUCTURE_DATAPATH`: Path to RNAstructure data tables (optional)

@@ -69,3 +69,24 @@ variable "custom_domain" {
   type        = string
   default     = "primercast.sabeti.broadinstitute.org"
 }
+
+variable "error_report_bucket_name" {
+  description = "GCS bucket (globally unique name) for \"Report a problem\" bundles from the web app."
+  type        = string
+  default     = "sabeti-adapt-primercast-error-reports"
+}
+
+variable "error_report_retention_days" {
+  description = "Error report bundles are deleted this many days after upload."
+  type        = number
+  default     = 90
+}
+
+variable "error_report_notification_emails" {
+  description = "Addresses emailed (via a Cloud Logging alert) when a user submits an error report."
+  type        = list(string)
+  default = [
+    "khsu@broadinstitute.org",
+    "baekseun@broadinstitute.org",
+  ]
+}
