@@ -55,6 +55,13 @@ from importlib.resources import files
 model_path = files('primercast.data').joinpath('combined_classifier.pth')
 ```
 
+### Filter Diagnostics
+Filtering steps record a funnel (candidates left after each filter) with
+`utils.diagnostics.StageDiagnostics`, written to `<output>.diagnostics.json`.
+`finish()` exits with code 3 and a "NO CANDIDATES: ..." message when a required
+step ends up empty; the GUI and `adapt` CLI show it via `explain_run(run_dir)`.
+Off-target steps use `fatal=False` (`prepare-input` is only fatal with `--fail-if-empty`).
+
 ### Adding New Subcommands
 1. Create module in `src/primercast/commands/`
 2. Implement `register(subparsers)` function to add argparse subparser

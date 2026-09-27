@@ -13,6 +13,7 @@ from Bio.SeqUtils import gc_fraction
 
 from primercast.utils import reverse_complement_dna, get_tm, parse_params, get_primer_params, sanitize_iupac
 from primercast.external import compute_batch_dimer_dg
+from primercast.utils.diagnostics import StageDiagnostics
 
 
 def register(subparsers):
@@ -80,11 +81,13 @@ def generate_primers_multi(
     min_tm: float,
     max_gc: float,
     min_dg: float,
+    diag: StageDiagnostics | None = None,
 ):
     """Generate and filter primer candidates across multiple target sequences.
 
     Returns (for_filt, rev_filt, features) where features[seq] includes
     a 'rep_count' key indicating how many input sequences produced that primer.
+    If ``diag`` is given, the count left after each filter is recorded in it.
     """
     forps, revps = {}, {}
     # Track how many target sequences each primer appears in
@@ -104,6 +107,7 @@ def generate_primers_multi(
 
     for_filt, rev_filt = {}, {}
     features = defaultdict(dict)
+    tm_gc_counts, dg_counts = [], []
 
     for unfilt, filt, counts in zip([forps, revps], [for_filt, rev_filt], [fwd_counts, rev_counts]):
         # First pass: filter by Tm and GC (fast)
@@ -115,6 +119,7 @@ def generate_primers_multi(
             gc = gc_fraction(pseq)
             if min_tm <= tm <= max_tm and gc <= max_gc / 100.0:
                 tm_gc_passed[pseq] = (tm, gc)
+        tm_gc_counts.append(len(tm_gc_passed))
 
         # Batch dG computation (single subprocess call)
         if tm_gc_passed:
@@ -130,9 +135,27 @@ def generate_primers_multi(
                     features[pseq]["dG"] = round(dG, 1)
                     features[pseq]["rep_count"] = counts.get(pseq, 1)
                     filt[pseq] = unfilt[pseq]
+        dg_counts.append(len(filt))
 
     valid_pairs = count_primer_pairs(for_filt, rev_filt, min_amp_len, max_amp_len)
     print(f">> Primers filtered: {len(for_filt)} forwards, {len(rev_filt)} reverses, {valid_pairs} pairs")
+
+    if diag is not None:
+        def _record(name, counts, params, hint=""):
+            diag.record(name, min(counts), params,
+                        breakdown={"forward": counts[0], "reverse": counts[1]}, hint=hint)
+
+        _record(
+            "Tiling (primer windows without N)", [len(forps), len(revps)],
+            {"PRIMER_LEN_MIN": min_pri_len, "PRIMER_LEN_MAX": max_pri_len, "AMPLEN_MIN": min_amp_len},
+            hint="The target must be longer than PRIMER_LEN_MAX + AMPLEN_MIN and not all N.",
+        )
+        _record("Tm / GC", tm_gc_counts, {"TM_MIN": min_tm, "TM_MAX": max_tm, "GC_MAX": max_gc})
+        _record("Self-dimer dG", dg_counts, {"DG_MIN": min_dg})
+        diag.record(
+            "Primer pairs within amplicon length", valid_pairs,
+            {"AMPLEN_MIN": min_amp_len, "AMPLEN_MAX": max_amp_len},
+        )
 
     return for_filt, rev_filt, features
 
@@ -162,10 +185,15 @@ def run(args):
     print(f"Tm range: {min_tm}-{max_tm}")
     start_time = time.time()
 
-    for_filt, rev_filt, features = generate_primers_multi(
-        target_seqs, step, min_pri_len, max_pri_len, min_amp_len, max_amp_len,
-        max_tm, min_tm, max_gc, min_dg,
-    )
+    diag = StageDiagnostics("generate", target=args.name)
+    if not target_seqs:
+        diag.record("Target sequences", 0, hint=f"{args.target_seqs} contains no sequences.")
+    else:
+        for_filt, rev_filt, features = generate_primers_multi(
+            target_seqs, step, min_pri_len, max_pri_len, min_amp_len, max_amp_len,
+            max_tm, min_tm, max_gc, min_dg, diag=diag,
+        )
+    diag.finish(args.primer_seqs)
 
     forwards = list(for_filt.keys())
     reverses = list(rev_filt.keys())

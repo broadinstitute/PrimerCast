@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
+from primercast.utils.diagnostics import explain_run
 from primercast.utils.params import parse_params, parse_list_param
 
 
@@ -124,10 +125,22 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
         cmd.append("--dry-run")
 
     print(f"Running: {' '.join(cmd)}")
-    print(f"Working directory: {run_dir.resolve()}")
+    print(f"Working directory: {run_dir.resolve()}", flush=True)
 
     result = subprocess.run(cmd, cwd=str(run_dir))
+    if result.returncode != 0 and not dry_run:
+        _print_failure_explanation(run_dir)
     return result.returncode
+
+
+def _print_failure_explanation(run_dir: Path) -> None:
+    """Name the filter that left a pipeline step with no candidates, if any."""
+    diagnoses = explain_run(run_dir)
+    if not diagnoses:
+        return
+    print("\nThe pipeline stopped because a filter removed every candidate:", file=sys.stderr)
+    for d in diagnoses:
+        print(f"  - {d.message}", file=sys.stderr)
 
 
 def cmd_design(args):

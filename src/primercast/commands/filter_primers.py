@@ -4,12 +4,14 @@ import argparse
 import ast
 import os
 from collections import defaultdict
+from pathlib import Path
 
 import pandas as pd
 from Bio import SeqIO
 
 from primercast.utils import parse_params
 from primercast.external import compute_batch_dimer_dg
+from primercast.utils.diagnostics import StageDiagnostics
 
 
 def load_probe_data(probe_mapping_path, probe_seqs_path):
@@ -167,6 +169,9 @@ def run(args):
     params = parse_params(args.params)
     num_select = int(params.get("NUM_TOP_SENSITIVITY", 100))
     min_dg = float(params.get("DG_MIN", -6))
+    target = Path(args.init).name.removesuffix("_init.fa")
+    diag = StageDiagnostics("filter", target=target, unit="primer pairs")
+    no_scores_hint = "The ML evaluation step produced no scored primer pairs."
 
     # Load evaluation results
     try:
@@ -178,15 +183,20 @@ def run(args):
         open(csv_out, "w").close()
         if args.probe_out:
             open(args.probe_out, "w").close()
+        diag.record("Scored primer pairs", 0, hint=no_scores_hint)
+        diag.finish(args.out)
         return
     if res.empty:
         print(f"Warning: Scores file {args.scores} has no data rows, writing empty output")
         open(args.out, "w").close()
-        csv_out = args.out.replace(".fa", "_pairs.csv")
+        csv_out = args.out.replace(".fa", ".csv")
         open(csv_out, "w").close()
         if args.probe_out:
             open(args.probe_out, "w").close()
+        diag.record("Scored primer pairs", 0, hint=no_scores_hint)
+        diag.finish(args.out)
         return
+    diag.record("Scored primer pairs", len(res))
 
     # Load primer sequences
     primer_seqs = {rec.id: str(rec.seq) for rec in SeqIO.parse(args.init, "fasta")}
@@ -197,6 +207,10 @@ def run(args):
     res = res[res['coverage'] >= min_coverage].reset_index(drop=True)
     if len(res) < n_before:
         print(f"Filtered {n_before - len(res)}/{n_before} pairs below coverage threshold ({min_coverage})")
+    diag.record(
+        "Coverage", len(res), {"COVERAGE_MIN": min_coverage},
+        hint="Coverage is the predicted fraction of target sequences each pair amplifies.",
+    )
 
     if res.empty:
         print(f"Warning: No pairs above coverage threshold ({min_coverage}), writing empty output")
@@ -205,6 +219,7 @@ def run(args):
         open(csv_out, "w").close()
         if args.probe_out:
             open(args.probe_out, "w").close()
+        diag.finish(args.out)
         return
 
     # PROBE MODE
@@ -349,6 +364,15 @@ def run(args):
                 valid_probes_per_pair[pair_key] = pair_valid_probes
 
         print(f"Found {len(valid_pairs)} pairs with compatible probes, selecting top {num_select}...")
+        diag.record(
+            "Probe inside amplicon", len(pair_candidates),
+            {"PROBE_AMPLICON_BUFFER": buffer, "PROBE_MAX_MISMATCHES": max_mismatches},
+            hint="Each pair needs a probe that binds inside its amplicon.",
+        )
+        diag.record(
+            "Probe-primer dimer dG", len(valid_pairs),
+            {"DG_MIN": min_dg, "MIN_PROBES_PER_PAIR": min_probes},
+        )
 
         # Select top N from probe-compatible pairs (ranked by original score order)
         if valid_pairs:
@@ -438,6 +462,13 @@ def run(args):
                 valid_pairs.append((pname_f, pname_r, dg))
 
         print(f"Found {len(valid_pairs)} of {len(pairs_to_check)} pairs with primer_dimer_dg > {min_dg}")
+        diag.record("Top pairs by score", len(pairs_to_check), {"NUM_TOP_SENSITIVITY": num_select})
+        dimer_failed = bool(pairs_to_check) and all(dg is None for dg in dg_values)
+        diag.record(
+            "Primer-dimer dG", len(valid_pairs), {"DG_MIN": min_dg},
+            hint=("The dimer calculation (RNAduplex) failed, so no pair could be checked."
+                  if dimer_failed else ""),
+        )
 
         # Filter to only pairs with valid primer dimer
         if valid_pairs:
@@ -478,3 +509,4 @@ def run(args):
             out.write(f">{pname}\n{primer_seqs[pname]}\n")
 
     print(f"Wrote {len(primer_names)} primers to {args.out}")
+    diag.finish(args.out)

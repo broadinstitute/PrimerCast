@@ -748,12 +748,15 @@ rule prepare_input:
         prev_arg=lambda wc, input: (
             f"--prev '{input.prev[0]}'"
             if input.prev else ""
-        )
+        ),
+        # On-target pairing must yield pairs; stop with an explanation if not.
+        # Off-target references are expected to yield none.
+        fail_arg=lambda wc: "--fail-if-empty" if (wc.virus == wc.target or (EVALUATE and wc.target == PRIMARY_TARGET)) else ""
     shell:
         "primercast prepare-input "
         "--in '{input.mapped}' {params.prev_arg} --out '{output}' "
         "--ref '{input.ref}' --reftype {params.ref_type} "
-        "--features '{input.features}' --params '{PARAMS}'"
+        "--features '{input.features}' --params '{PARAMS}' {params.fail_arg}"
 
 
 rule evaluate:

@@ -2,7 +2,6 @@
 
 import argparse
 import random
-import sys
 import time
 from collections import defaultdict
 
@@ -12,6 +11,7 @@ from Bio.SeqUtils import gc_fraction
 
 from primercast.utils import get_tm, parse_params, get_probe_params, reverse_complement_dna, has_homopolymer, sanitize_iupac
 from primercast.external import compute_batch_dimer_dg
+from primercast.utils.diagnostics import StageDiagnostics
 
 
 def register(subparsers):
@@ -58,12 +58,14 @@ def generate_probes(
     avoid_5prime_G: bool,
     max_num: int,
     conserved_regions=None,
+    diag: StageDiagnostics | None = None,
 ):
     """Generate and filter probe candidates across multiple target sequences.
 
     Args:
         conserved_regions: Optional list of (start, end) tuples. If provided,
             only probes falling entirely within a conserved region are generated.
+        diag: Optional diagnostics; the count left after each filter is recorded.
     """
     # Generate all candidate probes with step=1 from both strands
     probes = {}
@@ -98,11 +100,14 @@ def generate_probes(
 
     # First pass: fast filters (5' G, homopolymer, Tm, GC)
     tm_gc_passed = {}
+    n_5prime_ok = n_homopolymer_ok = 0
     for pseq in probes:
         if avoid_5prime_G and pseq[0] == 'G':
             continue
+        n_5prime_ok += 1
         if has_homopolymer(pseq, homopolymer_max):
             continue
+        n_homopolymer_ok += 1
 
         tm = get_tm(pseq)
         gc = gc_fraction(pseq)
@@ -126,6 +131,20 @@ def generate_probes(
                 filtered[pseq] = probes[pseq]
 
     print(f">> Probes filtered: {len(filtered)}")
+
+    if diag is not None:
+        diag.record(
+            "Tiling (probe windows without N)", len(probes),
+            {"PROBE_LEN_MIN": len_min, "PROBE_LEN_MAX": len_max},
+            hint=("Only windows inside the conserved regions are considered."
+                  if conserved_regions else ""),
+        )
+        if avoid_5prime_G:
+            diag.record("No 5' G", n_5prime_ok, {"PROBE_AVOID_5PRIME_G": True})
+        diag.record("Homopolymer runs", n_homopolymer_ok, {"PROBE_HOMOPOLYMER_MAX": homopolymer_max})
+        diag.record("Tm / GC", len(tm_gc_passed),
+                    {"PROBE_TM_MIN": min_tm, "PROBE_TM_MAX": max_tm, "PROBE_GC_MAX": max_gc})
+        diag.record("Self-dimer dG", len(filtered), {"PROBE_DG_MIN": min_dg})
 
     # Subsample if needed
     if len(filtered) > max_num:
@@ -171,23 +190,15 @@ def run(args):
     print(f"Tm range: {min_tm}-{max_tm}")
     start_time = time.time()
 
+    diag = StageDiagnostics("generate_probe", target=args.name, unit="probes")
     filtered, features = generate_probes(
         target_seqs, len_min, len_max,
         max_tm, min_tm, max_gc, min_dg,
         homopolymer_max, avoid_5prime_G, max_num,
         conserved_regions=conserved_regions,
+        diag=diag,
     )
-
-    if not filtered and conserved_regions:
-        print(
-            f"[ERROR] No probes passed filters within conserved regions.\n"
-            f"  Conserved regions: {len(conserved_regions)}, "
-            f"Tm range: {min_tm}-{max_tm}, GC max: {max_gc}\n"
-            f"  Try adjusting PROBE_CONSERVATION_THRESHOLD, PROBE_MAX_MISMATCHES, "
-            f"or probe Tm/GC/length parameters in params.txt.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    diag.finish(args.probe_seqs)
 
     # Write output FASTA
     probe_list = list(filtered.keys())

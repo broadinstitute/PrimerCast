@@ -9,6 +9,7 @@ import pandas as pd
 from Bio import SeqIO
 
 from primercast.utils import parse_params
+from primercast.utils.diagnostics import StageDiagnostics
 from primercast.external import compute_dimer_dg
 
 
@@ -236,21 +237,40 @@ def run(args):
     print(f"Building final output for {args.name}...")
     start_time = time.time()
 
+    diag = StageDiagnostics("build_output", target=args.name, unit="primer pairs")
+
     # Load ON-target evaluation
     if os.path.getsize(args.eval_on) == 0:
         print(f"Warning: ON-target eval file {args.eval_on} is empty — no primers passed filters.")
         # Write empty output
-        pd.DataFrame().to_csv(args.out, index=False)
+        pd.DataFrame().to_csv(args.output, index=False)
+        diag.record("On-target scored pairs", 0,
+                    hint="The ML evaluation step produced no scored primer pairs.")
+        diag.finish(args.output)
         return
-    teval = pd.read_csv(args.eval_on, index_col=[0, 1]).iloc[:num_select].copy()
+    teval = pd.read_csv(args.eval_on, index_col=[0, 1])
     teval.columns = ["cov_target", "act_target", "sco_target"]
+    diag.record("On-target scored pairs", len(teval))
 
-    # Filter teval to only include pairs that exist in the filtered primer CSV
+    # Keep only pairs that passed the filter step, then take the top N by score.
+    # Intersect before truncating: the filter can keep pairs ranked below N in
+    # the eval file (after its coverage filter, and in probe mode it scans past
+    # N for pairs with a usable probe).
     filt_csv_path = args.primers.replace(".fa", ".csv")
-    filt_pairs = pd.read_csv(filt_csv_path)
+    try:
+        filt_pairs = pd.read_csv(filt_csv_path)
+    except pd.errors.EmptyDataError:
+        filt_pairs = pd.DataFrame(columns=["pname_f", "pname_r"])
     valid_pairs = set(zip(filt_pairs['pname_f'], filt_pairs['pname_r']))
-    teval = teval[teval.index.isin(valid_pairs)].copy()
+    teval = teval[teval.index.isin(valid_pairs)]
     print(f"Filtered to {len(teval)} pairs from {filt_csv_path}")
+    diag.record(
+        "Pairs kept by the filter step", len(teval),
+        hint=f"None of the scored pairs are in {os.path.basename(filt_csv_path)}.",
+    )
+    teval = teval.iloc[:num_select].copy()
+    diag.record("Top pairs by score", len(teval), {"NUM_TOP_SENSITIVITY": num_select})
+    diag.finish(args.output)
 
     merged = teval.copy()
 

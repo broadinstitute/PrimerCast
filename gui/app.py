@@ -110,6 +110,7 @@ from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
 from gui import error_report
 from primercast.utils.params import parse_params
+from primercast.utils.diagnostics import explain_run
 from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
@@ -2026,6 +2027,7 @@ def _tab_run():
             if (scratch_dir / name).is_file():
                 shutil.copy2(scratch_dir / name, run_out_dir / name)
         st.session_state.pipeline_run_id = st.session_state.run_id
+        st.session_state.pipeline_started_at = time.time()
         _save_run_config(status="running")
         log_fh = open(run_out_dir / "pipeline.log", "w", buffering=1)
 
@@ -2230,6 +2232,7 @@ def _tab_run():
             st.success("Pipeline finished successfully!")
         else:
             st.error(f"Pipeline failed with exit code {rc}.")
+            _render_failure_diagnosis()
             with st.expander("Show error log"):
                 last_lines = "\n".join(log.splitlines()[-50:])
                 st.code(last_lines, language="text")
@@ -2259,11 +2262,36 @@ def _tab_run():
             st.success("Pipeline finished successfully!")
         else:
             st.error(f"Pipeline failed with exit code {rc}.")
+            _render_failure_diagnosis()
             log = st.session_state.get("pipeline_log", "")
             if log:
                 with st.expander("Show error log"):
                     last_lines = "\n".join(log.splitlines()[-50:])
                     st.code(last_lines, language="text")
+
+
+def _pipeline_diagnoses(run_id: str) -> list:
+    """Steps of the last pipeline run that a filter left with no candidates."""
+    if not run_id or st.session_state.get("pipeline_run_id") != run_id:
+        return []
+    return explain_run(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
+
+
+def _render_failure_diagnosis():
+    """Name the filter that stopped the pipeline, with its candidate funnel."""
+    for diagnosis in _pipeline_diagnoses(st.session_state.get("pipeline_run_id", "")):
+        st.error(f"**No candidates left.** {diagnosis.message}")
+        with st.expander(f"Filter funnel: {diagnosis.stage_label}"
+                         + (f" ({diagnosis.target})" if diagnosis.target else "")):
+            st.table([
+                {
+                    "Filter": step.get("filter", ""),
+                    "Remaining": f"{step.get('remaining', 0):,}",
+                    "Controlled by": ", ".join(
+                        f"{k}={v}" for k, v in (step.get("params") or {}).items()),
+                }
+                for step in diagnosis.steps
+            ])
 
 
 # ---------------------------------------------------------------------------
@@ -4866,6 +4894,7 @@ def _build_error_report(run_id: str, context: str, message: str, email: str) -> 
                 rule: sorted(targets) for rule, targets in
                 st.session_state.get("pipeline_rule_done_targets", {}).items()
             },
+            "no_candidates": [d.message for d in _pipeline_diagnoses(run_id)],
         }
 
     return {
