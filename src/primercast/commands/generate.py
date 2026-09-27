@@ -11,8 +11,8 @@ import pandas as pd
 from Bio import SeqIO
 from Bio.SeqUtils import gc_fraction
 
-from qprimer_designer.utils import reverse_complement_dna, get_tm, parse_params, get_primer_params, sanitize_iupac
-from qprimer_designer.external import compute_batch_dimer_dg
+from primercast.utils import reverse_complement_dna, get_tm, parse_params, get_primer_params, sanitize_iupac
+from primercast.external import compute_batch_dimer_dg
 
 
 def register(subparsers):

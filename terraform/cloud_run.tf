@@ -31,11 +31,11 @@ resource "google_cloud_run_v2_service" "app" {
 
       # "Report a problem" bundles (see error_reports.tf / gui/error_report.py).
       env {
-        name  = "QPRIMER_REPORT_BUCKET"
+        name  = "PRIMERCAST_REPORT_BUCKET"
         value = google_storage_bucket.error_reports.name
       }
       env {
-        name  = "QPRIMER_REPORT_PREFIX"
+        name  = "PRIMERCAST_REPORT_PREFIX"
         value = "prod"
       }
 

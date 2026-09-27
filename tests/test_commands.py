@@ -7,19 +7,19 @@ from unittest.mock import patch, MagicMock
 import pandas as pd
 import pytest
 
-from qprimer_designer.commands.generate import (
+from primercast.commands.generate import (
     generate_primers_single,
     count_primer_pairs,
 )
-from qprimer_designer.commands.prepare_features import infer_primer_orientation
-from qprimer_designer.commands.select_multiplex import (
+from primercast.commands.prepare_features import infer_primer_orientation
+from primercast.commands.select_multiplex import (
     infer_target_name,
     find_off_score_columns,
     select_top_rows,
     _parse_sam_cross_hits,
 )
-from qprimer_designer.commands.prepare_input import _ensure_list
-from qprimer_designer.commands.export_report import (
+from primercast.commands.prepare_input import _ensure_list
+from primercast.commands.export_report import (
     filter_by_primer_id,
     get_target_name,
 )

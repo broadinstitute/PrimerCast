@@ -8,8 +8,8 @@ from collections import defaultdict
 import pandas as pd
 from Bio import SeqIO
 
-from qprimer_designer.utils import parse_params
-from qprimer_designer.external import compute_batch_dimer_dg
+from primercast.utils import parse_params
+from primercast.external import compute_batch_dimer_dg
 
 
 def load_probe_data(probe_mapping_path, probe_seqs_path):

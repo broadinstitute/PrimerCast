@@ -7,8 +7,8 @@ import matplotlib as mpl
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 
-# Load custom fonts if QPRIMER_FONT_PATH is set, otherwise use system sans-serif
-font_path = os.environ.get('QPRIMER_FONT_PATH')
+# Load custom fonts if PRIMERCAST_FONT_PATH is set, otherwise use system sans-serif
+font_path = os.environ.get('PRIMERCAST_FONT_PATH')
 if font_path and os.path.isdir(font_path):
     font_files = fm.findSystemFonts(fontpaths=font_path)
     for font_file in font_files:

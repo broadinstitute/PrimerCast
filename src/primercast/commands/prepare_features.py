@@ -6,8 +6,8 @@ import pandas as pd
 from Bio import SeqIO
 from Bio.SeqUtils import gc_fraction
 
-from qprimer_designer.utils import get_tm
-from qprimer_designer.external import compute_batch_dimer_dg
+from primercast.utils import get_tm
+from primercast.external import compute_batch_dimer_dg
 
 
 def register(subparsers):

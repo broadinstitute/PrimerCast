@@ -1,6 +1,6 @@
-# qPrimer Designer Output Interpretation Guide
+# PrimerCast Output Interpretation Guide
 
-This guide describes the columns and values in the CSV and XLSX files produced by the qPrimer Designer pipeline.
+This guide describes the columns and values in the CSV and XLSX files produced by the PrimerCast pipeline.
 
 ---
 

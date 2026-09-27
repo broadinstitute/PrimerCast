@@ -138,7 +138,7 @@ def _run_rescue_pipeline(primer_fa, subset_ref, features, params_file,
     # prepare-input (no coverage check for rescue)
     input_file = workdir / "rescue.input"
     subprocess.run([
-        "qprimer", "prepare-input",
+        "primercast", "prepare-input",
         "--in", str(mapped_file),
         "--out", str(input_file),
         "--ref", str(subset_ref),
@@ -153,7 +153,7 @@ def _run_rescue_pipeline(primer_fa, subset_ref, features, params_file,
     # ML evaluate
     eval_out = workdir / "rescue.eval"
     subprocess.run([
-        "qprimer", "evaluate",
+        "primercast", "evaluate",
         "--in", str(input_file),
         "--out", str(eval_out),
         "--ref", str(subset_ref),
@@ -185,7 +185,7 @@ def _export_rescue_report(rescue_eval_path, ref_path, primer_fa, report_dir,
         return
 
     cmd = [
-        "qprimer", "export-report",
+        "primercast", "export-report",
         "--on", str(rescue_eval_path),
         "--out", str(report_dir),
         "--names", *names,
@@ -381,7 +381,7 @@ def run(args):
         rescue_probe_csv = rescue_dir / "rescue.probe.csv"
         rescue_full = Path(f"{rescue_eval}.full")
         subprocess.run([
-            "qprimer", "evaluate-probe",
+            "primercast", "evaluate-probe",
             "--probe-fa", str(probe_seqs_path),
             "--eval-full", str(rescue_full),
             "--ref", str(subset_ref),

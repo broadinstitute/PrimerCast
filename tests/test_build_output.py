@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from qprimer_designer.commands.build_output import find_valid_probes_offtarget
+from primercast.commands.build_output import find_valid_probes_offtarget
 
 
 class TestFindValidProbesOfftarget:

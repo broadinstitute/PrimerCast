@@ -9,7 +9,7 @@ from typing import Tuple
 import joblib
 import torch
 
-from qprimer_designer.models.architectures import (
+from primercast.models.architectures import (
     PGC,
     DropoutNd,
     S4DKernel,
@@ -54,7 +54,7 @@ def get_model_path(filename: str) -> Path:
     Returns:
         Path to the model file
     """
-    return files('qprimer_designer.data').joinpath(filename)
+    return files('primercast.data').joinpath(filename)
 
 
 def load_scaler():

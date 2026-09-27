@@ -16,12 +16,12 @@ from torch.utils.data import DataLoader
 
 from Bio.SeqUtils import gc_fraction
 
-from qprimer_designer.commands.generate import generate_primers_multi, generate_primers_single
-from qprimer_designer.commands.prepare_input import run as run_prepare_input
-from qprimer_designer.external import compute_batch_dimer_dg
-from qprimer_designer.external.bowtie import build_index, find_bowtie2
-from qprimer_designer.models import load_models, PcrDataset, FEATURE_COLUMNS
-from qprimer_designer.utils import (
+from primercast.commands.generate import generate_primers_multi, generate_primers_single
+from primercast.commands.prepare_input import run as run_prepare_input
+from primercast.external import compute_batch_dimer_dg
+from primercast.external.bowtie import build_index, find_bowtie2
+from primercast.models import load_models, PcrDataset, FEATURE_COLUMNS
+from primercast.utils import (
     encode_batch_parallel,
     get_tm,
     has_homopolymer,

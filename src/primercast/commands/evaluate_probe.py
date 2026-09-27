@@ -11,8 +11,8 @@ from pathlib import Path
 import pandas as pd
 from Bio import SeqIO
 
-from qprimer_designer.utils.probe import build_match_string, slide_probe_match
-from qprimer_designer.utils.sequences import complement_dna, reverse_complement_dna
+from primercast.utils.probe import build_match_string, slide_probe_match
+from primercast.utils.sequences import complement_dna, reverse_complement_dna
 
 
 def register(subparsers):

@@ -13,7 +13,7 @@ import pandas as pd
 from Bio import SeqIO
 from pandas.errors import EmptyDataError
 
-from qprimer_designer.utils import parse_params, reverse_complement_dna
+from primercast.utils import parse_params, reverse_complement_dna
 
 # GC-based Tm with offset to approximate Tm_NN(Na=50, Mg=1.5, dNTPs=0.6)
 _LOG10_NA = log10(0.05)

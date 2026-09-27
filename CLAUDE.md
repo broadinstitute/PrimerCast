@@ -1,10 +1,10 @@
-# qprimer_designer Development Guide
+# PrimerCast Development Guide
 
 ## Project Structure
 
 This is a Python package for ML-guided qPCR primer design. Key directories:
 
-- `src/qprimer_designer/` - Main package source
+- `src/primercast/` - Main package source
   - `cli.py` - Single CLI entry point with subcommands
   - `commands/` - Individual subcommand implementations
   - `models/` - PyTorch ML model architectures
@@ -20,7 +20,7 @@ This is a Python package for ML-guided qPCR primer design. Key directories:
 ```bash
 # Create conda environment with external tools
 conda env create -f environment.yml
-conda activate qprimer-designer
+conda activate primercast
 
 # Install package in editable mode with dev dependencies
 pip install -e ".[dev]"
@@ -33,13 +33,13 @@ pytest tests/ -v
 
 Single entry point with subcommands:
 ```bash
-qprimer generate --help
-qprimer evaluate --help
-qprimer pick-representatives --help
-qprimer prepare-input --help
-qprimer filter --help
-qprimer build-output --help
-qprimer select-multiplex --help
+primercast generate --help
+primercast evaluate --help
+primercast pick-representatives --help
+primercast prepare-input --help
+primercast filter --help
+primercast build-output --help
+primercast select-multiplex --help
 ```
 
 ## Key Patterns
@@ -52,30 +52,30 @@ in PATH via conda installation. Use `shutil.which()` to verify availability.
 Models are bundled as package data. Load using `importlib.resources`:
 ```python
 from importlib.resources import files
-model_path = files('qprimer_designer.data').joinpath('combined_classifier.pth')
+model_path = files('primercast.data').joinpath('combined_classifier.pth')
 ```
 
 ### Adding New Subcommands
-1. Create module in `src/qprimer_designer/commands/`
+1. Create module in `src/primercast/commands/`
 2. Implement `register(subparsers)` function to add argparse subparser
 3. Import and register in `cli.py`
 
 ## Testing
 
 - Run all tests: `pytest tests/ -v`
-- Run with coverage: `pytest tests/ -v --cov=qprimer_designer`
+- Run with coverage: `pytest tests/ -v --cov=primercast`
 - Tests should not require external tools (mock them)
 
 ## Docker
 
 Two images are built from the single `Dockerfile` via the `TORCH_VARIANT` build arg:
 
-- **GHCR — `ghcr.io/broadinstitute/qprimer_designer`**: multi-arch (amd64+arm64),
+- **GHCR — `ghcr.io/broadinstitute/primercast`**: multi-arch (amd64+arm64),
   **GPU**-enabled (CUDA PyTorch). Use this for the CLI, training, and Terra/batch
   workflows:
   ```bash
-  docker pull ghcr.io/broadinstitute/qprimer_designer:latest
-  docker run --rm ghcr.io/broadinstitute/qprimer_designer:latest qprimer --help
+  docker pull ghcr.io/broadinstitute/primercast:latest
+  docker run --rm ghcr.io/broadinstitute/primercast:latest primercast --help
   ```
 - **GAR — `us-central1-docker.pkg.dev/sabeti-adapt/primercast/primercast`**:
   amd64-only, **CPU**-only (slim, ~1.5–2 GB compressed). Runs the Streamlit web app on
@@ -83,9 +83,9 @@ Two images are built from the single `Dockerfile` via the `TORCH_VARIANT` build 
 
 Build locally (GPU is the default):
 ```bash
-docker build -t qprimer-designer:local .                          # GPU (GHCR-style)
-docker build --build-arg TORCH_VARIANT=cpu -t qprimer-cpu:local . # CPU (GAR/Cloud Run)
-docker run --rm qprimer-designer:local qprimer --help
+docker build -t primercast:local .                          # GPU (GHCR-style)
+docker build --build-arg TORCH_VARIANT=cpu -t primercast-cpu:local . # CPU (GAR/Cloud Run)
+docker run --rm primercast:local primercast --help
 ```
 
 CI (`.github/workflows/docker.yml`) builds both: GPU→GHCR (multi-arch manifest) and
@@ -108,12 +108,12 @@ URLs:
 Each pipeline run executes in an isolated scratch working directory
 (`gui/run_isolation.py`) so concurrent users don't share a Snakefile / `.snakemake`
 lock. Results are written to local disk, which is **ephemeral** on Cloud Run (lost on
-redeploy / scale events) in this iteration; `QPRIMER_DATA_DIR` is the seam for adding
+redeploy / scale events) in this iteration; `PRIMERCAST_DATA_DIR` is the seam for adding
 GCS persistence later.
 
 ## Snakemake Workflows
 
-Workflows are in `workflows/`. They use the `qprimer` CLI internally:
+Workflows are in `workflows/`. They use the `primercast` CLI internally:
 ```bash
 cd workflows
 snakemake -s Snakefile.example --cores all
@@ -126,14 +126,14 @@ snakemake -s Snakefile.example --dry-run
 
 ## Environment Variables
 
-- `QPRIMER_DATA_DIR`: Root for GUI run outputs (`runs/`, `monitor/`). Defaults to the
+- `PRIMERCAST_DATA_DIR`: Root for GUI run outputs (`runs/`, `monitor/`). Defaults to the
   project root (and the image's writable `/app`). Point at a mounted volume to persist
   results, e.g. on Cloud Run (optional). Reference inputs (`target_seqs/`) always stay
   under the project root.
-- `QPRIMER_REPORT_BUCKET` / `QPRIMER_REPORT_PREFIX`: GCS bucket + object prefix for the
+- `PRIMERCAST_REPORT_BUCKET` / `PRIMERCAST_REPORT_PREFIX`: GCS bucket + object prefix for the
   GUI's "Report a problem" bundles (`gui/error_report.py`; set by terraform for prod and
   by CI for staging). Unset (local dev) → bundles are saved under `DATA_DIR/error_reports/`
   and offered as a download.
-- `QPRIMER_FONT_PATH`: Custom font directory for training plots (optional)
-- `QPRIMER_TOOLPATH`: Custom tool installation path for training scripts (optional)
+- `PRIMERCAST_FONT_PATH`: Custom font directory for training plots (optional)
+- `PRIMERCAST_TOOLPATH`: Custom tool installation path for training scripts (optional)
 - `RNASTRUCTURE_DATAPATH`: Path to RNAstructure data tables (optional)

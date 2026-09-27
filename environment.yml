@@ -1,4 +1,4 @@
-name: qprimer-designer
+name: primercast
 channels:
   - pytorch
   - bioconda

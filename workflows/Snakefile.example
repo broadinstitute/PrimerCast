@@ -277,7 +277,7 @@ elif MULTIPLEX:
         params:
             params_arg=f"--params '{PARAMS}'" if PROBE_MODE else ""
         shell:
-            "qprimer select-multiplex "
+            "primercast select-multiplex "
             "{input.csvs} "
             "--out '{output}' {params.params_arg}"
 
@@ -310,7 +310,7 @@ elif MULTIPLEX:
                 if PROBE_MODE else ""
             )
         shell:
-            "qprimer build-output "
+            "primercast build-output "
             "--on '{input.eval_on}' {params.off_arg} "
             "--fa '{input.fa}' --out '{output}' --name '{wildcards.on}' "
             "--params '{PARAMS}' --ref '{input.ref}' {params.probe_args}"
@@ -350,7 +350,7 @@ else:
                 if PROBE_MODE else ""
             )
         shell:
-            "qprimer build-output "
+            "primercast build-output "
             "--on '{input.eval_on}' {params.off_arg} "
             "--fa '{input.fa}' --out '{output}' --name '{wildcards.virus}' "
             "--params '{PARAMS}' --ref '{input.ref}' {params.probe_args}"
@@ -398,7 +398,7 @@ rule generate_primers:
         fasta=f"{RUN_DIR}/{{virus}}_init.fa",
         features=f"{RUN_DIR}/{{virus}}_init.feat"
     shell:
-        "qprimer generate "
+        "primercast generate "
         "--in '{input}' --out '{output.fasta}' "
         "--params '{PARAMS}' --name '{wildcards.virus}'"
 
@@ -413,7 +413,7 @@ rule generate_probes:
         fasta=f"{RUN_DIR}/{{virus}}_probe.fa",
         features=f"{RUN_DIR}/{{virus}}_probe.feat"
     shell:
-        "qprimer generate-probe "
+        "primercast generate-probe "
         "--in '{input.seqs}' --out '{output.fasta}' "
         "--params '{PARAMS}' --name '{wildcards.virus}'"
 
@@ -440,7 +440,7 @@ if PROBE_MODE:
         threads:
             min(4, MAX_CORES)
         shell:
-            "qprimer quick-design "
+            "primercast quick-design "
             "--target '{input.target}' --msa '{input.msa}' "
             "--out '{output.eval}' "
             "--init-fa '{output.fasta}' --init-feat '{output.features}' "
@@ -463,7 +463,7 @@ else:
         threads:
             min(4, MAX_CORES)
         shell:
-            "qprimer quick-design "
+            "primercast quick-design "
             "--target '{input.target}' --msa '{input.msa}' "
             "--out '{output.eval}' "
             "--init-fa '{output.fasta}' --init-feat '{output.features}' "
@@ -520,7 +520,7 @@ rule prepare_features:
     output:
         feat=f"{RUN_DIR}/{{filename}}.feat"
     shell:
-        "qprimer prepare-features "
+        "primercast prepare-features "
         "--fa '{input.fa}' "
         "--out '{output.feat}'"
 
@@ -581,7 +581,7 @@ rule evaluate_pset:
             if EVAL_HAS_PROBE else ""
         )
     shell:
-        "qprimer export-report "
+        "primercast export-report "
         "--on '{input.eval_on}' "
         "{params.off_arg} "
         "--out '{output}' "
@@ -671,7 +671,7 @@ rule parse_probe_mapping:
     output:
         f"{RUN_DIR}/_{{target}}/{{virus}}.{{target}}.probe.csv"
     shell:
-        "qprimer parse-probe-mapping "
+        "primercast parse-probe-mapping "
         "--sam '{input.sam}' --out '{output}'"
 
 
@@ -750,7 +750,7 @@ rule prepare_input:
             if input.prev else ""
         )
     shell:
-        "qprimer prepare-input "
+        "primercast prepare-input "
         "--in '{input.mapped}' {params.prev_arg} --out '{output}' "
         "--ref '{input.ref}' --reftype {params.ref_type} "
         "--features '{input.features}' --params '{PARAMS}'"
@@ -772,7 +772,7 @@ rule evaluate:
     params:
         ref_type=lambda wc: "on" if (wc.virus == wc.target or EVALUATE) else "off"
     shell:
-        "qprimer evaluate "
+        "primercast evaluate "
         "--in '{input.inp}' --out '{output}' "
         "--ref '{input.ref}' --reftype {params.ref_type} "
         "--threads {threads}"
@@ -808,7 +808,7 @@ rule rescue_evaluate:
     threads:
         min(4, MAX_CORES)
     shell:
-        "qprimer rescue-evaluate "
+        "primercast rescue-evaluate "
         "--eval '{input.eval}' --report-dir '{params.report_dir}' "
         "--fasta '{input.fasta}' "
         "--ref '{input.ref}' --features '{input.features}' "
@@ -831,7 +831,7 @@ if PROBE_MODE:
             probe_csv=f"{RUN_DIR}/{{virus}}_filt_probes.csv",
             probe_fasta=f"{RUN_DIR}/{{virus}}_filt_probes.fa"
         shell:
-            "qprimer filter --init '{input.init}' --scores '{input.res}' "
+            "primercast filter --init '{input.init}' --scores '{input.res}' "
             "--out '{output.fasta}' --params '{PARAMS}' "
             "--probe-mapping '{input.probe_mapping}' "
             "--probe-seqs '{input.probe_seqs}' "
@@ -848,5 +848,5 @@ else:
             fasta=f"{RUN_DIR}/{{virus}}_filt.fa",
             csv=f"{RUN_DIR}/{{virus}}_filt.csv"
         shell:
-            "qprimer filter --init '{input.init}' --scores '{input.res}' "
+            "primercast filter --init '{input.init}' --scores '{input.res}' "
             "--out '{output.fasta}' --params '{PARAMS}'"

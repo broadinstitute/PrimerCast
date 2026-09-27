@@ -1,6 +1,6 @@
 FROM mambaorg/micromamba:2.5.0-debian12-slim
 
-LABEL org.opencontainers.image.source="https://github.com/broadinstitute/qprimer_designer"
+LABEL org.opencontainers.image.source="https://github.com/broadinstitute/PrimerCast"
 LABEL org.opencontainers.image.description="ML-guided qPCR primer design with off-target minimization"
 LABEL org.opencontainers.image.licenses="MIT"
 
@@ -33,8 +33,8 @@ RUN pip install --no-cache-dir ".[gui]"
 COPY --chown=$MAMBA_USER:$MAMBA_USER . /app
 
 # Verify installation
-RUN qprimer --help && \
-    qprimer generate --help && \
+RUN primercast --help && \
+    primercast generate --help && \
     RNAduplex --version && \
     bowtie2 --version
 
@@ -48,6 +48,6 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 EXPOSE 8080
 
-# If QPRIMER_REDIRECT_URL is set, serve a 301 redirect to it instead of the app.
+# If PRIMERCAST_REDIRECT_URL is set, serve a 301 redirect to it instead of the app.
 # Used by the legacy qprimer-designer Cloud Run service after the move to primercast.
-CMD ["sh", "-c", "if [ -n \"$QPRIMER_REDIRECT_URL\" ]; then exec python /app/gui/redirect_server.py; else exec streamlit run --server.port=${PORT:-8080} --server.address=0.0.0.0 /app/gui/app.py; fi"]
+CMD ["sh", "-c", "if [ -n \"$PRIMERCAST_REDIRECT_URL\" ]; then exec python /app/gui/redirect_server.py; else exec streamlit run --server.port=${PORT:-8080} --server.address=0.0.0.0 /app/gui/app.py; fi"]

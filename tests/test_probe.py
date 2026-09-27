@@ -1,7 +1,7 @@
 """Tests for wobble-aware probe matching utilities."""
 
 import pytest
-from qprimer_designer.utils.wobble import (
+from primercast.utils.wobble import (
     WOBBLE_W_SS,
     WOBBLE_W_PRIMER,
     WOBBLE_WEIGHT,
@@ -9,7 +9,7 @@ from qprimer_designer.utils.wobble import (
     wobble_mismatch_count_gapped,
     wobble_mismatch_count_cols,
 )
-from qprimer_designer.utils.probe import build_match_string, slide_probe_match
+from primercast.utils.probe import build_match_string, slide_probe_match
 
 
 class TestWobbleWeights:

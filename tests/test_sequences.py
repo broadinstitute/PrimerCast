@@ -1,7 +1,7 @@
 """Tests for sequence utility functions."""
 
 import pytest
-from qprimer_designer.utils.sequences import (
+from primercast.utils.sequences import (
     reverse_complement_dna,
     get_gc_fraction,
 )

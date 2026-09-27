@@ -17,7 +17,7 @@ import numpy as np
 from Bio import SeqIO
 from scipy.cluster import hierarchy
 
-from qprimer_designer.utils import parse_params, get_probe_params
+from primercast.utils import parse_params, get_probe_params
 
 
 def register(subparsers):

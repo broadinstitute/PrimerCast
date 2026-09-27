@@ -1,4 +1,4 @@
-"""Streamlit GUI for the qPrimer Designer pipeline."""
+"""Streamlit GUI for the PrimerCast pipeline."""
 
 import json
 import os
@@ -88,11 +88,11 @@ def _build_fetch_command(
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Persisted/output data root. Defaults to PROJECT_ROOT (local dev, and the
-# image's writable /app on Cloud Run). Set QPRIMER_DATA_DIR to a mounted volume
+# image's writable /app on Cloud Run). Set PRIMERCAST_DATA_DIR to a mounted volume
 # to persist results across instances/revisions (see terraform/README.md).
 # Reference inputs (target_seqs) stay under PROJECT_ROOT -- they're baked into
 # the image, not user data.
-DATA_DIR = Path(os.environ.get("QPRIMER_DATA_DIR") or PROJECT_ROOT)
+DATA_DIR = Path(os.environ.get("PRIMERCAST_DATA_DIR") or PROJECT_ROOT)
 
 TARGET_SEQS_DIR = PROJECT_ROOT / "target_seqs"
 FASTA_DIR = TARGET_SEQS_DIR / "original"
@@ -102,15 +102,15 @@ SCHEMATIC_PATH = PROJECT_ROOT / "schematic.png"
 # Ensure the upload directory exists
 FASTA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Add src/ to path so we can import qprimer_designer utilities
+# Add src/ to path so we can import primercast utilities
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
 from gui import error_report
-from qprimer_designer.utils.params import parse_params
-from qprimer_designer.adapt_cli import (
+from primercast.utils.params import parse_params
+from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
     _load_spreadsheet,
@@ -132,10 +132,10 @@ from qprimer_designer.adapt_cli import (
 MONITOR_DIR = DATA_DIR / "monitor"
 
 # Error reports ("Report a problem" button). On Cloud Run, bundles go to the GCS
-# bucket in QPRIMER_REPORT_BUCKET (see terraform/error_reports.tf); without it
+# bucket in PRIMERCAST_REPORT_BUCKET (see terraform/error_reports.tf); without it
 # (local dev) they are saved under DATA_DIR/error_reports and offered as a download.
-REPORT_BUCKET = os.environ.get("QPRIMER_REPORT_BUCKET", "").strip()
-REPORT_PREFIX = os.environ.get("QPRIMER_REPORT_PREFIX", "").strip() or "local"
+REPORT_BUCKET = os.environ.get("PRIMERCAST_REPORT_BUCKET", "").strip()
+REPORT_PREFIX = os.environ.get("PRIMERCAST_REPORT_PREFIX", "").strip() or "local"
 REPORTS_LOCAL_DIR = DATA_DIR / "error_reports"
 MAX_REPORTS_PER_SESSION = 3
 MONITOR_SCHEDULE_PATH = MONITOR_DIR / "schedule.json"
@@ -145,7 +145,7 @@ VIRUS_MAP_DATA_DIR = Path(__file__).parent / "virus_map_data"
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="qPrimer Designer",
+    page_title="PrimerCast",
     layout="wide",
 )
 
@@ -485,7 +485,7 @@ def _check_tool(name: str) -> bool:
 
 def _render_sidebar():
     with st.sidebar:
-        st.title("qPrimer Designer")
+        st.title("PrimerCast")
         st.caption(f"Working directory: `{PROJECT_ROOT}`")
 
         st.divider()
@@ -790,7 +790,7 @@ def _page_home():
     # Description
     st.markdown(
         """
-qPrimer Designer is an AI-powered tool for PCR diagnostics primer design and
+PrimerCast is an AI-powered tool for PCR diagnostics primer design and
 evaluation. It enables a **scalable, data-driven approach for adaptive
 diagnostic design** against rapidly evolving pathogens — accessible anywhere
 in the world, without requiring deep specialist expertise.
@@ -2040,7 +2040,7 @@ def _tab_run():
         env["PYTHONUNBUFFERED"] = "1"
         # Ensure the conda env bin dir is on PATH (for sam2pairwise, bowtie2, etc.)
         # Use snakemake's location to find the correct env bin dir, since
-        # CONDA_PREFIX may point to the base env rather than qprimer-designer.
+        # CONDA_PREFIX may point to the base env rather than primercast.
         snakemake_path = _find_tool("snakemake")
         env_bin = str(Path(sys.executable).parent)
         extra_dirs = [env_bin]
@@ -2769,7 +2769,7 @@ def _tab_results():
     st.markdown(
         "For help interpreting output columns, see the "
         "[Output Interpretation Guide]"
-        "(https://github.com/broadinstitute/qprimer_designer/blob/main/docs/output_interpretation_guide.md)."
+        "(https://github.com/broadinstitute/PrimerCast/blob/main/docs/output_interpretation_guide.md)."
     )
 
     run_id = st.session_state.get("run_id", "")
@@ -3617,7 +3617,7 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         pd.concat(meta_dfs, ignore_index=True).to_csv(meta_dest, index=False)
 
                     # Filter by subtype if specified
-                    from qprimer_designer.adapt_cli import _filter_fasta_by_subtype, _deduplicate_fasta
+                    from primercast.adapt_cli import _filter_fasta_by_subtype, _deduplicate_fasta
                     subtype = st.session_state.get(f"{prefix}_subtype_filter", "").strip()
                     n_subtype_removed = 0
                     if subtype:
@@ -4847,7 +4847,7 @@ def _tab_run_monitor():
 
 def _build_error_report(run_id: str, context: str, message: str, email: str) -> dict:
     """Assemble report.json for a run (settings, pipeline state, session)."""
-    from qprimer_designer import __version__
+    from primercast import __version__
 
     run_config = {}
     config_path = RUNS_DIR / run_id / "run_config.json"
@@ -4907,7 +4907,7 @@ def _error_report_inputs(report: dict) -> list[tuple[Path, str]]:
 
 @st.dialog("Report a problem")
 def _report_dialog(run_id: str, context: str):
-    st.markdown(f"Send run **{run_id}** to the qPrimer Designer team so we can investigate.")
+    st.markdown(f"Send run **{run_id}** to the PrimerCast team so we can investigate.")
     message = st.text_area("What went wrong? (optional)",
                            max_chars=error_report.MAX_MESSAGE_CHARS)
     email = st.text_input("Your email (optional, so we can follow up)")

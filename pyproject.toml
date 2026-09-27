@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "qprimer-designer"
+name = "primercast"
 version = "0.1.0"
 description = "ML-guided PCR primer design with off-target minimization"
 readme = "README.md"
@@ -26,14 +26,14 @@ dev = ["pytest>=8.0", "pytest-cov>=4.1"]
 gui = ["streamlit>=1.34", "plotly>=5.18", "pycountry>=23.12", "google-cloud-storage>=2.10"]
 
 [project.scripts]
-qprimer = "qprimer_designer.cli:main"
-adapt = "qprimer_designer.adapt_cli:main"
+primercast = "primercast.cli:main"
+adapt = "primercast.adapt_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-qprimer_designer = ["data/*.pth", "data/*.joblib"]
+primercast = ["data/*.pth", "data/*.joblib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

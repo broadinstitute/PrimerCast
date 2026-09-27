@@ -14,11 +14,11 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
-from qprimer_designer.utils.params import parse_params, parse_list_param
+from primercast.utils.params import parse_params, parse_list_param
 
 
 # Resolve template path relative to package location
-# Package is at src/qprimer_designer/, template is at workflows/
+# Package is at src/primercast/, template is at workflows/
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent.parent / "workflows" / "Snakefile.template"
 
 

@@ -13,8 +13,8 @@ from Bio import SeqIO
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import DataLoader
 
-from qprimer_designer.models import load_models, PcrDataset, FEATURE_COLUMNS
-from qprimer_designer.utils import encode_batch_parallel
+from primercast.models import load_models, PcrDataset, FEATURE_COLUMNS
+from primercast.utils import encode_batch_parallel
 
 
 def register(subparsers):

@@ -16,7 +16,8 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Docker image names must be lowercase; the repo is broadinstitute/PrimerCast.
+  IMAGE_NAME: ${{ github.repository_owner }}/primercast
   GAR_REGION: us-central1
   GAR_PROJECT: sabeti-adapt
   GAR_REGISTRY: us-central1-docker.pkg.dev/sabeti-adapt/primercast/primercast
@@ -179,7 +180,7 @@ jobs:
             echo "Creating manifest for: $tag"
             docker buildx imagetools create \
               --annotation "index:org.opencontainers.image.description=ML-guided qPCR primer design with off-target minimization" \
-              --annotation "index:org.opencontainers.image.source=https://github.com/broadinstitute/qprimer_designer" \
+              --annotation "index:org.opencontainers.image.source=https://github.com/broadinstitute/PrimerCast" \
               --annotation "index:org.opencontainers.image.licenses=MIT" \
               -t "$tag" \
               "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SUFFIX}-amd64" \
@@ -343,7 +344,7 @@ jobs:
             --cpu-boost \
             --session-affinity \
             --timeout=600 \
-            --update-env-vars="QPRIMER_REPORT_BUCKET=${{ env.REPORT_BUCKET }},QPRIMER_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }}" \
+            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }}" \
             --quiet \
             "${EXTRA_FLAGS[@]}"
 
@@ -367,7 +368,7 @@ jobs:
     steps:
       - uses: actions/delete-package-versions@v5
         with:
-          package-name: qprimer_designer
+          package-name: primercast
           package-type: container
           min-versions-to-keep: 5
           delete-only-untagged-versions: true
@@ -392,7 +393,7 @@ jobs:
             # Get version IDs for this tag (may return multiple lines)
             # Use index() for exact match instead of contains() which does substring matching
             VERSION_IDS=$(gh api \
-              "orgs/${{ github.repository_owner }}/packages/container/qprimer_designer/versions" \
+              "orgs/${{ github.repository_owner }}/packages/container/primercast/versions" \
               --jq ".[] | select(.metadata.container.tags | index(\"$TAG\")) | .id" \
               2>/dev/null || true)
 
@@ -400,7 +401,7 @@ jobs:
               echo "$VERSION_IDS" | while read -r VERSION_ID; do
                 [ -z "$VERSION_ID" ] && continue
                 gh api --method DELETE \
-                  "orgs/${{ github.repository_owner }}/packages/container/qprimer_designer/versions/$VERSION_ID"
+                  "orgs/${{ github.repository_owner }}/packages/container/primercast/versions/$VERSION_ID"
                 echo "Deleted version $VERSION_ID (tag: $TAG)"
               done
             else

@@ -33,8 +33,8 @@ This stack creates:
 - **Error reports:** a private GCS bucket (`sabeti-adapt-primercast-error-reports`, objects
   deleted after 90 days) that the runtime SA can only *create* objects in, plus a Cloud
   Logging alert that emails the team whenever the app logs `error_report_submitted`
-  (see `error_reports.tf` and `gui/error_report.py`). Prod gets `QPRIMER_REPORT_BUCKET` /
-  `QPRIMER_REPORT_PREFIX` from terraform; staging gets them from CI's `staging-deploy` flags.
+  (see `error_reports.tf` and `gui/error_report.py`). Prod gets `PRIMERCAST_REPORT_BUCKET` /
+  `PRIMERCAST_REPORT_PREFIX` from terraform; staging gets them from CI's `staging-deploy` flags.
   Reports submitted within the same 5 minutes are folded into one email (alert rate limit).
 
 It does **not** create the GPU image (that lives in GHCR) or any GCS bucket (see Deferred).
@@ -56,7 +56,7 @@ Two images are built from one Dockerfile via the `TORCH_VARIANT` build arg:
    `roles/run.admin`, `roles/artifactregistry.writer`, and `roles/iam.serviceAccountUser`
    at the project level — so it can deploy these services and act as the runtime SA with
    **no extra IAM**.
-2. **GitHub repo secrets** on `broadinstitute/qprimer_designer` (same values carmen uses):
+2. **GitHub repo secrets** on `broadinstitute/PrimerCast` (same values carmen uses):
    - `GCP_WIF_PROVIDER` — the Workload Identity provider resource name.
    - `GCP_DEPLOY_SA` — `gha-deployer@sabeti-adapt.iam.gserviceaccount.com`.
 3. **gcloud auth** for running terraform locally: `gcloud auth application-default login`.
@@ -93,11 +93,11 @@ in this terraform state; they are kept temporarily as a redirect and then delete
    and wait for the cert (`gcloud beta run domain-mappings describe --domain=primercast.sabeti.broadinstitute.org --region=us-central1`).
 4. Once `https://primercast.sabeti.broadinstitute.org` works, switch the legacy prod service
    to redirect mode. The image starts `gui/redirect_server.py` (a stdlib 301 server that
-   preserves path + query) instead of Streamlit when `QPRIMER_REDIRECT_URL` is set:
+   preserves path + query) instead of Streamlit when `PRIMERCAST_REDIRECT_URL` is set:
    ```bash
    gcloud run services update qprimer-designer --region=us-central1 --project=sabeti-adapt \
      --image=us-central1-docker.pkg.dev/sabeti-adapt/primercast/primercast:<vX.Y.Z> \
-     --update-env-vars=QPRIMER_REDIRECT_URL=https://primercast.sabeti.broadinstitute.org \
+     --update-env-vars=PRIMERCAST_REDIRECT_URL=https://primercast.sabeti.broadinstitute.org \
      --cpu=1 --memory=512Mi --min-instances=0 --max-instances=2
    ```
    The legacy domain mapping still points at this service, so both
@@ -116,6 +116,6 @@ in this terraform state; they are kept temporarily as a redirect and then delete
 
 - **GCS result persistence:** create a dedicated bucket with a 1-day lifecycle rule, mount
   it as a gen2 GCS volume on both services, grant the runtime SA `roles/storage.objectAdmin`,
-  and set `QPRIMER_DATA_DIR` to the mount. The app already roots its data dirs at
-  `QPRIMER_DATA_DIR`, so this is config-only on the app side. Makes "Past Results" survive
+  and set `PRIMERCAST_DATA_DIR` to the mount. The app already roots its data dirs at
+  `PRIMERCAST_DATA_DIR`, so this is config-only on the app side. Makes "Past Results" survive
   redeploys and be shared across users.

@@ -11,8 +11,8 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
-from qprimer_designer.utils import complement_dna
-from qprimer_designer.external import compute_dimer_dg
+from primercast.utils import complement_dna
+from primercast.external import compute_dimer_dg
 
 
 def register(subparsers):

@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 import torch
 
-from qprimer_designer.models.inference import (
+from primercast.models.inference import (
     get_model_path,
     load_scaler,
     load_classifier,

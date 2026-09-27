@@ -5,8 +5,8 @@ The Streamlit app's "Report a problem" button calls ``submit_report``, which:
 1. builds ``<run_id>-<report_id>.tar.gz`` containing ``report.json`` (the run
    state, a snapshot of the session, the user's message and a manifest), every
    file under ``runs/<run_id>/`` and the input FASTAs/MSAs the run used;
-2. uploads it to the GCS bucket named by ``QPRIMER_REPORT_BUCKET`` (under
-   ``QPRIMER_REPORT_PREFIX``), or, when no bucket is configured (local dev),
+2. uploads it to the GCS bucket named by ``PRIMERCAST_REPORT_BUCKET`` (under
+   ``PRIMERCAST_REPORT_PREFIX``), or, when no bucket is configured (local dev),
    saves it under a local directory so the user can download it instead;
 3. prints one structured JSON log line (``event = "error_report_submitted"``).
    On Cloud Run that becomes a Cloud Logging entry, and a log-based alert (see

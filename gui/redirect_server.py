@@ -2,7 +2,7 @@
 
 Used by the legacy ``qprimer-designer`` Cloud Run service after the web app moved
 to ``primercast``: the same container image starts this server instead of
-Streamlit when ``QPRIMER_REDIRECT_URL`` is set (see the Dockerfile ``CMD``), so
+Streamlit when ``PRIMERCAST_REDIRECT_URL`` is set (see the Dockerfile ``CMD``), so
 old links keep working until the legacy service is deleted. The request path and
 query string are preserved, e.g. ``/foo?x=1`` -> ``<base>/foo?x=1``.
 
@@ -43,7 +43,7 @@ def make_handler(base_url: str) -> type[BaseHTTPRequestHandler]:
 
 
 def main() -> None:
-    base_url = os.environ["QPRIMER_REDIRECT_URL"]
+    base_url = os.environ["PRIMERCAST_REDIRECT_URL"]
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(base_url))
     print(f"Redirecting all requests on :{port} to {base_url}", flush=True)
