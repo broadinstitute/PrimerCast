@@ -2,6 +2,7 @@
 
 import argparse
 import ast
+import json
 import shlex
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from sklearn.preprocessing import MultiLabelBinarizer
+
+from primercast.utils.diagnostics import RESCUE_SUFFIX, SUFFIX, append_step
 
 
 def register(subparsers):
@@ -138,7 +141,7 @@ def _run_rescue_pipeline(primer_fa, subset_ref, features, params_file,
     # prepare-input (no coverage check for rescue)
     input_file = workdir / "rescue.input"
     subprocess.run([
-        "qprimer", "prepare-input",
+        "primercast", "prepare-input",
         "--in", str(mapped_file),
         "--out", str(input_file),
         "--ref", str(subset_ref),
@@ -153,7 +156,7 @@ def _run_rescue_pipeline(primer_fa, subset_ref, features, params_file,
     # ML evaluate
     eval_out = workdir / "rescue.eval"
     subprocess.run([
-        "qprimer", "evaluate",
+        "primercast", "evaluate",
         "--in", str(input_file),
         "--out", str(eval_out),
         "--ref", str(subset_ref),
@@ -185,7 +188,7 @@ def _export_rescue_report(rescue_eval_path, ref_path, primer_fa, report_dir,
         return
 
     cmd = [
-        "qprimer", "export-report",
+        "primercast", "export-report",
         "--on", str(rescue_eval_path),
         "--out", str(report_dir),
         "--names", *names,
@@ -330,13 +333,65 @@ def _merge_final_xlsx(original_dir, rescue_dir):
     return updated_count
 
 
+def _covered_targets(report_dir):
+    """On-target seq_ids predicted to amplify (classifier=1) across all reports."""
+    covered = set()
+    for xlsx in Path(report_dir).glob("*.xlsx"):
+        if xlsx.name.startswith("~$"):
+            continue
+        df = pd.read_excel(xlsx, sheet_name="detail")
+        if "eval_type" in df.columns:
+            df = df[df["eval_type"] == "on"]
+        covered.update(df.loc[df["classifier"] == 1, "seq_id"])
+    return covered
+
+
+def _rescue_summary(target, n_failed, ref_total, rows_rescued, new_alignments):
+    """Summary of a rescue re-evaluation, shown to the user as a warning."""
+    text = (
+        f"Rescue re-evaluation was triggered for {target}: {n_failed}/{ref_total} "
+        f"target sequence(s) were not detected in the first pass (decision = 0), so "
+        f"they were re-aligned against a smaller subset reference and scored again. "
+    )
+    if not new_alignments:
+        text += "It found no new alignments; the report is unchanged."
+    elif rows_rescued:
+        text += (f"{rows_rescued} row(s) now pass (decision = 1) and were "
+                 f"updated in the report.")
+    else:
+        text += "No rows improved; the report is unchanged."
+    return {
+        "target": target,
+        "targets_reevaluated": n_failed,
+        "reference_total": ref_total,
+        "new_alignments": new_alignments,
+        "rows_rescued": rows_rescued,
+        "message": text,
+    }
+
+
+def _write_rescue_summary(eval_path, args, n_failed, ref_total, rows_rescued,
+                          new_alignments):
+    """Write ``<eval>.rescue.json`` and add the post-rescue coverage to the funnel."""
+    target = Path(args.ref).stem
+    summary = _rescue_summary(target, n_failed, ref_total, rows_rescued, new_alignments)
+    Path(f"{eval_path}{RESCUE_SUFFIX}").write_text(json.dumps(summary, indent=2))
+    print(f"WARNING: {summary['message']}", file=sys.stderr, flush=True)
+    if rows_rescued:
+        append_step(eval_path, "Predicted to amplify after rescue re-evaluation",
+                    len(_covered_targets(args.report_dir)))
+
+
 def run(args):
     """Run the rescue-evaluate command."""
+    eval_path = Path(args.eval_path)
+    # A summary from an earlier run would report a rescue that did not happen.
+    Path(f"{eval_path}{RESCUE_SUFFIX}").unlink(missing_ok=True)
+
     if args.reftype != "on":
         print("Rescue only applies to on-target. Skipping.")
         return
 
-    eval_path = Path(args.eval_path)
     full_path = Path(f"{eval_path}.full")
 
     if not full_path.exists() or full_path.stat().st_size == 0:
@@ -367,9 +422,13 @@ def run(args):
         workdir=rescue_dir,
         threads=args.threads,
     )
+    # The subset re-run's own diagnostics would be read as the main run's.
+    for stale in rescue_dir.glob(f"*{SUFFIX}"):
+        stale.unlink()
 
     if rescue_eval is None:
         print("  Rescue produced no new alignments.")
+        _write_rescue_summary(eval_path, args, n_extracted, ref_total, 0, False)
         return
 
     print(f"  Rescue eval saved to {rescue_eval}")
@@ -381,7 +440,7 @@ def run(args):
         rescue_probe_csv = rescue_dir / "rescue.probe.csv"
         rescue_full = Path(f"{rescue_eval}.full")
         subprocess.run([
-            "qprimer", "evaluate-probe",
+            "primercast", "evaluate-probe",
             "--probe-fa", str(probe_seqs_path),
             "--eval-full", str(rescue_full),
             "--ref", str(subset_ref),
@@ -405,3 +464,4 @@ def run(args):
         print(f"  Total {n_updated} row(s) updated in _final.xlsx files.")
     else:
         print("  No rows improved by rescue.")
+    _write_rescue_summary(eval_path, args, n_extracted, ref_total, n_updated, True)

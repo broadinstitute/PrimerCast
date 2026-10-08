@@ -1,4 +1,4 @@
-name: qprimer-designer
+name: primercast
 channels:
   - pytorch
   - bioconda
@@ -25,5 +25,6 @@ dependencies:
   # For pip install
   - pip
   - pip:
-    - streamlit>=1.30
+    - streamlit>=1.34
+    - google-cloud-storage>=2.10
     - gget>=0.30.2

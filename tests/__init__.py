@@ -1,1 +1,1 @@
-"""Test suite for qprimer_designer."""
+"""Test suite for primercast."""

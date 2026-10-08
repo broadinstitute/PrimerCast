@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from qprimer_designer.utils.encoding import one_hot_encode, encode_primer_pair, encode_batch_parallel
+from primercast.utils.encoding import one_hot_encode, encode_primer_pair, encode_batch_parallel
 
 
 class TestOneHotEncode:

@@ -8,8 +8,8 @@ from typing import List
 
 import pandas as pd
 
-from qprimer_designer.utils import parse_params
-from qprimer_designer.external import build_index, align_primers, compute_batch_dimer_dg
+from primercast.utils import parse_params
+from primercast.external import build_index, align_primers, compute_batch_dimer_dg
 
 
 def register(subparsers):

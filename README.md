@@ -1,8 +1,8 @@
-# qprimer-designer
+# PrimerCast
 
-[![Tests](https://github.com/broadinstitute/qprimer_designer/actions/workflows/test.yml/badge.svg)](https://github.com/broadinstitute/qprimer_designer/actions/workflows/test.yml)
-[![Docker Build](https://github.com/broadinstitute/qprimer_designer/actions/workflows/docker.yml/badge.svg)](https://github.com/broadinstitute/qprimer_designer/actions/workflows/docker.yml)
-[![codecov](https://codecov.io/gh/broadinstitute/qprimer_designer/graph/badge.svg)](https://codecov.io/gh/broadinstitute/qprimer_designer)
+[![Tests](https://github.com/broadinstitute/PrimerCast/actions/workflows/test.yml/badge.svg)](https://github.com/broadinstitute/PrimerCast/actions/workflows/test.yml)
+[![Docker Build](https://github.com/broadinstitute/PrimerCast/actions/workflows/docker.yml/badge.svg)](https://github.com/broadinstitute/PrimerCast/actions/workflows/docker.yml)
+[![codecov](https://codecov.io/gh/broadinstitute/PrimerCast/graph/badge.svg)](https://codecov.io/gh/broadinstitute/PrimerCast)
 
 ML-guided qPCR primer design with off-target minimization.
 
@@ -13,7 +13,7 @@ ML-guided qPCR primer design with off-target minimization.
 ```bash
 # Create environment with external tools
 conda env create -f environment.yml
-conda activate qprimer-designer
+conda activate primercast
 
 # Install the package
 pip install .
@@ -25,8 +25,8 @@ The GHCR image is multi-arch (amd64+arm64) and GPU-enabled — use it for the CL
 training, and Terra/batch workflows:
 
 ```bash
-docker pull ghcr.io/broadinstitute/qprimer_designer:latest
-docker run --rm ghcr.io/broadinstitute/qprimer_designer qprimer --help
+docker pull ghcr.io/broadinstitute/primercast:latest
+docker run --rm ghcr.io/broadinstitute/primercast primercast --help
 ```
 
 (A separate slim, CPU-only image powers the hosted web app on Cloud Run — see below.)
@@ -47,9 +47,9 @@ retained** across redeploys/restarts, so download anything you want to keep. See
 
 | Environment | URL |
 |-------------|-----|
-| **Production** | https://qprimer-designer.sabeti.broadinstitute.org |
-| **Staging (base)** | https://qprimer-designer-staging-soitfyremq-uc.a.run.app |
-| **Per-branch preview** | `https://<branch>---qprimer-designer-staging-soitfyremq-uc.a.run.app` |
+| **Production** | https://primercast.sabeti.broadinstitute.org |
+| **Staging (base)** | https://primercast-staging-soitfyremq-uc.a.run.app |
+| **Per-branch preview** | `https://<branch>---primercast-staging-soitfyremq-uc.a.run.app` |
 
 Every push to a branch deploys a preview revision to the staging service (with `--no-traffic`), accessible at the per-branch URL above. Pushing a `v*` tag deploys production.
 
@@ -241,7 +241,7 @@ monitor/
 
 The full fetched FASTA is removed after extracting the new-only subset and saving the accession list, to conserve disk space. Previous accession lists are used to diff against future fetches.
 
-The pipeline also uses internal `qprimer` subcommands via Snakemake. See [docs/qprimer_cli.md](docs/qprimer_cli.md) for details.
+The pipeline also uses internal `primercast` subcommands via Snakemake. See [docs/primercast_cli.md](docs/primercast_cli.md) for details.
 
 ## GPU Support
 
@@ -277,7 +277,7 @@ See [CLAUDE.md](CLAUDE.md) for development guidelines.
 
 ## Pre-trained Models
 
-Pre-trained models are bundled with the package in `src/qprimer_designer/data/`. Training scripts are available in the `training/` directory for reference (raw dataset available upon request).
+Pre-trained models are bundled with the package in `src/primercast/data/`. Training scripts are available in the `training/` directory for reference (raw dataset available upon request).
 
 ## License
 

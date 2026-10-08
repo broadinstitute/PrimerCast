@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from qprimer_designer.external.vienna import (
+from primercast.external.vienna import (
     _validate_sequence,
     compute_dimer_dg,
     compute_batch_dimer_dg,
@@ -16,13 +16,13 @@ from qprimer_designer.external.vienna import (
     VALID_DNA_CHARS,
     _IUPAC_AMBIGUITY_CHARS,
 )
-from qprimer_designer.external.bowtie import (
+from primercast.external.bowtie import (
     find_bowtie2,
     find_bowtie2_build,
     build_index,
     align_primers,
 )
-from qprimer_designer.external.mafft import (
+from primercast.external.mafft import (
     find_mafft,
     align_sequences,
 )
@@ -93,8 +93,8 @@ class TestValidateSequence:
 class TestComputeDimerDg:
     """Tests for compute_dimer_dg (mocked)."""
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
-    @patch("qprimer_designer.external.vienna.subprocess.run")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.subprocess.run")
     def test_parses_output(self, mock_run, mock_find):
         mock_run.return_value = MagicMock(
             stdout="..((.....))&..((.....)). : 1,12 : 1,12 ( -5.30)\n",
@@ -103,8 +103,8 @@ class TestComputeDimerDg:
         result = compute_dimer_dg("ATCGATCGATCG", "CGATCGATCGAT")
         assert result == -5.3
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
-    @patch("qprimer_designer.external.vienna.subprocess.run")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.subprocess.run")
     def test_positive_dg(self, mock_run, mock_find):
         mock_run.return_value = MagicMock(
             stdout=".&. : 0,0 : 0,0 ( 0.00)\n",
@@ -113,8 +113,8 @@ class TestComputeDimerDg:
         result = compute_dimer_dg("AAAA", "AAAA")
         assert result == 0.0
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
-    @patch("qprimer_designer.external.vienna.subprocess.run")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.subprocess.run")
     def test_unparseable_output_raises(self, mock_run, mock_find):
         mock_run.return_value = MagicMock(
             stdout="no match\n",
@@ -123,12 +123,12 @@ class TestComputeDimerDg:
         with pytest.raises(ValueError, match="Could not parse"):
             compute_dimer_dg("ATCG", "GCTA")
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
     def test_none_seq_raises(self, mock_find):
         with pytest.raises(TypeError):
             compute_dimer_dg(None, "ATCG")
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
     def test_empty_seq_raises(self, mock_find):
         with pytest.raises(ValueError):
             compute_dimer_dg("", "ATCG")
@@ -140,8 +140,8 @@ class TestComputeBatchDimerDg:
     def test_empty_list(self):
         assert compute_batch_dimer_dg([]) == []
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
-    @patch("qprimer_designer.external.vienna.subprocess.run")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.subprocess.run")
     def test_multiple_pairs(self, mock_run, mock_find):
         mock_run.return_value = MagicMock(
             stdout=(
@@ -156,8 +156,8 @@ class TestComputeBatchDimerDg:
         assert result[0] == -5.3
         assert result[1] == -3.2
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
-    @patch("qprimer_designer.external.vienna.subprocess.run")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.subprocess.run")
     def test_count_mismatch_raises(self, mock_run, mock_find):
         mock_run.return_value = MagicMock(
             stdout="..((.....))&..((.....)). : 1,12 : 1,12 ( -5.30)\n",
@@ -171,8 +171,8 @@ class TestComputeBatchDimerDg:
 class TestComputeSelfDimerDg:
     """Tests for compute_self_dimer_dg (mocked)."""
 
-    @patch("qprimer_designer.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
-    @patch("qprimer_designer.external.vienna.subprocess.run")
+    @patch("primercast.external.vienna.find_rnaduplex", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.subprocess.run")
     def test_calls_compute_dimer_dg_with_same_seq(self, mock_run, mock_find):
         mock_run.return_value = MagicMock(
             stdout="..((.....))&..((.....)). : 1,12 : 1,12 ( -2.50)\n",
@@ -194,11 +194,11 @@ class TestFindRnaduplex:
         """Clear LRU cache before each test."""
         find_rnaduplex.cache_clear()
 
-    @patch("qprimer_designer.external.vienna.shutil.which", return_value="/usr/bin/RNAduplex")
+    @patch("primercast.external.vienna.shutil.which", return_value="/usr/bin/RNAduplex")
     def test_found(self, mock_which):
         assert find_rnaduplex() == "/usr/bin/RNAduplex"
 
-    @patch("qprimer_designer.external.vienna.shutil.which", return_value=None)
+    @patch("primercast.external.vienna.shutil.which", return_value=None)
     def test_not_found(self, mock_which):
         with pytest.raises(FileNotFoundError, match="RNAduplex not found"):
             find_rnaduplex()
@@ -210,11 +210,11 @@ class TestFindRnaduplex:
 class TestFindBowtie2:
     """Tests for find_bowtie2."""
 
-    @patch("qprimer_designer.external.bowtie.shutil.which", return_value="/usr/bin/bowtie2")
+    @patch("primercast.external.bowtie.shutil.which", return_value="/usr/bin/bowtie2")
     def test_found(self, mock_which):
         assert find_bowtie2() == "/usr/bin/bowtie2"
 
-    @patch("qprimer_designer.external.bowtie.shutil.which", return_value=None)
+    @patch("primercast.external.bowtie.shutil.which", return_value=None)
     def test_not_found(self, mock_which):
         with pytest.raises(FileNotFoundError, match="bowtie2 not found"):
             find_bowtie2()
@@ -223,11 +223,11 @@ class TestFindBowtie2:
 class TestFindBowtie2Build:
     """Tests for find_bowtie2_build."""
 
-    @patch("qprimer_designer.external.bowtie.shutil.which", return_value="/usr/bin/bowtie2-build")
+    @patch("primercast.external.bowtie.shutil.which", return_value="/usr/bin/bowtie2-build")
     def test_found(self, mock_which):
         assert find_bowtie2_build() == "/usr/bin/bowtie2-build"
 
-    @patch("qprimer_designer.external.bowtie.shutil.which", return_value=None)
+    @patch("primercast.external.bowtie.shutil.which", return_value=None)
     def test_not_found(self, mock_which):
         with pytest.raises(FileNotFoundError, match="bowtie2-build not found"):
             find_bowtie2_build()
@@ -236,8 +236,8 @@ class TestFindBowtie2Build:
 class TestBuildIndex:
     """Tests for build_index (mocked)."""
 
-    @patch("qprimer_designer.external.bowtie.find_bowtie2_build", return_value="/usr/bin/bowtie2-build")
-    @patch("qprimer_designer.external.bowtie.subprocess.run")
+    @patch("primercast.external.bowtie.find_bowtie2_build", return_value="/usr/bin/bowtie2-build")
+    @patch("primercast.external.bowtie.subprocess.run")
     def test_success(self, mock_run, mock_find, tmp_path):
         fasta = tmp_path / "test.fa"
         fasta.write_text(">seq1\nATCG\n")
@@ -246,13 +246,13 @@ class TestBuildIndex:
         build_index(fasta, tmp_path / "idx")
         mock_run.assert_called_once()
 
-    @patch("qprimer_designer.external.bowtie.find_bowtie2_build", return_value="/usr/bin/bowtie2-build")
+    @patch("primercast.external.bowtie.find_bowtie2_build", return_value="/usr/bin/bowtie2-build")
     def test_missing_input(self, mock_find, tmp_path):
         with pytest.raises(FileNotFoundError, match="Input FASTA file not found"):
             build_index(tmp_path / "nonexistent.fa", tmp_path / "idx")
 
-    @patch("qprimer_designer.external.bowtie.find_bowtie2_build", return_value="/usr/bin/bowtie2-build")
-    @patch("qprimer_designer.external.bowtie.subprocess.run")
+    @patch("primercast.external.bowtie.find_bowtie2_build", return_value="/usr/bin/bowtie2-build")
+    @patch("primercast.external.bowtie.subprocess.run")
     def test_subprocess_failure(self, mock_run, mock_find, tmp_path):
         fasta = tmp_path / "test.fa"
         fasta.write_text(">seq1\nATCG\n")
@@ -265,8 +265,8 @@ class TestBuildIndex:
 class TestAlignPrimers:
     """Tests for align_primers (mocked)."""
 
-    @patch("qprimer_designer.external.bowtie.find_bowtie2", return_value="/usr/bin/bowtie2")
-    @patch("qprimer_designer.external.bowtie.subprocess.run")
+    @patch("primercast.external.bowtie.find_bowtie2", return_value="/usr/bin/bowtie2")
+    @patch("primercast.external.bowtie.subprocess.run")
     def test_success(self, mock_run, mock_find, tmp_path):
         query = tmp_path / "primers.fa"
         query.write_text(">p1\nATCG\n")
@@ -278,8 +278,8 @@ class TestAlignPrimers:
         assert "--local" in cmd
         assert "--very-sensitive-local" in cmd
 
-    @patch("qprimer_designer.external.bowtie.find_bowtie2", return_value="/usr/bin/bowtie2")
-    @patch("qprimer_designer.external.bowtie.subprocess.run")
+    @patch("primercast.external.bowtie.find_bowtie2", return_value="/usr/bin/bowtie2")
+    @patch("primercast.external.bowtie.subprocess.run")
     def test_no_local(self, mock_run, mock_find, tmp_path):
         query = tmp_path / "primers.fa"
         query.write_text(">p1\nATCG\n")
@@ -290,7 +290,7 @@ class TestAlignPrimers:
         assert "--local" not in cmd
         assert "--very-sensitive" in cmd
 
-    @patch("qprimer_designer.external.bowtie.find_bowtie2", return_value="/usr/bin/bowtie2")
+    @patch("primercast.external.bowtie.find_bowtie2", return_value="/usr/bin/bowtie2")
     def test_missing_query(self, mock_find, tmp_path):
         with pytest.raises(FileNotFoundError, match="Query FASTA file not found"):
             align_primers(tmp_path / "idx", tmp_path / "nonexistent.fa", tmp_path / "out.sam")
@@ -302,11 +302,11 @@ class TestAlignPrimers:
 class TestFindMafft:
     """Tests for find_mafft."""
 
-    @patch("qprimer_designer.external.mafft.shutil.which", return_value="/usr/bin/mafft")
+    @patch("primercast.external.mafft.shutil.which", return_value="/usr/bin/mafft")
     def test_found(self, mock_which):
         assert find_mafft() == "/usr/bin/mafft"
 
-    @patch("qprimer_designer.external.mafft.shutil.which", return_value=None)
+    @patch("primercast.external.mafft.shutil.which", return_value=None)
     def test_not_found(self, mock_which):
         with pytest.raises(FileNotFoundError, match="mafft not found"):
             find_mafft()
@@ -315,27 +315,27 @@ class TestFindMafft:
 class TestAlignSequences:
     """Tests for align_sequences (mocked)."""
 
-    @patch("qprimer_designer.external.mafft.find_mafft", return_value="/usr/bin/mafft")
+    @patch("primercast.external.mafft.find_mafft", return_value="/usr/bin/mafft")
     def test_missing_input(self, mock_find, tmp_path):
         with pytest.raises(FileNotFoundError, match="Input FASTA file not found"):
             align_sequences(tmp_path / "nonexistent.fa", tmp_path / "out.fa")
 
-    @patch("qprimer_designer.external.mafft.find_mafft", return_value="/usr/bin/mafft")
+    @patch("primercast.external.mafft.find_mafft", return_value="/usr/bin/mafft")
     def test_empty_input(self, mock_find, tmp_path):
         fasta = tmp_path / "empty.fa"
         fasta.write_text("")
         with pytest.raises(ValueError, match="empty"):
             align_sequences(fasta, tmp_path / "out.fa")
 
-    @patch("qprimer_designer.external.mafft.find_mafft", return_value="/usr/bin/mafft")
+    @patch("primercast.external.mafft.find_mafft", return_value="/usr/bin/mafft")
     def test_invalid_format(self, mock_find, tmp_path):
         fasta = tmp_path / "bad.fa"
         fasta.write_text("not a fasta file\n")
         with pytest.raises(ValueError, match="does not appear to be in FASTA format"):
             align_sequences(fasta, tmp_path / "out.fa")
 
-    @patch("qprimer_designer.external.mafft.find_mafft", return_value="/usr/bin/mafft")
-    @patch("qprimer_designer.external.mafft.subprocess.run")
+    @patch("primercast.external.mafft.find_mafft", return_value="/usr/bin/mafft")
+    @patch("primercast.external.mafft.subprocess.run")
     def test_success(self, mock_run, mock_find, tmp_path):
         fasta = tmp_path / "input.fa"
         fasta.write_text(">seq1\nATCG\n>seq2\nGCTA\n")
@@ -350,8 +350,8 @@ class TestAlignSequences:
         assert "--auto" in cmd
         assert "--quiet" in cmd
 
-    @patch("qprimer_designer.external.mafft.find_mafft", return_value="/usr/bin/mafft")
-    @patch("qprimer_designer.external.mafft.subprocess.run")
+    @patch("primercast.external.mafft.find_mafft", return_value="/usr/bin/mafft")
+    @patch("primercast.external.mafft.subprocess.run")
     def test_no_auto_no_quiet(self, mock_run, mock_find, tmp_path):
         fasta = tmp_path / "input.fa"
         fasta.write_text(">seq1\nATCG\n>seq2\nGCTA\n")

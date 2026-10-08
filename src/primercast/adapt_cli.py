@@ -9,16 +9,18 @@ import shutil
 import smtplib
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
-from qprimer_designer.utils.params import parse_params, parse_list_param
+from primercast.utils.diagnostics import explain_run, run_warnings
+from primercast.utils.params import parse_params, parse_list_param
 
 
 # Resolve template path relative to package location
-# Package is at src/qprimer_designer/, template is at workflows/
+# Package is at src/primercast/, template is at workflows/
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent.parent / "workflows" / "Snakefile.template"
 
 
@@ -124,10 +126,38 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
         cmd.append("--dry-run")
 
     print(f"Running: {' '.join(cmd)}")
-    print(f"Working directory: {run_dir.resolve()}")
+    print(f"Working directory: {run_dir.resolve()}", flush=True)
 
+    started_at = time.time()
     result = subprocess.run(cmd, cwd=str(run_dir))
+    if not dry_run:
+        n_warnings = _print_run_warnings(run_dir, since=started_at)
+        if result.returncode != 0:
+            _print_failure_explanation(run_dir)
+        elif n_warnings:
+            print(f"\nPipeline finished with {n_warnings} warning(s); review them "
+                  f"before using the results.", file=sys.stderr)
     return result.returncode
+
+
+def _print_run_warnings(run_dir: Path, since: float | None = None) -> int:
+    """Print evaluate-mode warnings (zero coverage, rescue); return how many."""
+    warnings = run_warnings(run_dir, since=since)
+    if warnings:
+        print("\nWARNINGS:", file=sys.stderr)
+        for w in warnings:
+            print(f"  - {w.message}", file=sys.stderr)
+    return len(warnings)
+
+
+def _print_failure_explanation(run_dir: Path) -> None:
+    """Name the filter that left a pipeline step with no candidates, if any."""
+    diagnoses = explain_run(run_dir)
+    if not diagnoses:
+        return
+    print("\nThe pipeline stopped because a filter removed every candidate:", file=sys.stderr)
+    for d in diagnoses:
+        print(f"  - {d.message}", file=sys.stderr)
 
 
 def cmd_design(args):
@@ -1010,7 +1040,10 @@ def _monitor_evaluate(
     cores: int,
     reuse: bool = False,
 ) -> Path | None:
-    """Run evaluate for a target with a pset. Returns output dir or None."""
+    """Run evaluate for a target with a pset.
+
+    Returns ``(output dir or None, warning messages)``.
+    """
     eval_dir = date_dir / target_name
     if not reuse and eval_dir.exists():
         shutil.rmtree(eval_dir)
@@ -1050,6 +1083,7 @@ def _monitor_evaluate(
     config_args = ["evaluate=1", f"pset={pset_fa.name}"]
 
     print(f"\n  Running evaluate for {target_name}...")
+    started_at = time.time()
     rc = subprocess.run(
         ["snakemake", "-s", "Snakefile", "--cores", str(cores),
          "--config"] + config_args,
@@ -1058,16 +1092,24 @@ def _monitor_evaluate(
 
     if rc != 0:
         print(f"  Evaluate failed for {target_name} (exit code {rc})")
-        return None
+        return None, []
+
+    warnings = [w.message for w in run_warnings(eval_dir, since=started_at)]
 
     # Find output Excel files
     xlsx_files = list(eval_dir.rglob("*.xlsx"))
-    if xlsx_files:
+    if xlsx_files and warnings:
+        print(f"  Evaluate finished with {len(warnings)} warning(s): "
+              f"{len(xlsx_files)} report(s) generated")
+        for message in warnings:
+            print(f"    - {message}")
+        return eval_dir, warnings
+    elif xlsx_files:
         print(f"  Evaluate complete: {len(xlsx_files)} report(s) generated")
-        return eval_dir
+        return eval_dir, warnings
     else:
         print(f"  Warning: no Excel output found")
-        return None
+        return None, warnings
 
 
 def _send_email(
@@ -1312,6 +1354,7 @@ def cmd_monitor(args):
     email_body_parts.append(f"ADAPT Monitor Report — {date_str}\n{'='*50}\n")
 
     all_xlsx: list[Path] = []
+    n_warnings = 0
 
     for target_name, rows in target_groups.items():
         result = fetch_results.get(target_name, {})
@@ -1363,7 +1406,7 @@ def cmd_monitor(args):
             print(f"\n  Using existing {pset_fa.name}")
 
         # Run evaluate
-        eval_dir = _monitor_evaluate(
+        eval_dir, eval_warnings = _monitor_evaluate(
             target_name=target_name,
             target_fasta=target_fasta,
             pset_fa=pset_fa,
@@ -1391,6 +1434,10 @@ def cmd_monitor(args):
                 email_body_parts.append(summary_text)
         else:
             email_body_parts.append("Evaluate failed.\n")
+        if eval_warnings:
+            n_warnings += len(eval_warnings)
+            email_body_parts.append("\nWarnings:")
+            email_body_parts.extend(f"  - {m}" for m in eval_warnings)
 
     # Step 3: Send email
     email_body = "\n".join(email_body_parts)
@@ -1410,7 +1457,11 @@ def cmd_monitor(args):
             print("\nEmail not configured (set EMAIL_SENDER, EMAIL_PASSWORD, "
                   "EMAIL_RECIPIENTS in params.txt)")
 
-    print("\nMonitor complete.")
+    if n_warnings:
+        print(f"\nMonitor finished with {n_warnings} warning(s); review them "
+              f"before using the results.")
+    else:
+        print("\nMonitor complete.")
 
 
 def main():

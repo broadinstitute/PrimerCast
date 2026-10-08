@@ -1,4 +1,4 @@
-"""Streamlit GUI for the qPrimer Designer pipeline."""
+"""Streamlit GUI for the PrimerCast pipeline."""
 
 import json
 import os
@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -88,11 +88,11 @@ def _build_fetch_command(
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Persisted/output data root. Defaults to PROJECT_ROOT (local dev, and the
-# image's writable /app on Cloud Run). Set QPRIMER_DATA_DIR to a mounted volume
+# image's writable /app on Cloud Run). Set PRIMERCAST_DATA_DIR to a mounted volume
 # to persist results across instances/revisions (see terraform/README.md).
 # Reference inputs (target_seqs) stay under PROJECT_ROOT -- they're baked into
 # the image, not user data.
-DATA_DIR = Path(os.environ.get("QPRIMER_DATA_DIR") or PROJECT_ROOT)
+DATA_DIR = Path(os.environ.get("PRIMERCAST_DATA_DIR") or PROJECT_ROOT)
 
 TARGET_SEQS_DIR = PROJECT_ROOT / "target_seqs"
 FASTA_DIR = TARGET_SEQS_DIR / "original"
@@ -102,14 +102,16 @@ SCHEMATIC_PATH = PROJECT_ROOT / "schematic.png"
 # Ensure the upload directory exists
 FASTA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Add src/ to path so we can import qprimer_designer utilities
+# Add src/ to path so we can import primercast utilities
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
-from qprimer_designer.utils.params import parse_params
-from qprimer_designer.adapt_cli import (
+from gui import error_report
+from primercast.utils.params import parse_params
+from primercast.utils.diagnostics import explain_run, run_warnings
+from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
     _load_spreadsheet,
@@ -129,6 +131,14 @@ from qprimer_designer.adapt_cli import (
 )
 
 MONITOR_DIR = DATA_DIR / "monitor"
+
+# Error reports ("Report a problem" button). On Cloud Run, bundles go to the GCS
+# bucket in PRIMERCAST_REPORT_BUCKET (see terraform/error_reports.tf); without it
+# (local dev) they are saved under DATA_DIR/error_reports and offered as a download.
+REPORT_BUCKET = os.environ.get("PRIMERCAST_REPORT_BUCKET", "").strip()
+REPORT_PREFIX = os.environ.get("PRIMERCAST_REPORT_PREFIX", "").strip() or "local"
+REPORTS_LOCAL_DIR = DATA_DIR / "error_reports"
+MAX_REPORTS_PER_SESSION = 3
 MONITOR_SCHEDULE_PATH = MONITOR_DIR / "schedule.json"
 VIRUS_MAP_DATA_DIR = Path(__file__).parent / "virus_map_data"
 
@@ -136,7 +146,7 @@ VIRUS_MAP_DATA_DIR = Path(__file__).parent / "virus_map_data"
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="qPrimer Designer",
+    page_title="PrimerCast",
     layout="wide",
 )
 
@@ -476,7 +486,7 @@ def _check_tool(name: str) -> bool:
 
 def _render_sidebar():
     with st.sidebar:
-        st.title("qPrimer Designer")
+        st.title("PrimerCast")
         st.caption(f"Working directory: `{PROJECT_ROOT}`")
 
         st.divider()
@@ -781,7 +791,7 @@ def _page_home():
     # Description
     st.markdown(
         """
-qPrimer Designer is an AI-powered tool for PCR diagnostics primer design and
+PrimerCast is an AI-powered tool for PCR diagnostics primer design and
 evaluation. It enables a **scalable, data-driven approach for adaptive
 diagnostic design** against rapidly evolving pathogens — accessible anywhere
 in the world, without requiring deep specialist expertise.
@@ -1864,8 +1874,12 @@ _PER_TARGET_RULES = {
 }
 
 
-def _save_run_config():
-    """Save all run settings to a JSON file alongside the final output."""
+def _save_run_config(status: str | None = None):
+    """Save all run settings to a JSON file alongside the final output.
+
+    Called when a run starts (status "running") and again when it ends, so
+    failed runs also have their config on disk for error reports.
+    """
     run_id = st.session_state.get("run_id", "")
     if not run_id:
         return
@@ -1885,6 +1899,8 @@ def _save_run_config():
                                               st.session_state.get("_probe_enabled_saved", False)),
         "cores": st.session_state.get("cores", 1),
     }
+    if status:
+        config["status"] = status
 
     # Fetch settings (target)
     fetch_prefix = "fetch"
@@ -2003,6 +2019,18 @@ def _tab_run():
 
         scratch_dir = _write_pipeline_files()
 
+        # Keep a copy of the run's inputs and a live log next to its outputs
+        # (the scratch dir is deleted afterwards); error reports bundle these.
+        run_out_dir = RUNS_DIR / st.session_state.run_id
+        run_out_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("Snakefile", "params.txt"):
+            if (scratch_dir / name).is_file():
+                shutil.copy2(scratch_dir / name, run_out_dir / name)
+        st.session_state.pipeline_run_id = st.session_state.run_id
+        st.session_state.pipeline_started_at = time.time()
+        _save_run_config(status="running")
+        log_fh = open(run_out_dir / "pipeline.log", "w", buffering=1)
+
         # Unlock the (fresh) scratch dir in case of a leftover lock from a crash.
         snakemake_bin = _find_tool("snakemake") or "snakemake"
         subprocess.run(
@@ -2014,7 +2042,7 @@ def _tab_run():
         env["PYTHONUNBUFFERED"] = "1"
         # Ensure the conda env bin dir is on PATH (for sam2pairwise, bowtie2, etc.)
         # Use snakemake's location to find the correct env bin dir, since
-        # CONDA_PREFIX may point to the base env rather than qprimer-designer.
+        # CONDA_PREFIX may point to the base env rather than primercast.
         snakemake_path = _find_tool("snakemake")
         env_bin = str(Path(sys.executable).parent)
         extra_dirs = [env_bin]
@@ -2113,6 +2141,7 @@ def _tab_run():
             line = proc.stdout.readline()
             if line:
                 log += line
+                log_fh.write(line)
                 stripped = line.strip()
                 if stripped.startswith("rule ") or stripped.startswith("localrule "):
                     rule_name = stripped.split("rule ")[1].rstrip(":")
@@ -2151,6 +2180,8 @@ def _tab_run():
         remaining = proc.stdout.read()
         if remaining:
             log += remaining
+            log_fh.write(remaining)
+        log_fh.close()
 
         # Mark last rule as complete
         _finish_current()
@@ -2196,11 +2227,12 @@ def _tab_run():
         progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
         status_area.caption(f"Completed in {mins}m {secs}s")
 
-        if rc == 0:
-            _save_run_config()
-            st.success("Pipeline finished successfully!")
-        else:
-            st.error(f"Pipeline failed with exit code {rc}.")
+        warnings = _pipeline_warnings()
+        _save_run_config(status=(f"failed (exit code {rc})" if rc != 0
+                                 else "succeeded with warnings" if warnings
+                                 else "succeeded"))
+        _render_pipeline_outcome(rc, warnings)
+        if rc != 0:
             with st.expander("Show error log"):
                 last_lines = "\n".join(log.splitlines()[-50:])
                 st.code(last_lines, language="text")
@@ -2226,15 +2258,73 @@ def _tab_run():
                 lines.append(f"⚪ &nbsp; {label}")
         st.markdown("<br>".join(lines), unsafe_allow_html=True)
 
-        if rc == 0:
-            st.success("Pipeline finished successfully!")
-        else:
-            st.error(f"Pipeline failed with exit code {rc}.")
+        _render_pipeline_outcome(rc, _pipeline_warnings())
+        if rc != 0:
             log = st.session_state.get("pipeline_log", "")
             if log:
                 with st.expander("Show error log"):
                     last_lines = "\n".join(log.splitlines()[-50:])
                     st.code(last_lines, language="text")
+
+
+def _pipeline_diagnoses(run_id: str) -> list:
+    """Steps of the last pipeline run that a filter left with no candidates."""
+    if not run_id or st.session_state.get("pipeline_run_id") != run_id:
+        return []
+    return explain_run(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
+
+
+def _render_funnel_table(steps: list):
+    st.table([
+        {
+            "Filter": step.get("filter", ""),
+            "Remaining": f"{step.get('remaining', 0):,}",
+            "Controlled by": ", ".join(
+                f"{k}={v}" for k, v in (step.get("params") or {}).items()),
+        }
+        for step in steps
+    ])
+
+
+def _render_failure_diagnosis():
+    """Name the filter that stopped the pipeline, with its candidate funnel."""
+    for diagnosis in _pipeline_diagnoses(st.session_state.get("pipeline_run_id", "")):
+        st.error(f"**No candidates left.** {diagnosis.message}")
+        with st.expander(f"Filter stage: {diagnosis.stage_label}"
+                         + (f" ({diagnosis.target})" if diagnosis.target else "")):
+            _render_funnel_table(diagnosis.steps)
+
+
+def _render_run_warnings(warnings: list):
+    """Evaluate-mode warnings: zero on-target coverage, rescue re-evaluation."""
+    for warning in warnings:
+        if warning.kind == "rescue":
+            st.warning(warning.message)
+            continue
+        st.warning(f"**No predicted coverage.** {warning.message}")
+        with st.expander("Filter stages"
+                         + (f" ({warning.target})" if warning.target else "")):
+            _render_funnel_table(warning.steps)
+
+
+def _pipeline_warnings() -> list:
+    """Warnings for the pipeline run started from this session."""
+    run_id = st.session_state.get("pipeline_run_id", "")
+    if not run_id:
+        return []
+    return run_warnings(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
+
+
+def _render_pipeline_outcome(rc: int, warnings: list):
+    """Final status of a pipeline run. A run with warnings is not reported as a success."""
+    if rc != 0:
+        st.error(f"Pipeline failed with exit code {rc}.")
+        _render_failure_diagnosis()
+    elif warnings:
+        st.warning(f"**Pipeline finished with {len(warnings)} warning(s).** ")
+    else:
+        st.success("Pipeline finished successfully!")
+    _render_run_warnings(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -2740,7 +2830,7 @@ def _tab_results():
     st.markdown(
         "For help interpreting output columns, see the "
         "[Output Interpretation Guide]"
-        "(https://github.com/broadinstitute/qprimer_designer/blob/main/docs/output_interpretation_guide.md)."
+        "(https://github.com/broadinstitute/PrimerCast/blob/main/docs/output_interpretation_guide.md)."
     )
 
     run_id = st.session_state.get("run_id", "")
@@ -2829,6 +2919,8 @@ def _tab_results():
     # --- Evaluate reports (evaluate/monitor workflows only) ---
     if workflow in ("evaluate", "monitor"):
         st.subheader("Evaluation reports")
+        if workflow == "evaluate" and run_dir and run_dir.exists():
+            _render_run_warnings(run_warnings(run_dir))
 
         if workflow == "monitor" and run_id and (MONITOR_DIR / run_id).exists():
             xlsx_files = sorted((MONITOR_DIR / run_id).glob("*.xlsx"), reverse=True)
@@ -3588,7 +3680,7 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         pd.concat(meta_dfs, ignore_index=True).to_csv(meta_dest, index=False)
 
                     # Filter by subtype if specified
-                    from qprimer_designer.adapt_cli import _filter_fasta_by_subtype, _deduplicate_fasta
+                    from primercast.adapt_cli import _filter_fasta_by_subtype, _deduplicate_fasta
                     subtype = st.session_state.get(f"{prefix}_subtype_filter", "").strip()
                     n_subtype_removed = 0
                     if subtype:
@@ -4581,6 +4673,7 @@ def _run_monitor():
     ]
 
     all_xlsx: list[Path] = []
+    monitor_warnings: list[str] = []
     email_body_parts = [f"ADAPT Monitor Report — {date_str}\n{'=' * 50}\n"]
 
     if targets_with_new:
@@ -4688,6 +4781,9 @@ def _run_monitor():
                 email_body_parts.append("Evaluate failed.\n")
                 continue
 
+            eval_warnings = [w.message for w in run_warnings(eval_dir)]
+            monitor_warnings.extend(f"{target_name}: {m}" for m in eval_warnings)
+
             # Collect Excel files
             xlsx_files = sorted(eval_dir.rglob("*.xlsx"))
             for xlsx in xlsx_files:
@@ -4700,8 +4796,15 @@ def _run_monitor():
                 email_body_parts.append(f"\n  --- {xlsx.stem} ---")
                 summary_text = _read_excel_summary(xlsx)
                 email_body_parts.append(summary_text)
+            if eval_warnings:
+                email_body_parts.append("\nWarnings:")
+                email_body_parts.extend(f"  - {m}" for m in eval_warnings)
 
-        progress_lines[-1] = f"✅ &nbsp; Evaluation complete — {len(all_xlsx)} report(s)"
+        if monitor_warnings:
+            progress_lines[-1] = (f"Evaluation finished with {len(monitor_warnings)} "
+                                  f"warning(s) — {len(all_xlsx)} report(s)")
+        else:
+            progress_lines[-1] = f"✅ &nbsp; Evaluation complete — {len(all_xlsx)} report(s)"
         _update(progress_lines)
     else:
         progress_lines.append("✅ &nbsp; No new sequences — evaluation skipped")
@@ -4732,7 +4835,7 @@ def _run_monitor():
         if ok:
             progress_lines[-1] = f"✅ &nbsp; Email sent to {', '.join(email_recipients)}"
         else:
-            progress_lines[-1] = "⚠️ &nbsp; Email sending failed"
+            progress_lines[-1] = "Email sending failed"
         _update(progress_lines)
     elif not email_sender or not _email_password:
         progress_lines.append("⚪ &nbsp; Email skipped (not configured)")
@@ -4749,8 +4852,11 @@ def _run_monitor():
     st.session_state.pipeline_running = False
     st.session_state.pipeline_return_code = 0
     st.session_state.monitor_results_dir = str(date_dir)
+    st.session_state.monitor_warnings = monitor_warnings
 
-    if all_xlsx:
+    if all_xlsx and monitor_warnings:
+        _render_monitor_warnings(monitor_warnings, f"{len(all_xlsx)} report(s) generated. ")
+    elif all_xlsx:
         st.success(f"Monitor complete — {len(all_xlsx)} report(s) generated.")
     elif total_new == 0:
         st.info("No new sequences found. Nothing to evaluate.")
@@ -4806,10 +4912,147 @@ def _tab_run_monitor():
 
     elif not running and st.session_state.get("pipeline_return_code") is not None:
         rc = st.session_state.pipeline_return_code
-        if rc == 0:
-            st.success("Monitor completed successfully!")
-        else:
+        monitor_warnings = st.session_state.get("monitor_warnings", [])
+        if rc != 0:
             st.error("Monitor failed.")
+        elif monitor_warnings:
+            _render_monitor_warnings(monitor_warnings)
+        else:
+            st.success("Monitor completed successfully!")
+
+
+def _render_monitor_warnings(warnings: list[str], detail: str = ""):
+    """Monitor status when an evaluation produced warnings (not a success)."""
+    st.warning(f"**Monitor finished with {len(warnings)} warning(s).** {detail}"
+               "Review them before using the results.")
+    for message in warnings:
+        st.warning(message)
+
+
+# ---------------------------------------------------------------------------
+# Error reports
+# ---------------------------------------------------------------------------
+
+def _build_error_report(run_id: str, context: str, message: str, email: str) -> dict:
+    """Assemble report.json for a run (settings, pipeline state, session)."""
+    from primercast import __version__
+
+    run_config = {}
+    config_path = RUNS_DIR / run_id / "run_config.json"
+    if config_path.is_file():
+        try:
+            run_config = json.loads(config_path.read_text())
+        except (OSError, ValueError):
+            pass
+
+    pipeline = {}
+    if st.session_state.get("pipeline_run_id") == run_id:
+        pipeline = {
+            "return_code": st.session_state.get("pipeline_return_code"),
+            "completed_rules": sorted(st.session_state.get("pipeline_completed_rules", set())),
+            "rule_done_targets": {
+                rule: sorted(targets) for rule, targets in
+                st.session_state.get("pipeline_rule_done_targets", {}).items()
+            },
+            "no_candidates": [d.message for d in _pipeline_diagnoses(run_id)],
+            "warnings": [w.message for w in run_warnings(
+                RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))],
+        }
+
+    return {
+        "report_id": error_report.new_report_id(),
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "context": context,
+        "run_id": run_id,
+        "workflow": run_config.get("workflow") or st.session_state.get("workflow", ""),
+        "mode": run_config.get("mode") or st.session_state.get("mode", ""),
+        "user_message": message.strip()[:error_report.MAX_MESSAGE_CHARS],
+        "contact_email": error_report.clean_contact_email(email),
+        "app": {
+            "version": __version__,
+            "service": os.environ.get("K_SERVICE", ""),
+            "revision": os.environ.get("K_REVISION", ""),
+        },
+        "pipeline": pipeline,
+        "run_config": run_config,
+        "session_state": error_report.snapshot_state(st.session_state.to_dict()),
+    }
+
+
+def _error_report_inputs(report: dict) -> list[tuple[Path, str]]:
+    """Input FASTAs/MSAs (and uploaded primer set) the reported run used."""
+    config = report.get("run_config") or {}
+    if config:
+        names = (config.get("targets", []) + config.get("cross_reactivity", [])
+                 + config.get("host", []) + [config.get("eval_target", "")])
+        extra = [config.get("eval_pset_path", "")]
+    else:
+        names = (_get_all_targets() + st.session_state.get("panel", [])
+                 + st.session_state.get("host_multiplex", [])
+                 + [st.session_state.get("eval_target", "")])
+        extra = [st.session_state.get("eval_pset_path", "")]
+    return error_report.resolve_input_files(
+        names, TARGET_SEQS_DIR, extra, extra_allowed_dir=PROJECT_ROOT / "evaluate",
+    )
+
+
+@st.dialog("Report a problem")
+def _report_dialog(run_id: str, context: str):
+    st.markdown(f"Send run **{run_id}** to the PrimerCast team so we can investigate.")
+    message = st.text_area("What went wrong? (optional)",
+                           max_chars=error_report.MAX_MESSAGE_CHARS)
+    email = st.text_input("Your email (optional, so we can follow up)")
+    st.caption(
+        "The report includes this run's settings, log and output files, plus the "
+        "sequence files it used. Reports are kept privately for 90 days."
+    )
+    if not st.button("Send report", type="primary"):
+        return
+    if email.strip() and not error_report.clean_contact_email(email):
+        st.error("That email address doesn't look valid.")
+        return
+
+    report = _build_error_report(run_id, context, message, email)
+    with st.spinner("Packaging and sending report..."):
+        try:
+            result = error_report.submit_report(
+                report=report,
+                run_id=run_id,
+                run_dir=RUNS_DIR / run_id,
+                input_files=_error_report_inputs(report),
+                bucket=REPORT_BUCKET or None,
+                prefix=REPORT_PREFIX,
+                local_dir=REPORTS_LOCAL_DIR,
+            )
+        except Exception as exc:
+            st.error(f"Could not send the report: {exc}")
+            return
+    st.session_state._error_reports_sent = st.session_state.get("_error_reports_sent", 0) + 1
+
+    if result.local_path is None:
+        st.success(f"Report sent — thank you! Reference: `{result.report_id}`")
+    else:
+        st.success(f"Report saved to `{result.location}`.")
+        st.download_button(
+            "Download report",
+            data=result.local_path.read_bytes(),
+            file_name=result.local_path.name,
+            mime="application/gzip",
+        )
+        st.caption("Please email this file to us (see the Contact page).")
+
+
+def _render_report_button(run_id: str, context: str):
+    """Render the "Report a problem" button (hidden if the run has no output dir)."""
+    if not run_id or not (RUNS_DIR / run_id).is_dir():
+        return
+    if st.session_state.get("_error_reports_sent", 0) >= MAX_REPORTS_PER_SESSION:
+        st.caption("Report limit reached for this session — please contact us directly "
+                   "(see the Contact page).")
+        return
+    if st.button(":material/bug_report: Report a problem", key=f"report_problem_{context}",
+                 type="primary"):
+        _report_dialog(run_id, context)
 
 
 def _page_run():
@@ -4842,6 +5085,8 @@ def _page_run():
         if st.button("View Results →", type="primary", use_container_width=True):
             _navigate("results")
             st.rerun()
+        if workflow != "monitor":
+            _render_report_button(st.session_state.get("pipeline_run_id", ""), "run_page")
 
 
 def _page_results():
@@ -4851,6 +5096,9 @@ def _page_results():
         _navigate("run")
         st.rerun()
     _tab_results()
+    if st.session_state.get("workflow", "design") != "monitor":
+        st.divider()
+        _render_report_button(st.session_state.get("run_id", ""), "results_page")
 
 
 def _get_active_cron_monitor() -> str | None:

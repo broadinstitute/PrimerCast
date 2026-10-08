@@ -13,7 +13,8 @@ import pandas as pd
 from Bio import SeqIO
 from pandas.errors import EmptyDataError
 
-from qprimer_designer.utils import parse_params, reverse_complement_dna
+from primercast.utils import parse_params, reverse_complement_dna
+from primercast.utils.diagnostics import StageDiagnostics
 
 # GC-based Tm with offset to approximate Tm_NN(Na=50, Mg=1.5, dNTPs=0.6)
 _LOG10_NA = log10(0.05)
@@ -43,6 +44,10 @@ amplicons and computes amplicon-level features.
     parser.add_argument("--reftype", dest="reftype", required=True, choices=["on", "off"], help="on-target or off-target")
     parser.add_argument("--features", dest="pri_features", required=True, help="Primer features CSV")
     parser.add_argument("--prev", default="", help="Previous evaluation file (for off-target restriction)")
+    parser.add_argument(
+        "--fail-if-empty", action="store_true",
+        help="Exit with an explanation if no primer pairs form (used for on-target references)",
+    )
     parser.set_defaults(func=run)
 
 
@@ -64,6 +69,11 @@ def run(args):
     max_off_len = int(params.get("OFFLEN_MAX", 5000))
     num_select = int(params.get("NUM_TOP_SENSITIVITY", 100))
 
+    ref_name = Path(args.reference).stem
+    diag = StageDiagnostics(
+        "prepare_input", target=ref_name, unit="primer pairs",
+        fatal=bool(getattr(args, "fail_if_empty", False)),
+    )
     print(f"Preparing ML input from {args.mapped}...")
     start_time = time.time()
     nlines = 0
@@ -99,11 +109,15 @@ def run(args):
     cols = ['pname', 'orientation', 'tname', 'start', 'pseq', 'tseq', 'match']
     try:
         raw = pd.read_table(args.mapped, sep='\t', names=cols)
-        if raw.empty:
-            Path(args.ml_input).touch()
-            sys.exit()
     except EmptyDataError:
+        raw = pd.DataFrame(columns=cols)
+    if raw.empty:
         Path(args.ml_input).touch()
+        diag.record(
+            f"Primer alignments to {ref_name}", 0,
+            hint="No primer aligned to this reference (bowtie2 found no hits).",
+        )
+        diag.finish(args.ml_input)
         sys.exit()
 
     raw['orientation'] = raw['orientation'] % 256
@@ -134,6 +148,25 @@ def run(args):
         revs = maptbl[maptbl['orientation'] == 16].drop(columns=drop_cols)
         minl, maxl = min_off_len, max_off_len
         lfunc = min
+
+    def _n_primers(df, forrev=None):
+        if forrev is not None:
+            df = df[df['forrev'] == forrev]
+        return df['pname'].nunique()
+
+    n_aligned = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
+    diag.record(
+        f"Primer alignments to {ref_name}", min(n_aligned),
+        breakdown={"forward": n_aligned[0], "reverse": n_aligned[1]},
+        hint="Pairs need at least one forward and one reverse primer that align.",
+    )
+    n_oriented = (_n_primers(fors), _n_primers(revs))
+    if args.reftype == 'on':
+        diag.record(
+            "Binding orientation", min(n_oriented),
+            breakdown={"forward": n_oriented[0], "reverse": n_oriented[1]},
+            hint="Forward primers must bind the + strand and reverse primers the - strand.",
+        )
 
     revs['pseq'] = revs['pseq'].apply(reverse_complement_dna)
     revs['tseq'] = revs['tseq'].apply(reverse_complement_dna)
@@ -267,6 +300,15 @@ def run(args):
         Path(args.ml_input).touch()
     else:
         pd.concat(allpairs, ignore_index=True).to_csv(args.ml_input, index=False)
+
+    len_param = "AMPLEN" if args.reftype == 'on' else "OFFLEN"
+    diag.record(
+        "Amplicon length" + (" (and off-target pair restriction)"
+                             if args.reftype == 'off' and valid_pairs is not None else ""),
+        nlines, {f"{len_param}_MIN": minl, f"{len_param}_MAX": maxl},
+        hint="Forward and reverse primers must bind the same sequence within this product length.",
+    )
+    diag.finish(args.ml_input)
 
     runtime = time.time() - start_time
     print(f"Wrote {nlines} lines to {args.ml_input} ({runtime:.1f} sec)")

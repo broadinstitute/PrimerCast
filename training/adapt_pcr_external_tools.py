@@ -7,10 +7,10 @@
 - primer3: libprimer3 release 2.6.1
 
 Tool paths can be configured via environment variables:
-- QPRIMER_TOOLPATH: Base path for tools (if tools are in a custom location)
+- PRIMERCAST_TOOLPATH: Base path for tools (if tools are in a custom location)
 - RNASTRUCTURE_DATAPATH: Path to RNAstructure data tables
 
-If QPRIMER_TOOLPATH is not set, tools are assumed to be in PATH
+If PRIMERCAST_TOOLPATH is not set, tools are assumed to be in PATH
 (e.g., installed via conda).
 """
 
@@ -31,12 +31,12 @@ def _find_tool(name: str, toolpath: str | None = None, subpath: str | None = Non
         return path
 
     raise FileNotFoundError(
-        f"{name} not found. Install via conda or set QPRIMER_TOOLPATH environment variable."
+        f"{name} not found. Install via conda or set PRIMERCAST_TOOLPATH environment variable."
     )
 
 
 # Get optional tool path from environment
-TOOLPATH = os.environ.get('QPRIMER_TOOLPATH')
+TOOLPATH = os.environ.get('PRIMERCAST_TOOLPATH')
 DATAPATH = os.environ.get(
     'RNASTRUCTURE_DATAPATH',
     os.path.join(TOOLPATH, 'RNAstructure/data_tables') if TOOLPATH else ''

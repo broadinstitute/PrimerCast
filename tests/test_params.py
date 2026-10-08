@@ -3,7 +3,7 @@
 import pytest
 import tempfile
 import os
-from qprimer_designer.utils.params import parse_params
+from primercast.utils.params import parse_params
 
 
 class TestParseParams:

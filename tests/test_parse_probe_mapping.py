@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from qprimer_designer.commands.parse_probe_mapping import run
+from primercast.commands.parse_probe_mapping import run
 
 
 class TestParseProbeMapping:

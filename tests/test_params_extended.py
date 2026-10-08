@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from qprimer_designer.utils.params import (
+from primercast.utils.params import (
     parse_params,
     get_primer_params,
     get_probe_params,

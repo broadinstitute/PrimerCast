@@ -2,7 +2,7 @@
 
 import pytest
 
-from qprimer_designer.commands.filter_primers import _find_position_valid_probes
+from primercast.commands.filter_primers import _find_position_valid_probes
 
 
 class TestFindPositionValidProbes:

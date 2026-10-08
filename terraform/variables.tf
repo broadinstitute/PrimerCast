@@ -13,19 +13,19 @@ variable "region" {
 variable "service_name" {
   description = "Cloud Run service name and the user-visible app slug."
   type        = string
-  default     = "qprimer-designer"
+  default     = "primercast"
 }
 
 variable "image" {
-  description = "Fully-qualified container image to deploy. The CI workflow pushes a :<sha> tag; for steady-state deploys we point at :latest. This is the CPU-only GAR image (Cloud Run has no GPU)."
+  description = "Container image used only when terraform first creates the Cloud Run services (both ignore image changes afterwards; CI deploys the real CPU-only GAR image). Defaults to Google's public placeholder so the services can be created before CI has pushed anything to the new GAR repo."
   type        = string
-  default     = "us-central1-docker.pkg.dev/sabeti-adapt/qprimer-designer/qprimer-designer:latest"
+  default     = "us-docker.pkg.dev/cloudrun/container/hello"
 }
 
 variable "gar_repository_id" {
-  description = "Artifact Registry repository ID for the qprimer-designer Docker image."
+  description = "Artifact Registry repository ID for the primercast Docker image."
   type        = string
-  default     = "qprimer-designer"
+  default     = "primercast"
 }
 
 variable "cloud_run_min_instances" {
@@ -67,5 +67,26 @@ variable "cloud_run_concurrency" {
 variable "custom_domain" {
   description = "Custom domain to map to the production Cloud Run service. Leave empty to skip domain mapping."
   type        = string
-  default     = "qprimer-designer.sabeti.broadinstitute.org"
+  default     = "primercast.sabeti.broadinstitute.org"
+}
+
+variable "error_report_bucket_name" {
+  description = "GCS bucket (globally unique name) for \"Report a problem\" bundles from the web app."
+  type        = string
+  default     = "sabeti-adapt-primercast-error-reports"
+}
+
+variable "error_report_retention_days" {
+  description = "Error report bundles are deleted this many days after upload."
+  type        = number
+  default     = 90
+}
+
+variable "error_report_notification_emails" {
+  description = "Addresses emailed (via a Cloud Logging alert) when a user submits an error report."
+  type        = list(string)
+  default = [
+    "khsu@broadinstitute.org",
+    "baekseun@broadinstitute.org",
+  ]
 }

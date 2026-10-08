@@ -54,7 +54,7 @@ class TestEvaluateProbeRun:
     """Tests for evaluate_probe.run()."""
 
     def test_exact_match_found(self, eval_probe_data):
-        from qprimer_designer.commands.evaluate_probe import run
+        from primercast.commands.evaluate_probe import run
         args = _make_args(eval_probe_data)
         run(args)
 
@@ -65,7 +65,7 @@ class TestEvaluateProbeRun:
         assert any(fwd_hits["mismatches"] == 0.0)
 
     def test_empty_probe_fa(self, eval_probe_data):
-        from qprimer_designer.commands.evaluate_probe import run
+        from primercast.commands.evaluate_probe import run
         eval_probe_data["probe_fa"].write_text("")
         args = _make_args(eval_probe_data)
         run(args)
@@ -74,7 +74,7 @@ class TestEvaluateProbeRun:
         assert len(df) == 0
 
     def test_missing_eval_full(self, eval_probe_data):
-        from qprimer_designer.commands.evaluate_probe import run
+        from primercast.commands.evaluate_probe import run
         eval_probe_data["eval_full"].unlink()
         args = _make_args(eval_probe_data)
         run(args)
@@ -83,7 +83,7 @@ class TestEvaluateProbeRun:
         assert len(df) == 0
 
     def test_tseq_and_match_columns_present(self, eval_probe_data):
-        from qprimer_designer.commands.evaluate_probe import run
+        from primercast.commands.evaluate_probe import run
         args = _make_args(eval_probe_data)
         run(args)
 
@@ -93,7 +93,7 @@ class TestEvaluateProbeRun:
 
     def test_strict_threshold_filters(self, eval_probe_data):
         """With max_mismatches=0 and a probe that has mismatches, no hits."""
-        from qprimer_designer.commands.evaluate_probe import run
+        from primercast.commands.evaluate_probe import run
         # Write a probe that doesn't exactly match
         eval_probe_data["probe_fa"].write_text(">probe1\nCCCCCCCCCCCCCCCCCCCC\n")
         args = _make_args(eval_probe_data, max_mismatches=0)
@@ -104,7 +104,7 @@ class TestEvaluateProbeRun:
 
     def test_target_not_in_ref(self, eval_probe_data):
         """eval.full references a target not in ref FASTA → gracefully skip."""
-        from qprimer_designer.commands.evaluate_probe import run
+        from primercast.commands.evaluate_probe import run
         eval_probe_data["eval_full"].write_text(
             "pname_f,pname_r,targets,starts,prod_len\n"
             "fwd1,rev1,\"['nonexistent']\",\"[0]\",40\n"
@@ -117,8 +117,8 @@ class TestEvaluateProbeRun:
 
     def test_reverse_complement_hit(self, eval_probe_data):
         """Probe RC should also produce hits."""
-        from qprimer_designer.commands.evaluate_probe import run
-        from qprimer_designer.utils.sequences import reverse_complement_dna
+        from primercast.commands.evaluate_probe import run
+        from primercast.utils.sequences import reverse_complement_dna
 
         probe_seq = "ATCGATCGATCGATCGATCG"
         probe_rc = reverse_complement_dna(probe_seq)
@@ -138,7 +138,7 @@ class TestEvaluateProbeRegister:
     """Tests for CLI registration."""
 
     def test_register_adds_subcommand(self):
-        from qprimer_designer.commands.evaluate_probe import register
+        from primercast.commands.evaluate_probe import register
         parser = argparse.ArgumentParser()
         subparsers = parser.add_subparsers()
         register(subparsers)

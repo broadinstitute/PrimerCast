@@ -1,25 +1,25 @@
 #!/usr/bin/env python
-"""qprimer - ML-guided PCR primer design CLI."""
+"""primercast - ML-guided PCR primer design CLI."""
 
 import argparse
 import sys
 
 
 def main():
-    """Main entry point for the qprimer CLI."""
+    """Main entry point for the primercast CLI."""
     parser = argparse.ArgumentParser(
-        prog="qprimer",
+        prog="primercast",
         description="ML-guided PCR primer design with off-target minimization",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  qprimer generate --in targets.fa --out primers.fa --params params.txt --name myprimer
-  qprimer generate-probe --in targets.fa --out probes.fa --params params.txt --name myprobe
-  qprimer prepare-features --fa my_primers.fa --out primers.feat
-  qprimer evaluate --in input.csv --out output.csv --ref reference.fa --reftype on
-  qprimer export-report --on eval.on --off eval.off1 eval.off2 --out reports/ --names primer1 primer2
+  primercast generate --in targets.fa --out primers.fa --params params.txt --name myprimer
+  primercast generate-probe --in targets.fa --out probes.fa --params params.txt --name myprobe
+  primercast prepare-features --fa my_primers.fa --out primers.feat
+  primercast evaluate --in input.csv --out output.csv --ref reference.fa --reftype on
+  primercast export-report --on eval.on --off eval.off1 eval.off2 --out reports/ --names primer1 primer2
 For more information on a specific command:
-  qprimer <command> --help
+  primercast <command> --help
 """,
     )
     parser.add_argument(
@@ -36,7 +36,7 @@ For more information on a specific command:
     )
 
     # Import and register subcommands
-    from qprimer_designer.commands import (
+    from primercast.commands import (
         generate,
         generate_probe,
         parse_probe_mapping,

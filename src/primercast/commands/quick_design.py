@@ -16,12 +16,12 @@ from torch.utils.data import DataLoader
 
 from Bio.SeqUtils import gc_fraction
 
-from qprimer_designer.commands.generate import generate_primers_multi, generate_primers_single
-from qprimer_designer.commands.prepare_input import run as run_prepare_input
-from qprimer_designer.external import compute_batch_dimer_dg
-from qprimer_designer.external.bowtie import build_index, find_bowtie2
-from qprimer_designer.models import load_models, PcrDataset, FEATURE_COLUMNS
-from qprimer_designer.utils import (
+from primercast.commands.generate import generate_primers_multi, generate_primers_single
+from primercast.commands.prepare_input import run as run_prepare_input
+from primercast.external import compute_batch_dimer_dg
+from primercast.external.bowtie import build_index, find_bowtie2
+from primercast.models import load_models, PcrDataset, FEATURE_COLUMNS
+from primercast.utils import (
     encode_batch_parallel,
     get_tm,
     has_homopolymer,
@@ -36,6 +36,7 @@ from qprimer_designer.utils import (
     wobble_mismatch_count_cols,
     wobble_mismatch_count_gapped,
 )
+from primercast.utils.diagnostics import StageDiagnostics
 
 
 def register(subparsers):
@@ -496,17 +497,25 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
 
 def extract_primers_at_positions(aligned_seqs, positions, primer_len,
                                  min_tm, max_tm, max_gc, min_dg,
-                                 n_variants=2, max_pri_len=None):
+                                 n_variants=2, max_pri_len=None, diag=None):
     """Generate consensus + wobble primer variants at scored positions.
 
     Each position is a 5-tuple (fwd_start, fwd_len, rev_start, rev_len, score).
     For each, generates 2 variants per direction (consensus + wobble-optimal),
     filters by Tm/GC/dG, and builds fwd×rev pairs.
 
+    If ``diag`` (a StageDiagnostics) is given, the count left after each
+    filter is recorded in it.
+
     Returns list of primer pair dicts and features dict.
     """
     primers = []
     features = {}
+
+    def _record(name, n_fwd, n_rev, params):
+        if diag is not None:
+            diag.record(name, min(n_fwd, n_rev), params=params,
+                        breakdown={"forward": n_fwd, "reverse": n_rev})
 
     fwd_candidates = []  # (pos_idx, var_idx, seq, tm, gc, pos_score)
     rev_candidates = []
@@ -549,6 +558,9 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
             if min_tm <= tm <= max_tm and gc <= max_gc / 100.0:
                 rev_candidates.append((pos_idx, vi, rev_seq, tm, gc, pos_score))
 
+    _record("Primer Tm / GC", len(fwd_candidates), len(rev_candidates),
+            {"TM_MIN": min_tm, "TM_MAX": max_tm, "GC_MAX": max_gc})
+
     # Batch self-dG
     all_seqs = [c[2] for c in fwd_candidates] + [c[2] for c in rev_candidates]
     if not all_seqs:
@@ -575,6 +587,8 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
             'seq': seq, 'tm': tm, 'gc': gc, 'dg': dg, 'pos_score': pos_score,
         }
         features[seq] = {'len': len(seq), 'Tm': round(tm, 2), 'GC': round(gc, 4), 'dG': round(dg, 2)}
+
+    _record("Primer self-dimer dG", len(fwd_passed), len(rev_passed), {"DG_MIN": min_dg})
 
     # Build all fwd×rev pairs at each position
     candidate_pairs = []
@@ -621,6 +635,9 @@ def extract_primers_at_positions(aligned_seqs, positions, primer_len,
             'score': pos_score,
         })
 
+    if diag is not None:
+        diag.record("Forward/reverse dimer dG (same position)", len(primers),
+                    params={"DG_MIN": min_dg})
     return primers, features
 
 
@@ -964,6 +981,79 @@ def _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0
         filtered_path, sep="\t", header=False, index=False
     )
     return filtered_path
+
+
+def _count_mapped_primers(mapped_path):
+    """(forward, reverse) counts of distinct primers in a bowtie2 mapped file."""
+    if not mapped_path.exists() or mapped_path.stat().st_size == 0:
+        return 0, 0
+    names = pd.read_csv(mapped_path, sep="\t", header=None, usecols=[0])[0].unique()
+    n_fwd = sum(1 for n in names if str(n).endswith("_f"))
+    return n_fwd, len(names) - n_fwd
+
+
+def _count_input_pairs(input_path):
+    """Distinct primer pairs in a prepare-input ML input file."""
+    if not input_path.exists() or input_path.stat().st_size == 0:
+        return 0
+    pairs = pd.read_csv(input_path, usecols=["pname_f", "pname_r"])
+    return len(pairs.drop_duplicates())
+
+
+def _new_batch_funnel():
+    """Per-filter candidate totals summed over the evaluated batches."""
+    return dict.fromkeys(
+        ["aligned_f", "aligned_r", "covered_f", "covered_r", "pairs", "scored"], 0)
+
+
+def _update_batch_funnel(funnel, mapped_path=None, filtered_path=None,
+                         input_path=None, res=None):
+    if mapped_path is not None:
+        n_fwd, n_rev = _count_mapped_primers(mapped_path)
+        funnel["aligned_f"] += n_fwd
+        funnel["aligned_r"] += n_rev
+    if filtered_path is not None:
+        n_fwd, n_rev = _count_mapped_primers(filtered_path)
+        funnel["covered_f"] += n_fwd
+        funnel["covered_r"] += n_rev
+    if input_path is not None:
+        funnel["pairs"] += _count_input_pairs(input_path)
+    if res is not None:
+        funnel["scored"] += len(res)
+
+
+def _record_batch_funnel(diag, funnel, primer_params):
+    """Add the per-batch evaluation filters to the quick-design diagnostics."""
+    diag.record(
+        "Primer alignments to target sequences (bowtie2)",
+        min(funnel["aligned_f"], funnel["aligned_r"]),
+        breakdown={"forward": funnel["aligned_f"], "reverse": funnel["aligned_r"]},
+        hint="bowtie2 found no binding site for the primers in the target sequences.",
+    )
+    diag.record(
+        "Primer coverage (binds >= 80% of sequences in its region)",
+        min(funnel["covered_f"], funnel["covered_r"]),
+        breakdown={"forward": funnel["covered_f"], "reverse": funnel["covered_r"]},
+        hint="The target sequences may be too divergent for a single primer pair.",
+    )
+    diag.record(
+        "Primer pairing (orientation / amplicon length)", funnel["pairs"],
+        params={"AMPLEN_MIN": primer_params["min_amp_len"],
+                "AMPLEN_MAX": primer_params["max_amp_len"]},
+    )
+    diag.record("ML scoring", funnel["scored"])
+
+
+def _probe_filter_params(probe_params):
+    return {
+        "PROBE_LEN_MIN": probe_params["len_min"],
+        "PROBE_LEN_MAX": probe_params["len_max"],
+        "PROBE_TM_MIN": probe_params["min_tm"],
+        "PROBE_TM_MAX": probe_params["max_tm"],
+        "PROBE_GC_MAX": probe_params["max_gc"],
+        "PROBE_HOMOPOLYMER_MAX": probe_params["homopolymer_max"],
+        "PROBE_DG_MIN": probe_params["min_dg"],
+    }
 
 
 def _run_evaluate(input_path, ref_path, scaler, classifier, regressor, device, threads,
@@ -2078,11 +2168,21 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions,
     )
+    diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
+    diag.record("Sequences in alignment", len(aligned_seqs))
+    diag.record(
+        "Amplicon positions (conservation / GC)", len(scored),
+        params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
+                "PRIMER_LEN_MAX": primer_params["max_pri_len"],
+                "AMPLEN_MIN": min_amp_len, "AMPLEN_MAX": max_amp_len,
+                "GC_MAX": primer_params["max_gc"]},
+        hint=("Both primer sites need >= 80% wobble-aware conservation across the "
+              "alignment, after dropping columns that are > 50% gaps. The alignment may "
+              "be too divergent or shorter than AMPLEN_MIN."),
+    )
     if not scored:
         print("ERROR: No valid amplicon positions found in MSA.")
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).touch()
-        return
+        diag.finish(args.out)
 
     # Step 2: Generate primer variants
     print("Step 2: Generating wobble-optimized primer variants...")
@@ -2092,13 +2192,12 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
         primer_params["max_gc"], min_dg,
         n_variants=n_variants,
         max_pri_len=primer_params["max_pri_len"],
+        diag=diag,
     )
 
     if not primers:
         print("ERROR: No primers passed Tm/GC/dG filters.")
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).touch()
-        return
+        diag.finish(args.out)
 
     n_unique_pos = len(set(p['pos_idx'] for p in primers))
     print(f"  Passed filters: {len(primers)} pairs ({n_unique_pos} positions)")
@@ -2106,6 +2205,8 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     primers.sort(key=lambda p: -p['score'])
     if len(primers) > top_pairs:
         primers = primers[:top_pairs]
+    diag.record("Top pairs by position score", len(primers),
+                params={"QUICK_TOP_PAIRS": top_pairs})
     print(f"  Selected top {len(primers)} pairs")
 
     # Step 3: Group into batches
@@ -2131,6 +2232,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     all_eval_full = []
     all_eval_cl = []
     name_to_seq = {}
+    funnel = _new_batch_funnel()
     pname_to_msa_pos = {}  # pname_f -> (fwd_start_msa, rev_start_msa, fwd_len, rev_len)
 
     try:
@@ -2180,11 +2282,13 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
             )
             print("done.")
 
+            _update_batch_funnel(funnel, mapped_path=mapped_path)
             if mapped_path.stat().st_size == 0:
                 print("  No alignments found. Skipping.")
                 continue
 
             filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.80)
+            _update_batch_funnel(funnel, filtered_path=filtered_path)
             if filtered_path.stat().st_size == 0:
                 print("  No primers pass coverage filter. Skipping.")
                 continue
@@ -2205,6 +2309,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
             except SystemExit:
                 pass
             print("done.")
+            _update_batch_funnel(funnel, input_path=input_path)
 
             if not input_path.exists() or input_path.stat().st_size == 0:
                 print("  No valid pairs formed. Skipping.")
@@ -2217,6 +2322,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
             )
             print("done.")
 
+            _update_batch_funnel(funnel, res=res)
             if res.empty:
                 print("  No results. Skipping.")
                 continue
@@ -2244,6 +2350,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 break
 
         # Step 6: Generate probes across the full MSA, then assign to primer pairs
+        _record_batch_funnel(diag, funnel, primer_params)
         if all_results:
             combined = pd.concat(all_results, ignore_index=True)
             combined = combined.sort_values("activity", ascending=False).drop_duplicates(
@@ -2252,13 +2359,11 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
             combined = combined[combined["coverage"] > 0]
         else:
             combined = pd.DataFrame()
+        diag.record("Predicted coverage > 0", len(combined))
 
         if combined.empty:
             print("\nWARNING: No primer pairs found. Skipping probe search.")
-            _write_output(args, all_results, all_eval_re, name_to_seq,
-                          cov_min, act_min, len(batches), tmpdir, min_dg=min_dg,
-                          features=features, all_eval_full=all_eval_full,
-                          all_eval_cl=all_eval_cl)
+            diag.finish(args.out)
         else:
             print(f"\nStep 6: Searching for probes across MSA...")
 
@@ -2268,19 +2373,15 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
             probes, probe_features = _generate_probes_from_msa(
                 aligned_seqs, full_region, probe_params)
             print(f"  Generated {len(probes)} probe candidates (Tm/GC/homopolymer/dG filtered)")
+            diag.record(
+                "Probe candidates (Tm / GC / homopolymer / dG)", len(probes),
+                params=_probe_filter_params(probe_params),
+                hint="Probes are designed from the alignment; it may be too divergent.",
+            )
 
             if not probes:
                 print("  WARNING: No probes passed thermodynamic filters.")
-                if args.probe_fa:
-                    Path(args.probe_fa).parent.mkdir(parents=True, exist_ok=True)
-                    Path(args.probe_fa).touch()
-                if args.probe_feat:
-                    Path(args.probe_feat).parent.mkdir(parents=True, exist_ok=True)
-                    Path(args.probe_feat).touch()
-                _write_output(args, all_results, all_eval_re, name_to_seq,
-                              cov_min, act_min, len(batches), tmpdir, min_dg=min_dg,
-                              features=features, all_eval_full=all_eval_full,
-                              all_eval_cl=all_eval_cl)
+                diag.finish(args.out)
             else:
                 # Score probes by wobble-aware coverage (once for all probes)
                 print(f"  Scoring probes by wobble-aware coverage (max_mm={max_mm}, max_indels={max_indel})...")
@@ -2322,6 +2423,11 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
 
                 n_with_probes = sum(1 for _ in pair_to_probe_idx)
                 print(f"  {n_with_probes}/{len(combined)} pairs have probes in amplicon")
+                diag.record(
+                    "Probe inside amplicon", n_with_probes,
+                    params={"PROBE_TOP_N": top_n_probes},
+                    hint="None of the top-scoring probes lies between a primer pair.",
+                )
 
                 # Check probe-primer dimers
                 print(f"  Checking probe-primer dimers...")
@@ -2330,6 +2436,9 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 n_dimer_pass = sum(1 for pair_key in pair_to_probe_idx
                                    if pair_key in all_probe_assignments)
                 print(f"  {n_dimer_pass}/{n_with_probes} pairs pass probe-primer dimer check")
+                diag.record("Probe-primer dimer dG", n_dimer_pass, params={"DG_MIN": min_dg})
+                if not n_dimer_pass:
+                    diag.finish(args.out)
 
                 # Write probe mapping CSV
                 if getattr(args, 'probe_csv', None):
@@ -2432,7 +2541,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                               features=features, probe_data=probe_data,
                               all_eval_full=all_eval_full, all_eval_cl=all_eval_cl,
                               pair_to_probe_idx=pair_to_probe_idx,
-                              combined_override=combined)
+                              combined_override=combined, diag=diag)
 
     finally:
         print(f"  Temp files kept at: {tmpdir}")
@@ -2490,11 +2599,21 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions,
     )
+    diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
+    diag.record("Sequences in alignment", len(aligned_seqs))
+    diag.record(
+        "Amplicon positions (conservation / GC)", len(scored),
+        params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
+                "PRIMER_LEN_MAX": primer_params["max_pri_len"],
+                "AMPLEN_MIN": min_amp_len, "AMPLEN_MAX": max_amp_len,
+                "GC_MAX": primer_params["max_gc"]},
+        hint=("Both primer sites need >= 80% wobble-aware conservation across the "
+              "alignment, after dropping columns that are > 50% gaps. The alignment may "
+              "be too divergent or shorter than AMPLEN_MIN."),
+    )
     if not scored:
         print("ERROR: No valid amplicon positions found in MSA.")
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).touch()
-        return
+        diag.finish(args.out)
 
     # Step 2: Generate wobble-optimized primer variants
     print("Step 2: Generating wobble-optimized primer variants...")
@@ -2504,13 +2623,12 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
         primer_params["max_gc"], min_dg,
         n_variants=n_variants,
         max_pri_len=primer_params["max_pri_len"],
+        diag=diag,
     )
 
     if not primers:
         print("ERROR: No primers passed Tm/GC/dG filters at any position.")
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).touch()
-        return
+        diag.finish(args.out)
 
     n_unique_pos = len(set(p['pos_idx'] for p in primers))
     print(f"  Passed Tm/GC/dG: {len(primers)} pairs ({n_unique_pos} positions)")
@@ -2519,6 +2637,8 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
     primers.sort(key=lambda p: -p['score'])
     if len(primers) > top_pairs:
         primers = primers[:top_pairs]
+    diag.record("Top pairs by position score", len(primers),
+                params={"QUICK_TOP_PAIRS": top_pairs})
     n_unique_pos = len(set(p['pos_idx'] for p in primers))
     print(f"  Selected top {len(primers)} pairs ({n_unique_pos} positions)")
 
@@ -2546,6 +2666,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
     all_eval_full = []
     all_eval_cl = []
     name_to_seq = {}
+    funnel = _new_batch_funnel()
 
     try:
         for batch_idx, (batch_primers, min_fwd, max_rev) in enumerate(batches):
@@ -2591,12 +2712,14 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
             )
             print("done.")
 
+            _update_batch_funnel(funnel, mapped_path=mapped_path)
             if mapped_path.stat().st_size == 0:
                 print("  No alignments found. Skipping.")
                 continue
 
             # Coverage filter
             filtered_path = _apply_coverage_filter(mapped_path, n_targets, tmpdir, batch_idx, cov_frac=0.80)
+            _update_batch_funnel(funnel, filtered_path=filtered_path)
             if filtered_path.stat().st_size == 0:
                 print("  No primers pass coverage filter. Skipping.")
                 continue
@@ -2618,6 +2741,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
             except SystemExit:
                 pass
             print("done.")
+            _update_batch_funnel(funnel, input_path=input_path)
 
             if not input_path.exists() or input_path.stat().st_size == 0:
                 print("  No valid pairs formed. Skipping.")
@@ -2631,6 +2755,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
             )
             print("done.")
 
+            _update_batch_funnel(funnel, res=res)
             if res.empty:
                 print("  No results. Skipping.")
                 continue
@@ -2658,10 +2783,11 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
                 break
 
         # Output results
+        _record_batch_funnel(diag, funnel, primer_params)
         _write_output(args, all_results, all_eval_re, name_to_seq,
                       cov_min, act_min, len(batches), tmpdir, min_dg=min_dg,
                       features=features, all_eval_full=all_eval_full,
-                      all_eval_cl=all_eval_cl)
+                      all_eval_cl=all_eval_cl, diag=diag)
 
     finally:
         print(f"  Temp files kept at: {tmpdir}")
@@ -2995,9 +3121,17 @@ def _write_output(args, all_results, all_eval_re, name_to_seq,
                    cov_min, act_min, n_batches, tmpdir, min_dg=-7.0,
                    features=None, probe_data=None, all_eval_full=None,
                    all_eval_cl=None, pair_to_probe_idx=None,
-                   combined_override=None):
-    """Write combined output from all batches/windows."""
+                   combined_override=None, diag=None):
+    """Write combined output from all batches/windows.
+
+    With ``diag`` (the run's StageDiagnostics), the final filters are
+    recorded and the command stops with an explanation if no pair is left.
+    """
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    if diag is not None and (diag.empty or not all_results):
+        if not diag.empty:
+            diag.record("ML scoring", 0)
+        diag.finish(args.out)
 
     if all_results:
         if combined_override is not None:
@@ -3009,6 +3143,9 @@ def _write_output(args, all_results, all_eval_re, name_to_seq,
             )
 
         combined = combined[combined["coverage"] > 0]
+        if diag is not None and combined_override is None:
+            diag.record("Predicted coverage > 0", len(combined))
+            diag.finish(args.out)
         if combined.empty:
             Path(args.out).touch()
             print("\nWARNING: All pairs had coverage=0. Recommend running full mode.")
@@ -3025,6 +3162,10 @@ def _write_output(args, all_results, all_eval_re, name_to_seq,
             n_dropped = n_before - len(combined)
             if n_dropped > 0:
                 print(f"  Cross-dimer dG filter: dropped {n_dropped}/{n_before} pairs (min_dg={min_dg})")
+            if diag is not None:
+                diag.record("Forward/reverse dimer dG (all pairs)", len(combined),
+                            params={"DG_MIN": min_dg})
+                diag.finish(args.out)
 
             # Probe mode: keep all passing pairs — dedup happens in build-output
             if pair_to_probe_idx:
@@ -3113,6 +3254,9 @@ def _write_output(args, all_results, all_eval_re, name_to_seq,
             eval_cl_combined.to_csv(cl_path, index=False)
             print(f"  Saved classifier table: {cl_path}")
 
+        if combined.empty:
+            print(f"\nWARNING: No pairs left after {n_batches} batches.")
+            return
         top = combined.iloc[0]
         passes = (top["coverage"] >= cov_min) and (top["activity"] >= act_min)
 

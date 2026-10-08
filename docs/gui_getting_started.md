@@ -1,4 +1,4 @@
-# Getting Started with the qPrimer Designer GUI
+# Getting Started with the PrimerCast GUI
 
 This guide walks you through downloading the code from GitHub and launching the graphical interface on **Mac** or **Windows**.
 
@@ -43,11 +43,11 @@ conda --version
 Open your terminal (**Terminal** on Mac, **Miniforge Prompt** on Windows) and run:
 
 ```bash
-git clone https://github.com/broadinstitute/qprimer_designer.git
-cd qprimer_designer
+git clone https://github.com/broadinstitute/PrimerCast.git
+cd PrimerCast
 ```
 
-This downloads the entire project into a folder called `qprimer_designer`.
+This downloads the entire project into a folder called `PrimerCast`.
 
 ---
 
@@ -55,7 +55,7 @@ This downloads the entire project into a folder called `qprimer_designer`.
 
 ```bash
 conda env create -f environment.yml
-conda activate qprimer-designer
+conda activate primercast
 pip install -e ".[gui]"
 ```
 
@@ -92,11 +92,11 @@ Go back to the terminal and press **Ctrl+C** to stop the server.
 After initial setup, you only need two commands to relaunch:
 
 ```bash
-conda activate qprimer-designer
+conda activate primercast
 streamlit run gui/app.py
 ```
 
-(Run these from inside the `qprimer_designer` folder.)
+(Run these from inside the `PrimerCast` folder.)
 
 ---
 
@@ -106,7 +106,7 @@ streamlit run gui/app.py
 
 **`git: command not found`** -- On Mac, run `xcode-select --install`. On Windows, make sure you installed Git for Windows and are using Git Bash or Miniforge Prompt.
 
-**`streamlit: command not found`** -- Make sure you ran `pip install -e ".[gui]"` and that the conda environment is active (`conda activate qprimer-designer`).
+**`streamlit: command not found`** -- Make sure you ran `pip install -e ".[gui]"` and that the conda environment is active (`conda activate primercast`).
 
 **Browser doesn't open** -- Manually navigate to `http://localhost:8501` in your browser.
 

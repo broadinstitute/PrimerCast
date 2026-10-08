@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from qprimer_designer.adapt_cli import (
+from primercast.adapt_cli import (
     _is_empty,
     _parse_boolean,
     _extract_spreadsheet_id,

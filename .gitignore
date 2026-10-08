@@ -103,6 +103,7 @@ gui/virus_map_data/
 
 # Analysis outputs and run directories
 runs/
+error_reports/
 evaluate/
 eval_sc2n/
 benchmark_realworld/
@@ -122,7 +123,7 @@ target_seqs/*.tsv
 
 # Standalone model checkpoints (not package data)
 *.pth
-!src/qprimer_designer/data/*.pth
+!src/primercast/data/*.pth
 
 # Documents and presentations
 *.pptx

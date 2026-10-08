@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from qprimer_designer.commands.export_report import (
+from primercast.commands.export_report import (
     filter_by_primer_id,
     build_alignment_string,
     build_sensitivity_table,

@@ -54,7 +54,7 @@ def prepare_run_dir(
     runs_dir = Path(runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
 
-    scratch = Path(tempfile.mkdtemp(prefix=f"qprimer_run_{_slug(run_id)}_"))
+    scratch = Path(tempfile.mkdtemp(prefix=f"primercast_run_{_slug(run_id)}_"))
     (scratch / "Snakefile").write_text(snakefile_content)
     (scratch / "params.txt").write_text(params_content)
 

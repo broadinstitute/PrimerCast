@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from qprimer_designer.models.architectures import (
+from primercast.models.architectures import (
     PGC,
     DropoutNd,
     S4DKernel,
@@ -16,7 +16,7 @@ from qprimer_designer.models.architectures import (
     CombinedModelClassifier,
     PcrDataset,
 )
-from qprimer_designer.models.inference import (
+from primercast.models.inference import (
     get_model_path,
     FEATURE_COLUMNS,
     SEQUENCE_COLUMNS,
