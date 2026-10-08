@@ -340,7 +340,7 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
                              min_amp_len, max_amp_len,
                              min_gc=0.35, max_gc=0.65,
                              min_primer_score=0.80,
-                             top_n=5000, out_csv=None):
+                             top_n=5000, min_gap=10, out_csv=None):
     """Score amplicon positions across a gap-pre-filtered MSA.
 
     Enumerates all (fwd_start, fwd_len, rev_start, rev_len) combinations
@@ -348,6 +348,11 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
     to primer_len_max.  Each column is scored using wobble-aware conservation
     with explicit gap penalty (GAP_WEIGHT).  Assumes gap-dominant columns
     have already been removed by the caller.
+
+    Only the best-scoring combination per fwd_start is kept, and fwd_starts
+    within min_gap of a higher-scoring one are dropped, so positions spread
+    across the MSA instead of all landing in its most conserved region
+    (which may have no primer within the Tm range).
 
     Args:
         aligned_seqs: list of aligned sequence strings (gap-dominant cols removed)
@@ -359,6 +364,7 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
         max_gc: maximum GC fraction for primer windows
         min_primer_score: prune positions below this score (performance)
         top_n: return at most this many pairs (0 = unlimited)
+        min_gap: minimum distance between returned fwd_starts
         out_csv: optional path to save per-column scores
 
     Returns:
@@ -366,8 +372,6 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
         consensus_aligned: consensus string (same length as input MSA)
         kept_cols: boolean array (all True after pre-filtering)
     """
-    import heapq
-
     seq_len = len(aligned_seqs[0])
     n_seqs = len(aligned_seqs)
 
@@ -443,8 +447,8 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
         gc_fracs = (cum_gc[plen:max_start + plen] - cum_gc[:max_start]) / plen
         primer_data[plen] = (fwd_scores, rev_scores, gc_fracs)
 
-    # Enumerate all valid (fwd_start, fwd_len, rev_start, rev_len) pairs
-    heap = []  # min-heap of (score, fwd_start, fwd_len, rev_start, rev_len)
+    # Best valid (fwd_len, rev_start, rev_len) for each fwd_start
+    best_by_fwd = {}  # fwd_start -> (score, fwd_start, fwd_len, rev_start, rev_len)
 
     for fwd_len, (fwd_scores, _, fwd_gc, ) in primer_data.items():
         fwd_mask = ((fwd_scores >= min_primer_score)
@@ -452,12 +456,13 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
         fwd_indices = np.where(fwd_mask)[0]
 
         for fwd_start in fwd_indices:
+            fwd_start = int(fwd_start)
             fwd_sc = float(fwd_scores[fwd_start])
 
             for rev_len, (_, rev_scores, rev_gc) in primer_data.items():
                 # amplicon = rev_start + rev_len - fwd_start
-                rev_lo = int(fwd_start) + min_amp_len - rev_len
-                rev_hi = int(fwd_start) + max_amp_len - rev_len + 1
+                rev_lo = fwd_start + min_amp_len - rev_len
+                rev_hi = fwd_start + max_amp_len - rev_len + 1
                 rev_lo = max(0, rev_lo)
                 rev_hi = min(len(rev_scores), rev_hi)
                 if rev_lo >= rev_hi:
@@ -469,23 +474,23 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
                 if not mask.any():
                     continue
 
-                rev_sc_slice = rev_scores[rev_lo:rev_hi]
-                for idx in np.where(mask)[0]:
-                    pair_score = fwd_sc + float(rev_sc_slice[idx])
-                    rev_start = rev_lo + int(idx)
-                    entry = (pair_score, fwd_start, fwd_len, rev_start, rev_len)
+                rev_sc_slice = np.where(mask, rev_scores[rev_lo:rev_hi], -np.inf)
+                idx = int(np.argmax(rev_sc_slice))
+                pair_score = fwd_sc + float(rev_sc_slice[idx])
+                entry = (pair_score, fwd_start, fwd_len, rev_lo + idx, rev_len)
+                if fwd_start not in best_by_fwd or pair_score > best_by_fwd[fwd_start][0]:
+                    best_by_fwd[fwd_start] = entry
 
-                    if top_n > 0:
-                        if len(heap) < top_n:
-                            heapq.heappush(heap, entry)
-                        elif pair_score > heap[0][0]:
-                            heapq.heapreplace(heap, entry)
-                    else:
-                        heap.append(entry)
-
-    # Sort by score descending
-    heap.sort(key=lambda x: -x[0])
-    positions = [(fs, fl, rs, rl, sc) for sc, fs, fl, rs, rl in heap]
+    # Sort by score descending; skip fwd_starts within min_gap of a better one
+    positions = []
+    used_fwd = []
+    for sc, fs, fl, rs, rl in sorted(best_by_fwd.values(), key=lambda x: -x[0]):
+        if any(abs(fs - u) < min_gap for u in used_fwd):
+            continue
+        used_fwd.append(fs)
+        positions.append((fs, fl, rs, rl, sc))
+        if top_n > 0 and len(positions) >= top_n:
+            break
 
     print(f"  Top amplicon pairs: {len(positions)}")
     for i, (fs, fl, rs, rl, sc) in enumerate(positions[:5]):
