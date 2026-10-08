@@ -2393,21 +2393,14 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 _score_probes_by_coverage(probes, aligned_seqs, max_mm, max_indel,
                                          seq_ids=all_seq_ids)
 
-                # Select top probes at distinct positions
+                # Select probes per primer pair from the candidates inside its
+                # amplicon (between the primers). Selecting the globally best
+                # probes first and only then checking containment leaves short
+                # amplicons with nothing, even when they hold many good candidates.
                 top_n_probes = int(params.get("PROBE_TOP_N", 50))
-                selected_probes = _select_top_probes(probes, top_n=top_n_probes, min_distance=30)
-                print(f"  Selected {len(selected_probes)} probes at distinct positions:")
-                for i, p in enumerate(selected_probes[:10]):
-                    print(f"    Probe {i+1}: {p['name']} ({p['seq'][:20]}...) "
-                          f"MSA {p['msa_start']}-{p['msa_end']}, "
-                          f"coverage={p['coverage']:.1%}, Tm={p['tm']}")
-
-                selected_names = {p['name'] for p in selected_probes}
-                probe_features = {k: v for k, v in probe_features.items()
-                                  if k in selected_names}
-
-                # Assign probes to primer pairs by amplicon containment
-                probes_by_probe_idx = {i: [p] for i, p in enumerate(selected_probes)}
+                per_pair = max(1, min(top_n_probes, 5))
+                selected_probes = []
+                name_to_idx = {}
                 pair_to_probe_idx = {}
 
                 for _, row in combined.iterrows():
@@ -2418,20 +2411,34 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                     amp_start = fwd_start + fwd_len
                     amp_end = rev_start
 
-                    pair_key = (pname_f, row['pname_r'])
+                    inside = [p for p in probes
+                              if p['msa_start'] >= amp_start and p['msa_end'] <= amp_end]
                     probe_idxs = set()
-                    for pi, p in enumerate(selected_probes):
-                        if p['msa_start'] >= amp_start and p['msa_end'] <= amp_end:
-                            probe_idxs.add(pi)
+                    for p in _select_top_probes(inside, top_n=per_pair, min_distance=5):
+                        if p['name'] not in name_to_idx:
+                            name_to_idx[p['name']] = len(selected_probes)
+                            selected_probes.append(p)
+                        probe_idxs.add(name_to_idx[p['name']])
                     if probe_idxs:
-                        pair_to_probe_idx[pair_key] = probe_idxs
+                        pair_to_probe_idx[(pname_f, row['pname_r'])] = probe_idxs
+
+                print(f"  Selected {len(selected_probes)} probes inside primer-pair amplicons:")
+                for i, p in enumerate(selected_probes[:10]):
+                    print(f"    Probe {i+1}: {p['name']} ({p['seq'][:20]}...) "
+                          f"MSA {p['msa_start']}-{p['msa_end']}, "
+                          f"coverage={p['coverage']:.1%}, Tm={p['tm']}")
+
+                selected_names = {p['name'] for p in selected_probes}
+                probe_features = {k: v for k, v in probe_features.items()
+                                  if k in selected_names}
+                probes_by_probe_idx = {i: [p] for i, p in enumerate(selected_probes)}
 
                 n_with_probes = sum(1 for _ in pair_to_probe_idx)
                 print(f"  {n_with_probes}/{len(combined)} pairs have probes in amplicon")
                 diag.record(
                     "Probe inside amplicon", n_with_probes,
-                    params={"PROBE_TOP_N": top_n_probes},
-                    hint="None of the top-scoring probes lies between a primer pair.",
+                    hint="No probe candidate fits between the primers of any pair; "
+                         "the amplicons may be too short for the probe length.",
                 )
 
                 # Check probe-primer dimers
