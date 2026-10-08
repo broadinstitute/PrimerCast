@@ -307,7 +307,7 @@ jobs:
         id: rev
         run: |
           # Cloud Run revision tags: lowercase, alphanumeric + hyphens, max 63 chars
-          TAG=$(echo '${{ github.ref_name }}' | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | head -c 22)
+          TAG=$(echo '${{ github.ref_name }}' | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | head -c 22 | sed 's/-*$//')
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
 
       - name: Generate image tag
