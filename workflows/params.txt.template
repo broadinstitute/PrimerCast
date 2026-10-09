@@ -27,7 +27,7 @@ PROBE_TM_MAX = 75
 PROBE_GC_MAX = 60
 PROBE_DG_MIN = -8
 PROBE_HOMOPOLYMER_MAX = 4
-PROBE_AVOID_5PRIME_G = False
+PROBE_AVOID_5PRIME_G = True
 PROBE_CONSERVATION_THRESHOLD = 0.8  # Column conservation fraction for probe region selection
 
 ## Probe mode configuration (singleplex only)

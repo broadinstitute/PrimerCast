@@ -65,6 +65,11 @@ Off-target steps use `fatal=False` (`prepare-input` and `evaluate` are only fata
 empty step: it still writes a report (0 coverage, targets listed as unmapped), and
 `run_warnings(run_dir)` surfaces zero on-target coverage plus rescue re-evaluations
 (`<eval>.rescue.json`) as warnings in the GUI and CLI.
+After any successful run, `run_funnels(run_dir)` gives every on-target funnel with a
+summary of the filters that removed the most candidates (shown in the GUI and `adapt`
+CLI). Pass `unit=` to `record()` for steps counting something other than the stage's
+unit (counts are only compared within a unit), and `summarize=False` for top-N cuts.
+Off-target `prepare-input` funnels set `offtarget=True` and are left out.
 
 ### Adding New Subcommands
 1. Create module in `src/primercast/commands/`

@@ -110,7 +110,7 @@ from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
 from gui import error_report
 from primercast.utils.params import parse_params
-from primercast.utils.diagnostics import explain_run, run_warnings
+from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings, step_baselines
 from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
@@ -444,7 +444,7 @@ DEFAULT_PARAMS: dict = {
     "PROBE_GC_MAX": 60,
     "PROBE_DG_MIN": -8,
     "PROBE_HOMOPOLYMER_MAX": 4,
-    "PROBE_AVOID_5PRIME_G": False,
+    "PROBE_AVOID_5PRIME_G": True,
     "PROBE_CONSERVATION_THRESHOLD": 0.8,
     "PROBE_MAX_MISMATCHES": 2,
     "PROBE_MAX_INDELS": 0,
@@ -1624,6 +1624,8 @@ def _tab_parameters(mode: str = "design"):
             p["PROBE_AVOID_5PRIME_G"] = st.checkbox(
                 "PROBE_AVOID_5PRIME_G", value=bool(p["PROBE_AVOID_5PRIME_G"]),
                 key="p_probe_5g",
+                help="Reject probes that start with G at the 5' end. A G next to the "
+                     "reporter dye quenches its fluorescence, even after cleavage.",
             )
 
             c9, c10 = st.columns(2)
@@ -2274,16 +2276,41 @@ def _pipeline_diagnoses(run_id: str) -> list:
     return explain_run(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
 
 
+def _format_change(remaining: int, before) -> str:
+    """Change from the previous step of the same unit ("—" when not comparable)."""
+    if not before:
+        return "—"
+    diff = remaining - before
+    return f"{diff:+,} ({diff / before:+.0%})" if diff else "0"
+
+
 def _render_funnel_table(steps: list):
     st.table([
         {
             "Filter": step.get("filter", ""),
             "Remaining": f"{step.get('remaining', 0):,}",
+            "Change": _format_change(step.get("remaining", 0), before),
             "Controlled by": ", ".join(
                 f"{k}={v}" for k, v in (step.get("params") or {}).items()),
         }
-        for step in steps
+        for step, before in zip(steps, step_baselines(steps))
     ])
+
+
+def _render_run_funnels(funnels: list):
+    """Which filters narrowed the candidates, shown for successful runs too."""
+    if not funnels:
+        return
+    st.markdown("**Where filters narrowed the candidates**")
+    summaries = [f.summary for f in funnels if f.summary]
+    if summaries:
+        st.markdown("\n".join(f"- {s}" for s in summaries))
+    else:
+        st.caption("No filter removed any candidates.")
+    for funnel in funnels:
+        with st.expander(f"Filter stage: {funnel.stage_label}"
+                         + (f" ({funnel.target})" if funnel.target else "")):
+            _render_funnel_table(funnel.steps)
 
 
 def _render_failure_diagnosis():
@@ -2315,6 +2342,14 @@ def _pipeline_warnings() -> list:
     return run_warnings(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
 
 
+def _pipeline_funnels() -> list:
+    """Filter funnels of the pipeline run started from this session."""
+    run_id = st.session_state.get("pipeline_run_id", "")
+    if not run_id:
+        return []
+    return run_funnels(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
+
+
 def _render_pipeline_outcome(rc: int, warnings: list):
     """Final status of a pipeline run. A run with warnings is not reported as a success."""
     if rc != 0:
@@ -2325,6 +2360,8 @@ def _render_pipeline_outcome(rc: int, warnings: list):
     else:
         st.success("Pipeline finished successfully!")
     _render_run_warnings(warnings)
+    if rc == 0:
+        _render_run_funnels(_pipeline_funnels())
 
 
 # ---------------------------------------------------------------------------
@@ -2915,6 +2952,9 @@ def _tab_results():
                     st.error(f"Error reading {selected_csv_label}: {exc}")
         else:
             st.info("No CSV results for this run yet.")
+
+    if workflow in ("design", "evaluate") and run_dir and run_dir.exists():
+        _render_run_funnels(run_funnels(run_dir))
 
     # --- Evaluate reports (evaluate/monitor workflows only) ---
     if workflow in ("evaluate", "monitor"):

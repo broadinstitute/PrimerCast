@@ -267,9 +267,11 @@ def run(args):
     diag.record(
         "Pairs kept by the filter step", len(teval),
         hint=f"None of the scored pairs are in {os.path.basename(filt_csv_path)}.",
+        summarize=False,  # repeats the filter step's losses
     )
     teval = teval.iloc[:num_select].copy()
-    diag.record("Top pairs by score", len(teval), {"NUM_TOP_SENSITIVITY": num_select})
+    diag.record("Top pairs by score", len(teval), {"NUM_TOP_SENSITIVITY": num_select},
+                summarize=False)
     diag.finish(args.output)
 
     merged = teval.copy()

@@ -1038,12 +1038,14 @@ def _record_batch_funnel(diag, funnel, primer_params):
         min(funnel["aligned_f"], funnel["aligned_r"]),
         breakdown={"forward": funnel["aligned_f"], "reverse": funnel["aligned_r"]},
         hint="bowtie2 found no binding site for the primers in the target sequences.",
+        unit="primers",
     )
     diag.record(
         "Primer coverage (binds >= 80% of sequences in its region)",
         min(funnel["covered_f"], funnel["covered_r"]),
         breakdown={"forward": funnel["covered_f"], "reverse": funnel["covered_r"]},
         hint="The target sequences may be too divergent for a single primer pair.",
+        unit="primers",
     )
     diag.record(
         "Primer pairing (orientation / amplicon length)", funnel["pairs"],
@@ -1062,6 +1064,7 @@ def _probe_filter_params(probe_params):
         "PROBE_GC_MAX": probe_params["max_gc"],
         "PROBE_HOMOPOLYMER_MAX": probe_params["homopolymer_max"],
         "PROBE_DG_MIN": probe_params["min_dg"],
+        "PROBE_AVOID_5PRIME_G": probe_params["avoid_5prime_g"],
     }
 
 
@@ -2180,7 +2183,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
         top_n=n_positions, min_interior=min_interior,
     )
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
-    diag.record("Sequences in alignment", len(aligned_seqs))
+    diag.record("Sequences in alignment", len(aligned_seqs), unit="sequences")
     diag.record(
         "Amplicon positions (conservation / GC)", len(scored),
         params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
@@ -2219,7 +2222,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     if len(primers) > top_pairs:
         primers = primers[:top_pairs]
     diag.record("Top pairs by position score", len(primers),
-                params={"QUICK_TOP_PAIRS": top_pairs})
+                params={"QUICK_TOP_PAIRS": top_pairs}, summarize=False)
     print(f"  Selected top {len(primers)} pairs")
 
     # Step 3: Group into batches
@@ -2392,6 +2395,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 "Probe candidates (Tm / GC / homopolymer / dG)", len(probes),
                 params=_probe_filter_params(probe_params),
                 hint="Probes are designed from the alignment; it may be too divergent.",
+                unit="probes",
             )
 
             if not probes:
@@ -2623,7 +2627,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
         top_n=n_positions,
     )
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
-    diag.record("Sequences in alignment", len(aligned_seqs))
+    diag.record("Sequences in alignment", len(aligned_seqs), unit="sequences")
     diag.record(
         "Amplicon positions (conservation / GC)", len(scored),
         params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
@@ -2661,7 +2665,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
     if len(primers) > top_pairs:
         primers = primers[:top_pairs]
     diag.record("Top pairs by position score", len(primers),
-                params={"QUICK_TOP_PAIRS": top_pairs})
+                params={"QUICK_TOP_PAIRS": top_pairs}, summarize=False)
     n_unique_pos = len(set(p['pos_idx'] for p in primers))
     print(f"  Selected top {len(primers)} pairs ({n_unique_pos} positions)")
 

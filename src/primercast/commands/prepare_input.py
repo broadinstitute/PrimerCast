@@ -73,6 +73,7 @@ def run(args):
     diag = StageDiagnostics(
         "prepare_input", target=ref_name, unit="primer pairs",
         fatal=bool(getattr(args, "fail_if_empty", False)),
+        offtarget=args.reftype == "off",
     )
     print(f"Preparing ML input from {args.mapped}...")
     start_time = time.time()
@@ -116,6 +117,7 @@ def run(args):
         diag.record(
             f"Primer alignments to {ref_name}", 0,
             hint="No primer aligned to this reference (bowtie2 found no hits).",
+            unit="primers",
         )
         diag.finish(args.ml_input)
         sys.exit()
@@ -159,6 +161,7 @@ def run(args):
         f"Primer alignments to {ref_name}", min(n_aligned),
         breakdown={"forward": n_aligned[0], "reverse": n_aligned[1]},
         hint="Pairs need at least one forward and one reverse primer that align.",
+        unit="primers",
     )
     n_oriented = (_n_primers(fors), _n_primers(revs))
     if args.reftype == 'on':
@@ -166,6 +169,7 @@ def run(args):
             "Binding orientation", min(n_oriented),
             breakdown={"forward": n_oriented[0], "reverse": n_oriented[1]},
             hint="Forward primers must bind the + strand and reverse primers the - strand.",
+            unit="primers",
         )
 
     revs['pseq'] = revs['pseq'].apply(reverse_complement_dna)

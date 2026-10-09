@@ -462,7 +462,8 @@ def run(args):
                 valid_pairs.append((pname_f, pname_r, dg))
 
         print(f"Found {len(valid_pairs)} of {len(pairs_to_check)} pairs with primer_dimer_dg > {min_dg}")
-        diag.record("Top pairs by score", len(pairs_to_check), {"NUM_TOP_SENSITIVITY": num_select})
+        diag.record("Top pairs by score", len(pairs_to_check), {"NUM_TOP_SENSITIVITY": num_select},
+                    summarize=False)
         dimer_failed = bool(pairs_to_check) and all(dg is None for dg in dg_values)
         diag.record(
             "Primer-dimer dG", len(valid_pairs), {"DG_MIN": min_dg},

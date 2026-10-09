@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
-from primercast.utils.diagnostics import explain_run, run_warnings
+from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings
 from primercast.utils.params import parse_params, parse_list_param
 
 
@@ -134,9 +134,11 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
         n_warnings = _print_run_warnings(run_dir, since=started_at)
         if result.returncode != 0:
             _print_failure_explanation(run_dir)
-        elif n_warnings:
-            print(f"\nPipeline finished with {n_warnings} warning(s); review them "
-                  f"before using the results.", file=sys.stderr)
+        else:
+            _print_funnel_summary(run_dir, since=started_at)
+            if n_warnings:
+                print(f"\nPipeline finished with {n_warnings} warning(s); review them "
+                      f"before using the results.", file=sys.stderr)
     return result.returncode
 
 
@@ -148,6 +150,15 @@ def _print_run_warnings(run_dir: Path, since: float | None = None) -> int:
         for w in warnings:
             print(f"  - {w.message}", file=sys.stderr)
     return len(warnings)
+
+
+def _print_funnel_summary(run_dir: Path, since: float | None = None) -> None:
+    """Name the filters that removed the most candidates in a finished run."""
+    summaries = [f.summary for f in run_funnels(run_dir, since=since) if f.summary]
+    if summaries:
+        print("\nWhere filters narrowed the candidates:", file=sys.stderr)
+        for summary in summaries:
+            print(f"  - {summary}", file=sys.stderr)
 
 
 def _print_failure_explanation(run_dir: Path) -> None:
