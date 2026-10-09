@@ -87,6 +87,7 @@ MAX_BATCHES = 5
 TOP_PAIRS = 2500  # top primer pairs to evaluate (after Tm/GC/dG filtering)
 N_POSITIONS = 2500  # amplicon positions to score
 N_VARIANTS = 5     # primer variants per direction (consensus + wobble)
+PROBE_INTERIOR_MARGIN = 5  # bp beyond PROBE_LEN_MAX required between primers (probe mode)
 
 _WOBBLE_W = WOBBLE_W_PRIMER
 _COMPLEMENT = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G'}
@@ -340,7 +341,7 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
                              min_amp_len, max_amp_len,
                              min_gc=0.35, max_gc=0.65,
                              min_primer_score=0.80,
-                             top_n=5000, min_gap=10, out_csv=None):
+                             top_n=5000, min_gap=10, min_interior=0, out_csv=None):
     """Score amplicon positions across a gap-pre-filtered MSA.
 
     Enumerates all (fwd_start, fwd_len, rev_start, rev_len) combinations
@@ -365,6 +366,8 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
         min_primer_score: prune positions below this score (performance)
         top_n: return at most this many pairs (0 = unlimited)
         min_gap: minimum distance between returned fwd_starts
+        min_interior: minimum gap between the primers (fwd end to rev start),
+            e.g. to leave room for a probe
         out_csv: optional path to save per-column scores
 
     Returns:
@@ -462,6 +465,7 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
             for rev_len, (_, rev_scores, rev_gc) in primer_data.items():
                 # amplicon = rev_start + rev_len - fwd_start
                 rev_lo = fwd_start + min_amp_len - rev_len
+                rev_lo = max(rev_lo, fwd_start + fwd_len + min_interior)
                 rev_hi = fwd_start + max_amp_len - rev_len + 1
                 rev_lo = max(0, rev_lo)
                 rev_hi = min(len(rev_scores), rev_hi)
@@ -2167,11 +2171,13 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     print(f"  MSA: {len(aligned_seqs)} seqs, {n_raw_cols} columns -> "
           f"{n_kept} after removing {n_raw_cols - n_kept} gap-dominant columns")
 
+    # Leave room between the primers for the longest allowed probe
+    min_interior = probe_params["len_max"] + PROBE_INTERIOR_MARGIN
     scored, consensus_aligned, kept_cols = score_amplicon_positions(
         aligned_seqs, primer_params["min_pri_len"], primer_params["max_pri_len"],
         min_amp_len, max_amp_len,
         min_gc=min_gc, max_gc=max_gc_frac,
-        top_n=n_positions,
+        top_n=n_positions, min_interior=min_interior,
     )
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
     diag.record("Sequences in alignment", len(aligned_seqs))
@@ -2180,10 +2186,12 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
         params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
                 "PRIMER_LEN_MAX": primer_params["max_pri_len"],
                 "AMPLEN_MIN": min_amp_len, "AMPLEN_MAX": max_amp_len,
-                "GC_MAX": primer_params["max_gc"]},
+                "GC_MAX": primer_params["max_gc"],
+                "PROBE_LEN_MAX": probe_params["len_max"]},
         hint=("Both primer sites need >= 80% wobble-aware conservation across the "
-              "alignment, after dropping columns that are > 50% gaps. The alignment may "
-              "be too divergent or shorter than AMPLEN_MIN."),
+              "alignment, after dropping columns that are > 50% gaps, with at least "
+              f"PROBE_LEN_MAX + {PROBE_INTERIOR_MARGIN} bp between them for the probe. "
+              "The alignment may be too divergent or shorter than AMPLEN_MIN."),
     )
     if not scored:
         print("ERROR: No valid amplicon positions found in MSA.")
@@ -2239,6 +2247,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     name_to_seq = {}
     funnel = _new_batch_funnel()
     pname_to_msa_pos = {}  # pname_f -> (fwd_start_msa, rev_start_msa, fwd_len, rev_len)
+    rev_to_msa_pos = {}  # pname_r -> (rev_start_msa, rev_len); evaluated pairs can mix positions
 
     try:
         for batch_idx, (batch_primers, min_fwd, max_rev) in enumerate(batches):
@@ -2280,6 +2289,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                     p['fwd_start_msa'], p['rev_start_msa'],
                     len(p['fwd_seq']), len(p['rev_seq']),
                 )
+                rev_to_msa_pos[pname_r] = (p['rev_start_msa'], len(p['rev_seq']))
 
             print("  Aligning...", end=" ", flush=True)
             mapped_path = _align_batch(
@@ -2405,9 +2415,10 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
 
                 for _, row in combined.iterrows():
                     pname_f = row['pname_f']
-                    if pname_f not in pname_to_msa_pos:
+                    if pname_f not in pname_to_msa_pos or row['pname_r'] not in rev_to_msa_pos:
                         continue
-                    fwd_start, rev_start, fwd_len, rev_len = pname_to_msa_pos[pname_f]
+                    fwd_start, _, fwd_len, _ = pname_to_msa_pos[pname_f]
+                    rev_start, _ = rev_to_msa_pos[row['pname_r']]
                     amp_start = fwd_start + fwd_len
                     amp_end = rev_start
 
