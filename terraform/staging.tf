@@ -57,6 +57,9 @@ resource "google_cloud_run_v2_service" "staging" {
   lifecycle {
     ignore_changes = [
       template,
+      # Any update re-sends the template with CI's current revision name, which
+      # Cloud Run rejects as a duplicate — so ignore service-level drift too.
+      scaling,
       client,
       client_version,
     ]

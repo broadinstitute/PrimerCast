@@ -108,10 +108,17 @@ resource "google_cloud_run_v2_service" "app" {
       client,
       client_version,
       template[0].containers[0].image,
+      # Service-level scaling block (not template.scaling) drifts to an empty
+      # manual count via gcloud deploys; updating it only spawns a no-op revision.
+      scaling,
     ]
   }
 
-  depends_on = [google_project_service.services]
+  # The revision must be able to read the SMTP-key secret when it is created.
+  depends_on = [
+    google_project_service.services,
+    google_secret_manager_secret_iam_member.monitor_smtp_key,
+  ]
 }
 
 # Public site: ingress=ALL above lets anyone reach the service; this binding

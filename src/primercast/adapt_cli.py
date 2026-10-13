@@ -985,6 +985,99 @@ def _build_pset_fa(rows: list[dict], output_path: Path) -> list[str]:
     return pair_ids
 
 
+# Columns of a mastersheet built in the GUI (manual setup). Metadata columns
+# must precede TaxID: everything from TaxID onwards becomes a gget argument.
+MANUAL_SHEET_HEADERS = [
+    "Target name", "Primer name", "Forward", "Reverse", "Probe", "subtype_filter",
+    "TaxID", "host", "nuc_completeness", "geographic_location",
+    "min_collection_date", "max_collection_date", "min_release_date",
+    "min_seq_length", "max_seq_length", "max_ambiguous_chars", "segment", "refseq_only",
+]
+
+
+def _rows_to_sheet_csv(headers: list[str], rows: list[dict]) -> str:
+    """Write rows as mastersheet CSV text that ``_load_spreadsheet`` reads back.
+
+    Layout: category row, header row, description row, then one row per dict.
+    """
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow([""] * len(headers))
+    writer.writerow(headers)
+    writer.writerow(["examples/definition:"] + [""] * (len(headers) - 1))
+    for row in rows:
+        writer.writerow(["" if _is_empty(row.get(h)) else str(row.get(h)).strip()
+                         for h in headers])
+    return out.getvalue()
+
+
+def _parse_pset_fasta(text: str) -> list[dict]:
+    """Primer sets from a FASTA named ``<set>_for/_rev/_pro`` (or ``_f/_r/_p``).
+
+    Returns ``[{"name", "Forward", "Reverse", "Probe"}]`` for sets with both primers.
+    """
+    roles = {"f": "Forward", "for": "Forward", "r": "Reverse", "rev": "Reverse",
+             "p": "Probe", "pro": "Probe"}
+    sets: dict[str, dict] = {}
+    name = role = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(">"):
+            header = line[1:].split()[0] if line[1:].split() else ""
+            base, _, suffix = header.rpartition("_")
+            role = roles.get(suffix.lower()) if base else None
+            name = base if role else None
+            if name:
+                sets.setdefault(name, {"name": name, "Forward": "", "Reverse": "", "Probe": ""})
+                sets[name][role] = ""
+        elif name and line:
+            sets[name][role] += line.upper()
+    return [s for s in sets.values() if s["Forward"] and s["Reverse"]]
+
+
+def _add_primers_to_rows(rows: list[dict], primers: list[dict]) -> list[dict]:
+    """Attach extra primer sets to every target in ``rows``.
+
+    Each primer set becomes a new row copying its target's fetch settings.
+    Targets that gain primers drop their primer-less placeholder rows, and a
+    primer name already present for a target is not added twice.
+    """
+    if not primers:
+        return list(rows)
+    targets: dict[str, list[dict]] = {}
+    for row in rows:
+        targets.setdefault(_make_target_name(row), []).append(row)
+
+    out = []
+    for target_rows in targets.values():
+        kept = [r for r in target_rows
+                if not _is_empty(r.get("Forward")) and not _is_empty(r.get("Reverse"))]
+        names = {str(r.get("Primer name", "")).strip() for r in kept}
+        template = target_rows[0]
+        for p in primers:
+            if p["name"] in names:
+                continue
+            names.add(p["name"])
+            kept.append(dict(template, **{
+                "Primer name": p["name"], "Forward": p["Forward"],
+                "Reverse": p["Reverse"], "Probe": p.get("Probe", ""),
+            }))
+        out.extend(kept)
+    return out
+
+
+def _sheet_with_primers(csv_text: str, primers: list[dict]) -> str:
+    """Return mastersheet CSV text with ``primers`` added to every target."""
+    if not primers:
+        return csv_text
+    headers, rows = _load_spreadsheet(csv_text)
+    headers = list(headers)
+    for col in ("Primer name", "Forward", "Reverse", "Probe"):
+        if col not in headers:
+            headers.insert(headers.index("TaxID"), col)
+    return _rows_to_sheet_csv(headers, _add_primers_to_rows(rows, primers))
+
+
 def _get_new_seq_table(
     new_accessions: set[str], metadata_path: Path | None
 ) -> str:

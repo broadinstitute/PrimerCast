@@ -22,6 +22,11 @@ from primercast.adapt_cli import (
     _deduplicate_fasta,
     _get_new_seq_table,
     _read_excel_summary,
+    _rows_to_sheet_csv,
+    _parse_pset_fasta,
+    _add_primers_to_rows,
+    _sheet_with_primers,
+    MANUAL_SHEET_HEADERS,
 )
 
 
@@ -607,6 +612,56 @@ class TestReadExcelSummary:
 # ---------------------------------------------------------------------------
 # _email_config / cron helpers
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Sheets built in the GUI (manual monitor setup / added primers)
+# ---------------------------------------------------------------------------
+_P1 = {"name": "P1", "Forward": "AAAA", "Reverse": "CCCC", "Probe": "GGGG"}
+
+
+class TestManualSheet:
+    def test_round_trip_through_loader(self):
+        row = {"Target name": "SC2", "TaxID": "2697049", "host": "human",
+               "min_release_date": "2025-01-01", "refseq_only": "TRUE"}
+        headers, rows = _load_spreadsheet(_rows_to_sheet_csv(MANUAL_SHEET_HEADERS, [row]))
+        assert len(rows) == 1
+        assert _make_target_name(rows[0]) == "SC2"
+        cmd = _build_gget_command(rows[0], "out")
+        assert cmd[:3] == ["gget", "virus", "2697049"]
+        assert "--host" in cmd and "--refseq_only" in cmd
+        assert "--Target name" not in cmd and "--Forward" not in cmd
+
+    def test_parse_pset_fasta(self):
+        text = ">A_for\nacgt\n>A_rev\nTTTT\n>A_pro\nGG\nCC\n>B_f\nAA\n>B_r\nCC\n>C_for\nAA\n>junk\nAA\n"
+        sets = _parse_pset_fasta(text)
+        assert sets == [
+            {"name": "A", "Forward": "ACGT", "Reverse": "TTTT", "Probe": "GGCC"},
+            {"name": "B", "Forward": "AA", "Reverse": "CC", "Probe": ""},
+        ]
+
+    def test_primers_replace_placeholder_row(self):
+        rows = [{"Target name": "SC2", "TaxID": "1", "host": "human", "Forward": "", "Reverse": ""}]
+        out = _add_primers_to_rows(rows, [_P1])
+        assert len(out) == 1
+        assert out[0]["Primer name"] == "P1" and out[0]["host"] == "human"
+
+    def test_primers_added_per_target_without_duplicates(self):
+        rows = [
+            {"Target name": "A", "TaxID": "1", "Primer name": "P1", "Forward": "AAAA", "Reverse": "CCCC"},
+            {"Target name": "B", "TaxID": "2", "Primer name": "Q", "Forward": "TT", "Reverse": "GG"},
+        ]
+        out = _add_primers_to_rows(rows, [_P1])
+        assert [(r["Target name"], r["Primer name"]) for r in out] == [
+            ("A", "P1"), ("B", "Q"), ("B", "P1")]
+
+    def test_sheet_with_primers_adds_missing_columns(self, tmp_path):
+        base = "cat,,\nTarget name,TaxID,host\nexamples/definition:,,\nSC2,2697049,human\n"
+        assert _sheet_with_primers(base, []) == base
+        headers, rows = _load_spreadsheet(_sheet_with_primers(base, [_P1]))
+        assert headers.index("Forward") < headers.index("TaxID")
+        assert rows[0]["Forward"] == "AAAA" and rows[0]["host"] == "human"
+        assert _build_pset_fa(rows, tmp_path / "p.fa") == ["P1"]
+
+
 class TestEmailConfig:
     def test_params_win(self, monkeypatch):
         from primercast.adapt_cli import _email_config

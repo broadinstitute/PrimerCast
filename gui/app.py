@@ -129,6 +129,10 @@ from primercast.adapt_cli import (
     _email_config,
     _smtp_config,
     _install_dispatch_cron,
+    _rows_to_sheet_csv,
+    _parse_pset_fasta,
+    _sheet_with_primers,
+    MANUAL_SHEET_HEADERS,
 )
 from primercast import monitor_schedule
 
@@ -3528,7 +3532,46 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         key=f"{prefix}_max_ambiguous_chars")
         st.checkbox("RefSeq only", key=f"{prefix}_refseq_only")
 
-    if st.button("Fetch sequences", disabled=not taxid or not target_name, key=f"{prefix}_fetch_btn"):
+    if monitor:
+        # Monitoring fetches sequences itself on every run; here we only record
+        # the target as a one-row mastersheet.
+        if st.button("Use this target", disabled=not taxid or not target_name,
+                     key=f"{prefix}_use_btn"):
+            def _val(key):
+                v = st.session_state.get(f"{prefix}_{key}")
+                if v is None or v == "":
+                    return ""
+                return v.strftime("%Y-%m-%d") if isinstance(v, date) else str(v).strip()
+            row = {
+                "Target name": target_name.strip(),
+                "TaxID": taxid.strip(),
+                "subtype_filter": _val("subtype_filter"),
+                "host": _val("host"),
+                "nuc_completeness": _val("nuc_completeness"),
+                "geographic_location": _val("geo_location"),
+                "min_collection_date": _val("min_collection_date"),
+                "max_collection_date": _val("max_collection_date"),
+                "min_release_date": _val("min_release_date"),
+                "min_seq_length": _val("min_seq_length"),
+                "max_seq_length": _val("max_seq_length"),
+                "max_ambiguous_chars": _val("max_ambiguous_chars"),
+                "segment": _val("segment"),
+                "refseq_only": "TRUE" if st.session_state.get(f"{prefix}_refseq_only") else "",
+            }
+            csv_text = _rows_to_sheet_csv(MANUAL_SHEET_HEADERS, [row])
+            headers, data_rows = _load_spreadsheet(csv_text)
+            st.session_state["monitor_spreadsheet_data"] = {
+                "csv_text": csv_text,
+                "base_csv_text": csv_text,
+                "headers": headers,
+                "data_rows": data_rows,
+                "spreadsheet_id": "",
+            }
+            st.toast(f"Target '{target_name.strip()}' set — add primer sets on the next page.")
+            st.rerun()
+        return
+
+    if st.button("Fetch sequences",disabled=not taxid or not target_name, key=f"{prefix}_fetch_btn"):
         gget_bin = shutil.which("gget")
         if not gget_bin:
             env_bin = Path(sys.executable).parent
@@ -4241,7 +4284,8 @@ def _page_monitor_target():
 
     # --- Option 2: Manual setup ---
     st.subheader("Manual setup")
-    st.caption("Set up a single target manually by fetching sequences from NCBI Virus.")
+    st.caption("Set up a single target manually. Each monitoring run fetches its "
+               "sequences from NCBI Virus with these settings.")
     with st.expander("Configure manual fetch"):
         _render_fetch_ui("monitor_fetch", monitor=True)
 
@@ -4260,7 +4304,7 @@ def _page_monitor_target():
         st.rerun()
 
     if not has_sheet:
-        st.caption("Load a spreadsheet to continue.")
+        st.caption("Load a spreadsheet or set up a target manually to continue.")
 
 
 def _page_monitor_primer():
@@ -4277,11 +4321,17 @@ def _page_monitor_primer():
     sheet_data = st.session_state.get("monitor_spreadsheet_data")
 
     # --- From spreadsheet ---
+    # Show the sheet as loaded; primers added below are merged in on Continue.
+    base_rows = []
     if sheet_data:
+        base_rows = [r for r in _load_spreadsheet(
+            sheet_data.get("base_csv_text", sheet_data["csv_text"]))[1]
+            if not _is_empty(r.get("Forward")) or not _is_empty(r.get("Reverse"))]
+    if base_rows:
         st.subheader("Primers from spreadsheet")
         import pandas as pd
         display_rows = []
-        for row in sheet_data["data_rows"]:
+        for row in base_rows:
             fwd = row.get("Forward", "")
             rev = row.get("Reverse", "")
             pro = row.get("Probe", "")
@@ -4370,8 +4420,37 @@ def _page_monitor_primer():
             st.rerun()
     with col_cont:
         if st.button("Continue →", type="primary", use_container_width=True, key="monitor_primer_cont"):
-            _navigate("monitor_config")
-            st.rerun()
+            if sheet_data and _apply_monitor_primers(sheet_data):
+                _navigate("monitor_config")
+                st.rerun()
+
+
+def _apply_monitor_primers(sheet_data: dict) -> bool:
+    """Merge manually entered / uploaded primer sets into the monitor sheet.
+
+    Rebuilt from the original sheet each time, so going back and changing the
+    primers never duplicates or keeps stale ones. Returns False (with an error
+    shown) when no target has any primer set to evaluate.
+    """
+    primers = list(st.session_state.get("monitor_manual_primers", []))
+    pset_path = st.session_state.get("monitor_pset_path")
+    if pset_path and Path(pset_path).exists():
+        from_fasta = _parse_pset_fasta(Path(pset_path).read_text())
+        if not from_fasta:
+            st.error("No primer sets found in the uploaded FASTA. Name sequences "
+                     "`<set>_for`, `<set>_rev` and optionally `<set>_pro`.")
+            return False
+        primers += from_fasta
+
+    base = sheet_data.setdefault("base_csv_text", sheet_data["csv_text"])
+    csv_text = _sheet_with_primers(base, primers)
+    headers, data_rows = _load_spreadsheet(csv_text)
+    if not any(not _is_empty(r.get("Forward")) and not _is_empty(r.get("Reverse"))
+               for r in data_rows):
+        st.error("Add at least one primer set (forward + reverse) to monitor.")
+        return False
+    sheet_data.update(csv_text=csv_text, headers=headers, data_rows=data_rows)
+    return True
 
 
 def _config_monitor():
@@ -5233,10 +5312,14 @@ def _create_monitor_schedule(frequency: str) -> bool:
         pn for row in data_rows if (pn := row.get("Primer name", "").strip())))
 
     # Keep the live sheet URL when it is the sheet that was loaded, so later edits
-    # are picked up; otherwise (resumed run) the saved snapshot is used.
+    # are picked up; otherwise (resumed run, or primers added in the app) the
+    # saved snapshot is used.
     url = st.session_state.get("monitor_spreadsheet_url", "").strip()
+    added_primers = sheet_data.get("csv_text") != sheet_data.get("base_csv_text",
+                                                                 sheet_data.get("csv_text"))
     try:
-        if not url or _extract_spreadsheet_id(url) != sheet_data.get("spreadsheet_id"):
+        if (not url or added_primers
+                or _extract_spreadsheet_id(url) != sheet_data.get("spreadsheet_id")):
             url = ""
     except Exception:
         url = ""
