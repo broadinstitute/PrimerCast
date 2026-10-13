@@ -51,8 +51,12 @@ OFFLEN_MAX = 5000
 NUM_TOP_SENSITIVITY = 200
 
 ## Email configuration (for adapt monitor)
-# Gmail address and app password for sending alerts
+# Sender address and SMTP password (Gmail: app password; Brevo: SMTP key)
 EMAIL_SENDER =
 EMAIL_PASSWORD =
+# Optional SMTP relay (defaults to Gmail, smtp.gmail.com:465), e.g. Brevo:
+# SMTP_HOST = smtp-relay.brevo.com
+# SMTP_PORT = 587
+# SMTP_USER = <Brevo SMTP login>
 # Comma-separated recipient addresses
 EMAIL_RECIPIENTS =

@@ -90,3 +90,63 @@ variable "error_report_notification_emails" {
     "baekseun@broadinstitute.org",
   ]
 }
+
+variable "monitor_bucket_name" {
+  description = "GCS bucket (globally unique) holding scheduled-monitor configs and run data (accession history, reports)."
+  type        = string
+  default     = "sabeti-adapt-primercast-monitor"
+}
+
+variable "monitor_email_sender" {
+  description = "From address of monitor reports. Must be a verified sender in Brevo (Senders, Domains & Dedicated IPs)."
+  type        = string
+  default     = ""
+}
+
+variable "monitor_smtp_host" {
+  description = "SMTP server for monitor reports."
+  type        = string
+  default     = "smtp-relay.brevo.com"
+}
+
+variable "monitor_smtp_port" {
+  description = "SMTP port: 465 = implicit TLS, anything else = STARTTLS."
+  type        = number
+  default     = 587
+}
+
+variable "monitor_smtp_user" {
+  description = "SMTP login (Brevo: the login shown under SMTP & API -> SMTP, e.g. 1a2b3c001@smtp-brevo.com). Empty = log in as monitor_email_sender. The SMTP key goes in the primercast-monitor-smtp-key secret (see monitor.tf)."
+  type        = string
+  default     = ""
+}
+
+variable "monitor_email_enabled" {
+  description = "Wire the SMTP-key secret into the service and jobs. Set true only after adding a secret version (Cloud Run rejects a secret reference with no versions)."
+  type        = bool
+  default     = false
+}
+
+variable "monitor_time_zone" {
+  description = "Time zone for the daily dispatcher trigger and scheduled run dates."
+  type        = string
+  default     = "America/New_York"
+}
+
+variable "monitor_job_cpu" {
+  description = "CPU for the monitor dispatcher job (runs fetch + evaluate per due schedule)."
+  type        = string
+  default     = "4"
+}
+
+variable "monitor_job_memory" {
+  description = "Memory for the monitor dispatcher job. Scratch files live in memory on Cloud Run, so leave headroom."
+  type        = string
+  default     = "8Gi"
+}
+
+variable "monitor_job_timeout_seconds" {
+  description = "Max runtime of one dispatcher execution (all due schedules run sequentially). Cloud Run Jobs allow up to 24h."
+  type        = number
+  default     = 21600
+}

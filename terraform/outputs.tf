@@ -38,3 +38,18 @@ output "error_report_bucket" {
   description = "Private bucket holding \"Report a problem\" bundles (runtime SA can only create objects)."
   value       = "gs://${google_storage_bucket.error_reports.name}"
 }
+
+output "monitor_bucket" {
+  description = "Private bucket holding scheduled-monitor configs (schedules/) and run data (runs/), under prod/ and staging/."
+  value       = "gs://${google_storage_bucket.monitor.name}"
+}
+
+output "monitor_jobs" {
+  description = "Cloud Run Jobs running `adapt monitor-dispatch` (prod is triggered daily by Cloud Scheduler)."
+  value       = { for k, job in google_cloud_run_v2_job.monitor : k => job.name }
+}
+
+output "monitor_email_secret" {
+  description = "Secret Manager secret for the monitor emails' SMTP key (add a version, then set monitor_email_enabled = true)."
+  value       = google_secret_manager_secret.monitor_smtp_key.secret_id
+}

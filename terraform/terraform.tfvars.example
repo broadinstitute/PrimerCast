@@ -14,3 +14,6 @@
 # cloud_run_concurrency   = 8
 # cloud_run_timeout_seconds = 600
 # custom_domain             = "primercast.sabeti.broadinstitute.org"  # set to "" to skip
+# monitor_email_sender    = "primercast.monitor@gmail.com"   # verified Brevo sender
+# monitor_smtp_user       = "1a2b3c001@smtp-brevo.com"       # Brevo SMTP login
+# monitor_email_enabled   = true   # only after adding a version to the SMTP-key secret

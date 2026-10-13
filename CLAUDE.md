@@ -127,6 +127,14 @@ lock. Results are written to local disk, which is **ephemeral** on Cloud Run (lo
 redeploy / scale events) in this iteration; `PRIMERCAST_DATA_DIR` is the seam for adding
 GCS persistence later.
 
+Scheduled monitors do not depend on the web service being up (it scales to zero). The GUI
+saves each schedule to a store (`src/primercast/monitor_schedule.py`): the GCS bucket in
+`PRIMERCAST_MONITOR_BUCKET` on Cloud Run, `DATA_DIR/monitor_schedules/` locally. A daily
+`adapt monitor-dispatch` (Cloud Run Job + Cloud Scheduler, `terraform/monitor.tf`; a cron
+line locally) runs every due schedule and persists its accession history, which is what
+makes monitoring incremental. No accounts: each schedule has a private manage link
+`/?monitor=<id>.<token>`.
+
 ## Snakemake Workflows
 
 Workflows are in `workflows/`. They use the `primercast` CLI internally:
@@ -150,6 +158,16 @@ snakemake -s Snakefile.example --dry-run
   GUI's "Report a problem" bundles (`gui/error_report.py`; set by terraform for prod and
   by CI for staging). Unset (local dev) → bundles are saved under `DATA_DIR/error_reports/`
   and offered as a download.
+- `PRIMERCAST_MONITOR_BUCKET` / `PRIMERCAST_MONITOR_PREFIX`: GCS bucket + prefix for scheduled
+  monitors (set by terraform for prod/jobs, CI for staging). Unset → local store.
+- `PRIMERCAST_MONITOR_TZ`: time zone for scheduled run dates (default `America/New_York`).
+- `PRIMERCAST_MONITOR_MAX_SCHEDULES`: cap on active scheduled monitors (default 50).
+- `PRIMERCAST_EMAIL_SENDER` / `PRIMERCAST_EMAIL_PASSWORD`: From address + SMTP password/key for
+  monitor reports when not in `params.txt` (key from Secret Manager on Cloud Run).
+- `PRIMERCAST_SMTP_HOST` / `PRIMERCAST_SMTP_PORT` / `PRIMERCAST_SMTP_USER`: SMTP server, port
+  (465 = TLS, else STARTTLS) and login (empty = sender). Defaults to Gmail; Cloud Run uses
+  the Brevo relay (`smtp-relay.brevo.com:587`, set by terraform/CI).
+- `PRIMERCAST_PUBLIC_URL`: base URL for manage links in emails (falls back to the request host).
 - `PRIMERCAST_FONT_PATH`: Custom font directory for training plots (optional)
 - `PRIMERCAST_TOOLPATH`: Custom tool installation path for training scripts (optional)
 - `RNASTRUCTURE_DATAPATH`: Path to RNAstructure data tables (optional)

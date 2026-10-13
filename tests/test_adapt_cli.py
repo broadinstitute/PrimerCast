@@ -602,3 +602,123 @@ class TestReadExcelSummary:
 
         result = _read_excel_summary(xlsx)
         assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# _email_config / cron helpers
+# ---------------------------------------------------------------------------
+class TestEmailConfig:
+    def test_params_win(self, monkeypatch):
+        from primercast.adapt_cli import _email_config
+        monkeypatch.setenv("PRIMERCAST_EMAIL_SENDER", "env@x.org")
+        monkeypatch.setenv("PRIMERCAST_EMAIL_PASSWORD", "envpw")
+        assert _email_config({"EMAIL_SENDER": "p@x.org", "EMAIL_PASSWORD": "ppw"}) == ("p@x.org", "ppw")
+
+    def test_env_fallback(self, monkeypatch):
+        from primercast.adapt_cli import _email_config
+        monkeypatch.setenv("PRIMERCAST_EMAIL_SENDER", "env@x.org")
+        monkeypatch.setenv("PRIMERCAST_EMAIL_PASSWORD", "envpw")
+        assert _email_config({}) == ("env@x.org", "envpw")
+
+    def test_unset(self, monkeypatch):
+        from primercast.adapt_cli import _email_config
+        monkeypatch.delenv("PRIMERCAST_EMAIL_SENDER", raising=False)
+        monkeypatch.delenv("PRIMERCAST_EMAIL_PASSWORD", raising=False)
+        assert _email_config({}) == ("", "")
+
+
+
+class TestSmtp:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for k in ("HOST", "PORT", "USER"):
+            monkeypatch.delenv(f"PRIMERCAST_SMTP_{k}", raising=False)
+
+    def test_defaults_to_gmail(self):
+        from primercast.adapt_cli import _smtp_config
+        assert _smtp_config({}) == ("smtp.gmail.com", 465, "")
+
+    def test_env_and_params(self, monkeypatch):
+        from primercast.adapt_cli import _smtp_config
+        monkeypatch.setenv("PRIMERCAST_SMTP_HOST", "smtp-relay.brevo.com")
+        monkeypatch.setenv("PRIMERCAST_SMTP_PORT", "587")
+        monkeypatch.setenv("PRIMERCAST_SMTP_USER", "abc@smtp-brevo.com")
+        assert _smtp_config({}) == ("smtp-relay.brevo.com", 587, "abc@smtp-brevo.com")
+        assert _smtp_config({"SMTP_PORT": "465"})[1] == 465
+
+    def _fake_smtp(self, calls):
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                calls.append(("connect", type(self).__name__, host, port))
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def starttls(self):
+                calls.append(("starttls",))
+            def login(self, user, password):
+                calls.append(("login", user, password))
+            def send_message(self, msg):
+                calls.append(("send", msg["From"], msg["To"]))
+        return FakeSMTP
+
+    def test_brevo_uses_starttls_and_smtp_login(self):
+        from primercast import adapt_cli
+        calls = []
+        with patch.object(adapt_cli.smtplib, "SMTP", self._fake_smtp(calls)):
+            ok = adapt_cli._send_email(
+                "alerts@lab.org", "key", ["a@x.org", "b@x.org"], "s", "b",
+                smtp=("smtp-relay.brevo.com", 587, "abc@smtp-brevo.com"))
+        assert ok
+        assert calls == [
+            ("connect", "FakeSMTP", "smtp-relay.brevo.com", 587),
+            ("starttls",),
+            ("login", "abc@smtp-brevo.com", "key"),
+            ("send", "alerts@lab.org", "a@x.org, b@x.org"),
+        ]
+
+    def test_port_465_uses_ssl_and_sender_login(self):
+        from primercast import adapt_cli
+        calls = []
+        with patch.object(adapt_cli.smtplib, "SMTP_SSL", self._fake_smtp(calls)):
+            assert adapt_cli._send_email("me@gmail.com", "pw", ["a@x.org"], "s", "b")
+        assert ("starttls",) not in calls
+        assert ("login", "me@gmail.com", "pw") in calls
+
+    def test_failure_returns_false(self):
+        from primercast import adapt_cli
+        with patch.object(adapt_cli.smtplib, "SMTP", side_effect=OSError("nope")):
+            assert not adapt_cli._send_email(
+                "a@x.org", "k", ["b@x.org"], "s", "b", smtp=("h", 587, ""))
+
+
+class TestSetCronLine:
+    def _run(self, existing):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs.get("input")))
+            if cmd == ["crontab", "-l"]:
+                return type("P", (), {"returncode": 0, "stdout": existing})()
+            return type("P", (), {"returncode": 0})()
+        return calls, fake_run
+
+    def test_replaces_only_tagged_line(self):
+        from primercast.adapt_cli import _set_cron_line
+        existing = ("0 1 * * * other\n"
+                    "0 0 1 * * adapt monitor  # adapt-monitor\n"
+                    "0 0 * * * old  # primercast-monitor-dispatch\n")
+        calls, fake_run = self._run(existing)
+        with patch("primercast.adapt_cli.subprocess.run", fake_run):
+            assert _set_cron_line("primercast-monitor-dispatch", "0 0 * * * new  # primercast-monitor-dispatch")
+        written = calls[-1][1]
+        assert "other" in written and "# adapt-monitor" in written
+        assert "old" not in written and "new" in written
+
+    def test_crontab_missing(self):
+        from primercast.adapt_cli import _set_cron_line
+
+        def missing(*a, **k):
+            raise FileNotFoundError
+        with patch("primercast.adapt_cli.subprocess.run", missing):
+            assert _set_cron_line("x", None) is False

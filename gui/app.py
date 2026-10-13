@@ -126,11 +126,18 @@ from primercast.adapt_cli import (
     _get_new_seq_table,
     _generate_snakefile,
     _is_empty,
-    _install_cron,
-    _uninstall_cron,
+    _email_config,
+    _smtp_config,
+    _install_dispatch_cron,
 )
+from primercast import monitor_schedule
 
 MONITOR_DIR = DATA_DIR / "monitor"
+# Scheduled monitors (see primercast/monitor_schedule.py). On Cloud Run they live in
+# the GCS bucket in PRIMERCAST_MONITOR_BUCKET and a Cloud Run Job runs them daily
+# (terraform/monitor.tf); locally they live here and a daily cron line runs them.
+MONITOR_STORE_DIR = DATA_DIR / "monitor_schedules"
+MONITOR_ON_CLOUD = bool(os.environ.get("PRIMERCAST_MONITOR_BUCKET", "").strip())
 
 # Error reports ("Report a problem" button). On Cloud Run, bundles go to the GCS
 # bucket in PRIMERCAST_REPORT_BUCKET (see terraform/error_reports.tf); without it
@@ -139,7 +146,6 @@ REPORT_BUCKET = os.environ.get("PRIMERCAST_REPORT_BUCKET", "").strip()
 REPORT_PREFIX = os.environ.get("PRIMERCAST_REPORT_PREFIX", "").strip() or "local"
 REPORTS_LOCAL_DIR = DATA_DIR / "error_reports"
 MAX_REPORTS_PER_SESSION = 3
-MONITOR_SCHEDULE_PATH = MONITOR_DIR / "schedule.json"
 VIRUS_MAP_DATA_DIR = Path(__file__).parent / "virus_map_data"
 
 # ---------------------------------------------------------------------------
@@ -184,7 +190,7 @@ def _reset_workflow_state():
                 "monitor_primer_name", "monitor_primer_fwd",
                 "monitor_primer_rev", "monitor_primer_pro",
                 "monitor_frequency", "monitor_skip_fetch",
-                "monitor_resume_run"):
+                "monitor_resume_run", "monitor_schedule"):
         st.session_state.pop(key, None)
     _clear_pipeline_state()
 
@@ -561,47 +567,21 @@ def _render_sidebar():
                 else:
                     st.markdown("**Mode:** —")
 
-        # --- Scheduled monitor (always visible) ---
-        active_cron = _get_active_cron_monitor()
-        if active_cron:
+        # --- Monitors scheduled in this session ---
+        created = st.session_state.get("monitor_schedules_created", [])
+        if created:
             st.divider()
-            st.markdown("**Scheduled monitor**")
-            # Read saved schedule details
-            if MONITOR_SCHEDULE_PATH.exists():
-                import json
-                try:
-                    sched_info = json.loads(MONITOR_SCHEDULE_PATH.read_text())
-                    targets = sched_info.get("targets", [])
-                    target_summary = ", ".join(targets) if targets else "N/A"
-                    with st.expander(target_summary):
-                        lines = []
-                        primers = sched_info.get("primer_sets", [])
-                        if primers:
-                            primer_list = "".join(
-                                f"<br>&nbsp;&nbsp;&nbsp;{p}" for p in primers
-                            )
-                            lines.append(f"<b>Primer sets:</b>{primer_list}")
-                        lines.append(f"<b>Frequency:</b> {sched_info.get('frequency', 'N/A')}")
-                        recipients = sched_info.get("recipients", "")
-                        if recipients:
-                            lines.append(f"<b>Email:</b> {recipients}")
-                        st.markdown(
-                            "<div style='font-size:0.85em; line-height:1.4;'>"
-                            + "<br>".join(lines)
-                            + "</div>",
-                            unsafe_allow_html=True,
-                        )
-                        if st.button("Stop monitoring", key="sidebar_stop_cron", use_container_width=True):
-                            _uninstall_cron()
-                            if MONITOR_SCHEDULE_PATH.exists():
-                                MONITOR_SCHEDULE_PATH.unlink()
-                            st.rerun()
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            else:
-                if st.button("Stop monitoring", key="sidebar_stop_cron", use_container_width=True):
-                    _uninstall_cron()
-                    st.rerun()
+            st.markdown("**Scheduled monitors**")
+            for sched in created:
+                with st.expander(", ".join(sched["targets"]) or sched["id"]):
+                    st.markdown(
+                        "<div style='font-size:0.85em; line-height:1.4;'>"
+                        f"<b>Frequency:</b> {sched['frequency']}<br>"
+                        f"<b>Email:</b> {', '.join(sched['recipients'])}<br>"
+                        f"<a href='{sched['manage_url']}' target='_blank'>Manage / stop</a>"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
 
 
 
@@ -4514,14 +4494,11 @@ def _run_monitor():
     params_path = date_dir / "params.txt"
     params_path.write_text(params_content)
 
-    # Read email config from project params.txt (password deferred to send time)
+    # Read email config from project params.txt / env (password deferred to send time)
     params_source = PROJECT_ROOT / "params.txt"
-    email_sender = ""
-    default_recipients = ""
-    if params_source.exists():
-        p = parse_params(params_source)
-        email_sender = str(p.get("EMAIL_SENDER", "")).strip()
-        default_recipients = str(p.get("EMAIL_RECIPIENTS", "")).strip()
+    p = parse_params(params_source) if params_source.exists() else {}
+    email_sender, _ = _email_config(p)
+    default_recipients = str(p.get("EMAIL_RECIPIENTS", "")).strip()
 
     recipients_str = st.session_state.get("monitor_email_recipients", "").strip()
     if not recipients_str:
@@ -4536,7 +4513,7 @@ def _run_monitor():
         f.write(f"\n## Email configuration\n")
         f.write(f"EMAIL_SENDER = {email_sender}\n")
         f.write(f"EMAIL_RECIPIENTS = {recipients_str}\n")
-    # Note: EMAIL_PASSWORD is read from project params.txt at send time, never copied
+    # Note: EMAIL_PASSWORD is read from params.txt / env at send time, never copied
 
     cores = st.session_state.get("cores", 1)
     progress_area = st.empty()
@@ -4851,12 +4828,15 @@ def _run_monitor():
         _update(progress_lines)
 
     # ===================== STEP 3: EMAIL =====================
+    schedule = st.session_state.get("monitor_schedule")
+    if schedule:
+        email_body_parts.append(
+            f"\n{'-' * 50}\nManage or stop this monitor: {schedule['manage_url']}")
     email_body = "\n".join(email_body_parts)
 
     # Read password at send time only (avoid storing in long-lived variable)
-    _email_password = ""
-    if params_source.exists():
-        _email_password = str(parse_params(params_source).get("EMAIL_PASSWORD", "")).strip()
+    _send_params = parse_params(params_source) if params_source.exists() else {}
+    _, _email_password = _email_config(_send_params)
 
     if email_sender and _email_password and email_recipients and all_xlsx:
         progress_lines.append("⏳ &nbsp; **Sending email report...**")
@@ -4870,6 +4850,7 @@ def _run_monitor():
             subject=subject,
             body=email_body,
             attachments=all_xlsx,
+            smtp=_smtp_config(_send_params),
         )
         _email_password = ""  # clear after use
         if ok:
@@ -4883,6 +4864,14 @@ def _run_monitor():
     elif not all_xlsx:
         progress_lines.append("⚪ &nbsp; Email skipped (no reports to send)")
         _update(progress_lines)
+
+    # Persist this first run's accession lists so the scheduled runs only
+    # report sequences that are new since today.
+    if schedule and not skip_fetch:
+        try:
+            monitor_schedule.upload_run_dir(_monitor_store(), schedule["id"], date_dir)
+        except Exception as e:
+            st.warning(f"Could not save this run for the scheduled monitor: {e}")
 
     # Done
     elapsed = int(time.time() - start_time)
@@ -5141,20 +5130,6 @@ def _page_results():
         _render_report_button(st.session_state.get("run_id", ""), "results_page")
 
 
-def _get_active_cron_monitor() -> str | None:
-    """Check if an adapt-monitor cron job is currently active. Returns the cron line or None."""
-    try:
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        if result.returncode != 0:
-            return None
-        for line in result.stdout.strip().split("\n"):
-            if "adapt-monitor" in line:
-                return line
-    except FileNotFoundError:
-        pass
-    return None
-
-
 def _page_monitor_report():
     """Monitor: Email & scheduling page."""
     _render_workflow_progress("monitor_report")
@@ -5165,12 +5140,9 @@ def _page_monitor_report():
     st.subheader("Email")
 
     params_path = PROJECT_ROOT / "params.txt"
-    email_configured = False
-    if params_path.exists():
-        params = parse_params(params_path)
-        email_sender = str(params.get("EMAIL_SENDER", "")).strip()
-        email_password = str(params.get("EMAIL_PASSWORD", "")).strip()
-        email_configured = bool(email_sender and email_password)
+    params = parse_params(params_path) if params_path.exists() else {}
+    email_sender, email_password = _email_config(params)
+    email_configured = bool(email_sender and email_password)
 
     if email_configured:
         st.markdown(f"Sender: `{email_sender}`")
@@ -5178,7 +5150,8 @@ def _page_monitor_report():
     else:
         st.warning(
             "Admin email not configured. Set `EMAIL_SENDER` and `EMAIL_PASSWORD` "
-            "in `params.txt` to enable email reports."
+            "in `params.txt` (or `PRIMERCAST_EMAIL_SENDER` / `PRIMERCAST_EMAIL_PASSWORD`) "
+            "to enable email reports."
         )
         default_recipients = ""
 
@@ -5208,6 +5181,10 @@ def _page_monitor_report():
         key="monitor_frequency",
     )
     frequency = frequency_options[selected_label]
+    st.caption(
+        "The monitor runs once now, then on each scheduled date. Every report email "
+        "includes a private link for viewing or stopping the schedule."
+    )
 
     st.divider()
 
@@ -5220,45 +5197,128 @@ def _page_monitor_report():
     with col_cont:
         if st.button("Continue →", type="primary", use_container_width=True,
                       key="report_cont", disabled=not email_configured):
-            # Install cron job
-            recipients = st.session_state.get("monitor_email_recipients", "").strip()
-            try:
-                _install_cron(
-                    work_dir=PROJECT_ROOT / "monitor",
-                    params_file=PROJECT_ROOT / "params.txt",
-                    schedule_email=recipients,
-                    frequency=frequency,
-                )
-                # Save schedule details for display
-                import json
-                sheet_data = st.session_state.get("monitor_spreadsheet_data")
-                targets = []
-                if sheet_data:
-                    seen = set()
-                    for row in sheet_data["data_rows"]:
-                        t = _make_target_name(row)
-                        if t not in seen:
-                            targets.append(t)
-                            seen.add(t)
-                primer_names = []
-                if sheet_data:
-                    for row in sheet_data["data_rows"]:
-                        pn = row.get("Primer name", "").strip()
-                        if pn and pn not in primer_names:
-                            primer_names.append(pn)
-                MONITOR_DIR.mkdir(parents=True, exist_ok=True)
-                MONITOR_SCHEDULE_PATH.write_text(json.dumps({
-                    "targets": targets,
-                    "primer_sets": primer_names,
-                    "frequency": selected_label,
-                    "recipients": recipients,
-                }, indent=2))
-                st.session_state["_monitor_cron_installed"] = True
-            except SystemExit:
-                st.error("Failed to install cron job. Is 'adapt' in PATH?")
-            st.session_state._run_page_fresh = True
-            _navigate("run")
+            if _create_monitor_schedule(frequency):
+                st.session_state._run_page_fresh = True
+                _navigate("run")
+                st.rerun()
+
+
+def _public_base_url() -> str:
+    """Base URL for links back to this app (manage links in schedule emails)."""
+    url = os.environ.get("PRIMERCAST_PUBLIC_URL", "").strip()
+    if url:
+        return url
+    host = st.context.headers.get("Host") or "localhost:8501"
+    scheme = "http" if host.startswith(("localhost", "127.0.0.1")) else "https"
+    return f"{scheme}://{host}"
+
+
+@st.cache_resource
+def _monitor_store():
+    return monitor_schedule.get_store(MONITOR_STORE_DIR)
+
+
+def _create_monitor_schedule(frequency: str) -> bool:
+    """Save a schedule for the current monitor setup; False (with an error shown) if not."""
+    recipients = monitor_schedule.clean_recipients(
+        st.session_state.get("monitor_email_recipients", ""))
+    if not recipients:
+        st.error("Enter at least one valid recipient email.")
+        return False
+
+    sheet_data = st.session_state.get("monitor_spreadsheet_data") or {}
+    data_rows = sheet_data.get("data_rows", [])
+    targets = list(dict.fromkeys(_make_target_name(row) for row in data_rows))
+    primer_names = list(dict.fromkeys(
+        pn for row in data_rows if (pn := row.get("Primer name", "").strip())))
+
+    # Keep the live sheet URL when it is the sheet that was loaded, so later edits
+    # are picked up; otherwise (resumed run) the saved snapshot is used.
+    url = st.session_state.get("monitor_spreadsheet_url", "").strip()
+    try:
+        if not url or _extract_spreadsheet_id(url) != sheet_data.get("spreadsheet_id"):
+            url = ""
+    except Exception:
+        url = ""
+
+    _init_params()
+    schedule = monitor_schedule.new_schedule(
+        targets=targets,
+        primer_sets=primer_names,
+        frequency=frequency,
+        recipients=recipients,
+        params_txt=build_params_txt(st.session_state.params),
+        csv_text=sheet_data.get("csv_text", ""),
+        spreadsheet_url=url,
+        query_ids=st.session_state.get("monitor_query_ids", []),
+    )
+    created = st.session_state.setdefault("monitor_schedules_created", [])
+    previous = st.session_state.get("monitor_schedule")
+    try:
+        if previous:
+            # Back → Continue again: update this workflow's schedule, don't add another.
+            schedule.update({k: previous[k] for k in ("id", "token", "created")})
+            schedule["manage_url"] = monitor_schedule.manage_url(_public_base_url(), schedule)
+            monitor_schedule.save_schedule(_monitor_store(), schedule)
+            created[:] = [s for s in created if s["id"] != schedule["id"]]
+        else:
+            schedule["manage_url"] = monitor_schedule.manage_url(_public_base_url(), schedule)
+            monitor_schedule.create_schedule(_monitor_store(), schedule)
+    except monitor_schedule.ScheduleLimitError as e:
+        st.error(f"{e} Please try again later or contact us.")
+        return False
+    except Exception as e:
+        st.error(f"Could not save the monitor schedule: {e}")
+        return False
+
+    if not MONITOR_ON_CLOUD and not _install_dispatch_cron(MONITOR_STORE_DIR):
+        st.toast("Schedule saved, but the daily cron job could not be installed. Run "
+                 f"`adapt monitor-dispatch --store-dir {MONITOR_STORE_DIR}` daily yourself.",
+                 icon="⚠️")
+
+    st.session_state["monitor_schedule"] = schedule
+    created.append(schedule)
+    return True
+
+
+def _page_monitor_manage(ref: str):
+    """Manage page for a scheduled monitor, reached via its private link."""
+    st.header("Scheduled monitor")
+    try:
+        schedule = monitor_schedule.find_by_ref(_monitor_store(), ref)
+    except Exception as e:
+        st.error(f"Could not load the schedule: {e}")
+        return
+    if schedule is None:
+        st.error("This monitor link is invalid or the schedule no longer exists.")
+        return
+
+    labels = {"biweekly": "Biweekly (1st & 15th)", "monthly": "Monthly (1st)",
+              "quarterly": "Quarterly (Jan, Apr, Jul, Oct)"}
+    active = schedule["status"] == "active"
+    st.markdown(
+        f"**Status:** {'Active' if active else 'Stopped on ' + str(schedule['stopped_at'])}  \n"
+        f"**Targets:** {', '.join(schedule['targets']) or '—'}  \n"
+        f"**Primer sets:** {', '.join(schedule['primer_sets']) or '—'}  \n"
+        f"**Frequency:** {labels.get(schedule['frequency'], schedule['frequency'])}  \n"
+        f"**Recipients:** {', '.join(schedule['recipients'])}  \n"
+        f"**Created:** {schedule['created']}"
+    )
+    if schedule.get("spreadsheet_url"):
+        st.markdown(f"**Spreadsheet:** {schedule['spreadsheet_url']}")
+    if schedule.get("history"):
+        st.subheader("Recent runs")
+        st.dataframe(list(reversed(schedule["history"])), hide_index=True,
+                     use_container_width=True)
+
+    if active:
+        if st.button("Stop monitoring", type="primary"):
+            monitor_schedule.stop_schedule(_monitor_store(), schedule)
+            st.toast("Monitoring stopped. No further reports will be sent.")
             st.rerun()
+    else:
+        st.info(f"Stored data for this monitor is deleted "
+                f"{monitor_schedule.DEFAULT_PURGE_AFTER_DAYS} days after it was stopped.")
 
 
 _SCROLL_JS = """
@@ -5287,6 +5347,11 @@ def _scroll_to_top():
 
 def main():
     _render_sidebar()
+
+    monitor_ref = st.query_params.get("monitor")
+    if monitor_ref:
+        _page_monitor_manage(monitor_ref)
+        return
 
     page = _current_page()
 

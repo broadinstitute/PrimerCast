@@ -1123,6 +1123,37 @@ def _monitor_evaluate(
         return None, warnings
 
 
+def _email_config(params: dict) -> tuple[str, str]:
+    """(sender, password) for report emails.
+
+    params.txt values win; otherwise ``PRIMERCAST_EMAIL_SENDER`` /
+    ``PRIMERCAST_EMAIL_PASSWORD`` (on Cloud Run, the password comes from Secret
+    Manager — see terraform/monitor.tf).
+    """
+    sender = str(params.get("EMAIL_SENDER", "")).strip() \
+        or os.environ.get("PRIMERCAST_EMAIL_SENDER", "").strip()
+    password = str(params.get("EMAIL_PASSWORD", "")).strip() \
+        or os.environ.get("PRIMERCAST_EMAIL_PASSWORD", "").strip()
+    return sender, password
+
+
+def _smtp_config(params: dict) -> tuple[str, int, str]:
+    """(host, port, login) of the SMTP server for report emails.
+
+    params.txt ``SMTP_HOST`` / ``SMTP_PORT`` / ``SMTP_USER`` win; otherwise
+    ``PRIMERCAST_SMTP_HOST`` / ``PRIMERCAST_SMTP_PORT`` / ``PRIMERCAST_SMTP_USER``.
+    Defaults to Gmail. An empty login means "log in as the sender" (Gmail);
+    relays such as Brevo (smtp-relay.brevo.com:587) have their own SMTP login.
+    """
+    def get(key: str) -> str:
+        return str(params.get(key, "")).strip() \
+            or os.environ.get(f"PRIMERCAST_{key}", "").strip()
+
+    host = get("SMTP_HOST") or "smtp.gmail.com"
+    port = int(get("SMTP_PORT") or 465)
+    return host, port, get("SMTP_USER")
+
+
 def _send_email(
     sender: str,
     password: str,
@@ -1130,8 +1161,14 @@ def _send_email(
     subject: str,
     body: str,
     attachments: list[Path] | None = None,
+    smtp: tuple[str, int, str] | None = None,
 ) -> bool:
-    """Send email via Gmail SMTP with optional attachments."""
+    """Send email over SMTP with optional attachments.
+
+    ``smtp`` is ``(host, port, login)`` (see ``_smtp_config``; defaults to the
+    environment). Port 465 uses implicit TLS, any other port STARTTLS.
+    """
+    host, port, login = smtp or _smtp_config({})
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
@@ -1150,8 +1187,14 @@ def _send_email(
             )
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender, password)
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=60)
+        else:
+            server = smtplib.SMTP(host, port, timeout=60)
+        with server:
+            if port != 465:
+                server.starttls()
+            server.login(login or sender, password)
             server.send_message(msg)
         print(f"Email sent to {', '.join(recipients)}")
         return True
@@ -1187,25 +1230,7 @@ def _install_cron(work_dir: Path, params_file: Path, schedule_email: str,
     schedule, description = _CRON_SCHEDULES.get(frequency, _CRON_SCHEDULES["monthly"])
     cron_line = f"{schedule} {cmd}  # adapt-monitor"
 
-    # Read existing crontab
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True
-        )
-        existing = result.stdout if result.returncode == 0 else ""
-    except FileNotFoundError:
-        existing = ""
-
-    # Remove any existing adapt-monitor line
-    lines = [l for l in existing.strip().split("\n") if "adapt-monitor" not in l]
-    lines.append(cron_line)
-
-    # Install new crontab
-    new_cron = "\n".join(lines) + "\n"
-    proc = subprocess.run(
-        ["crontab", "-"], input=new_cron, text=True
-    )
-    if proc.returncode == 0:
+    if _set_cron_line("adapt-monitor", cron_line):
         print(f"Cron job installed ({description} at midnight)")
         print(f"  {cron_line}")
     else:
@@ -1213,25 +1238,42 @@ def _install_cron(work_dir: Path, params_file: Path, schedule_email: str,
         sys.exit(1)
 
 
+def _set_cron_line(tag: str, line: str | None) -> bool:
+    """Replace the crontab line containing ``# <tag>`` with ``line`` (None removes it).
+
+    Returns False if crontab is unavailable or the update failed.
+    """
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        existing = result.stdout if result.returncode == 0 else ""
+        lines = [l for l in existing.strip().split("\n") if l and f"# {tag}" not in l]
+        if line:
+            lines.append(line)
+        new_cron = "\n".join(lines) + "\n" if lines else ""
+        return subprocess.run(["crontab", "-"], input=new_cron, text=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def _uninstall_cron():
     """Remove the adapt monitor cron job."""
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print("No crontab found.")
-            return
-        existing = result.stdout
-    except FileNotFoundError:
+    if _set_cron_line("adapt-monitor", None):
+        print("Cron job removed.")
+    else:
         print("crontab not available.")
-        return
 
-    lines = [l for l in existing.strip().split("\n") if "adapt-monitor" not in l]
-    new_cron = "\n".join(lines) + "\n" if lines else ""
 
-    subprocess.run(["crontab", "-"], input=new_cron, text=True)
-    print("Cron job removed.")
+def _install_dispatch_cron(store_dir: Path) -> bool:
+    """Install a daily cron line running ``adapt monitor-dispatch`` (local GUI schedules).
+
+    On Cloud Run, Cloud Scheduler triggers the dispatcher job instead.
+    """
+    adapt_path = shutil.which("adapt")
+    if not adapt_path:
+        return False
+    line = (f"0 0 * * * {adapt_path} monitor-dispatch --store-dir {store_dir.resolve()}"
+            f" >> {store_dir.resolve() / 'dispatch.log'} 2>&1  # primercast-monitor-dispatch")
+    return _set_cron_line("primercast-monitor-dispatch", line)
 
 
 def cmd_monitor(args):
@@ -1260,14 +1302,9 @@ def cmd_monitor(args):
     cores = args.cores
 
     # Email config
-    email_sender = str(params.get("EMAIL_SENDER", "")).strip()
-    email_password = str(params.get("EMAIL_PASSWORD", "")).strip()
-    email_recipients = [
-        e.strip() for e in str(params.get("EMAIL_RECIPIENTS", "")).split(",")
-        if e.strip()
-    ]
-    if args.email:
-        email_recipients = [args.email]
+    email_sender, email_password = _email_config(params)
+    recipients = args.email or str(params.get("EMAIL_RECIPIENTS", ""))
+    email_recipients = [e.strip() for e in recipients.split(",") if e.strip()]
 
     if args.skip_fetch:
         # --skip-fetch: reuse existing date directory, skip spreadsheet/fetch entirely
@@ -1308,15 +1345,22 @@ def cmd_monitor(args):
 
         target_groups = {t: [] for t in fetch_results}
     else:
-        # Normal flow: download spreadsheet and fetch
-        spreadsheet_url = args.url or str(params.get("SPREADSHEET_URL", "")).strip()
-        if not spreadsheet_url:
-            print("Error: no spreadsheet URL.", file=sys.stderr)
-            sys.exit(1)
+        # Normal flow: download spreadsheet (or read --csv) and fetch
+        if args.csv:
+            if not args.runid:
+                print("Error: --runid is required with --csv.", file=sys.stderr)
+                sys.exit(1)
+            spreadsheet_id = ""
+            csv_text = Path(args.csv).read_text(encoding="utf-8")
+        else:
+            spreadsheet_url = args.url or str(params.get("SPREADSHEET_URL", "")).strip()
+            if not spreadsheet_url:
+                print("Error: no spreadsheet URL.", file=sys.stderr)
+                sys.exit(1)
 
-        spreadsheet_id = _extract_spreadsheet_id(spreadsheet_url)
-        print(f"Downloading spreadsheet...")
-        csv_text = _download_spreadsheet_csv(spreadsheet_id)
+            spreadsheet_id = _extract_spreadsheet_id(spreadsheet_url)
+            print(f"Downloading spreadsheet...")
+            csv_text = _download_spreadsheet_csv(spreadsheet_id)
         _, data_rows = _load_spreadsheet(csv_text)
 
         # Filter by query IDs if specified
@@ -1451,6 +1495,8 @@ def cmd_monitor(args):
             email_body_parts.extend(f"  - {m}" for m in eval_warnings)
 
     # Step 3: Send email
+    if args.manage_url:
+        email_body_parts.append(f"\n{'-'*50}\nManage or stop this monitor: {args.manage_url}")
     email_body = "\n".join(email_body_parts)
 
     if email_sender and email_password and email_recipients:
@@ -1462,17 +1508,36 @@ def cmd_monitor(args):
             subject=subject,
             body=email_body,
             attachments=all_xlsx if all_xlsx else None,
+            smtp=_smtp_config(params),
         )
     else:
         if not email_sender:
             print("\nEmail not configured (set EMAIL_SENDER, EMAIL_PASSWORD, "
-                  "EMAIL_RECIPIENTS in params.txt)")
+                  "EMAIL_RECIPIENTS in params.txt, or PRIMERCAST_EMAIL_SENDER / "
+                  "PRIMERCAST_EMAIL_PASSWORD)")
 
     if n_warnings:
         print(f"\nMonitor finished with {n_warnings} warning(s); review them "
               f"before using the results.")
     else:
         print("\nMonitor complete.")
+
+
+def cmd_monitor_dispatch(args):
+    """Run every due monitor schedule from the schedule store (see monitor_schedule)."""
+    from primercast import monitor_schedule
+
+    store = monitor_schedule.get_store(Path(args.store_dir))
+    results = monitor_schedule.dispatch(
+        store,
+        cores=args.cores,
+        purge_after_days=args.purge_after_days,
+        dry_run=args.dry_run,
+    )
+    failed = [r for r in results if not r.ok]
+    print(f"\nDispatch finished: {len(results) - len(failed)} ok, {len(failed)} failed.")
+    if failed:
+        sys.exit(1)
 
 
 def main():
@@ -1521,6 +1586,9 @@ Examples:
 
   # Remove cron job
   adapt monitor --unschedule
+
+  # Run all due scheduled monitors (Cloud Run Job / daily cron)
+  adapt monitor-dispatch
 """,
     )
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
@@ -1601,7 +1669,12 @@ Examples:
     p_monitor.add_argument("--workdir", default="monitor",
                            help="Working directory for monitor data (default: monitor/)")
     p_monitor.add_argument("--runid", help="Run ID to group results (default: derived from spreadsheet name)")
-    p_monitor.add_argument("--email", help="Recipient email (overrides EMAIL_RECIPIENTS in params.txt)")
+    p_monitor.add_argument("--csv", help="Local spreadsheet CSV to use instead of downloading "
+                                         "(requires --runid)")
+    p_monitor.add_argument("--email", help="Recipient email(s), comma-separated "
+                                           "(overrides EMAIL_RECIPIENTS in params.txt)")
+    p_monitor.add_argument("--manage-url", dest="manage_url",
+                           help="Link appended to the report email for managing the schedule")
     p_monitor.add_argument("--cores", type=int, default=os.cpu_count() or 1,
                            help="Number of cores (default: all)")
     p_monitor.add_argument("--skip-fetch", action="store_true",
@@ -1612,6 +1685,25 @@ Examples:
     p_monitor.add_argument("--unschedule", action="store_true",
                            help="Remove monthly cron job")
     p_monitor.set_defaults(func=cmd_monitor)
+
+    # --- monitor-dispatch subcommand ---
+    p_dispatch = subparsers.add_parser(
+        "monitor-dispatch",
+        help="Run all due scheduled monitors",
+        description="Run every due monitor schedule from the schedule store: the GCS "
+                    "bucket in PRIMERCAST_MONITOR_BUCKET, or --store-dir locally. "
+                    "Run daily (Cloud Scheduler on Cloud Run, cron locally).",
+    )
+    p_dispatch.add_argument("--store-dir", default="monitor_schedules",
+                            help="Local schedule store when PRIMERCAST_MONITOR_BUCKET is "
+                                 "unset (default: monitor_schedules/)")
+    p_dispatch.add_argument("--cores", type=int, default=os.cpu_count() or 1,
+                            help="Number of cores (default: all)")
+    p_dispatch.add_argument("--purge-after-days", type=int, default=90,
+                            help="Delete data of schedules stopped this many days ago "
+                                 "(default: 90)")
+    p_dispatch.add_argument("--dry-run", action="store_true", help="List due schedules only")
+    p_dispatch.set_defaults(func=cmd_monitor_dispatch)
 
     args = parser.parse_args()
 

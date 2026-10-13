@@ -24,6 +24,14 @@ env:
   # "Report a problem" bucket (terraform/error_reports.tf). Prod gets its env
   # vars from terraform; staging's are set by the staging-deploy flags below.
   REPORT_BUCKET: sabeti-adapt-primercast-error-reports
+  # Scheduled-monitor bucket + jobs (terraform/monitor.tf). Emails go through the
+  # Brevo SMTP relay; the From address, SMTP login and whether the SMTP-key secret
+  # is wired into staging come from repo variables MONITOR_EMAIL_SENDER /
+  # MONITOR_SMTP_USER / MONITOR_EMAIL_ENABLED ('true' once the secret has a version).
+  MONITOR_BUCKET: sabeti-adapt-primercast-monitor
+  MONITOR_EMAIL_SECRET: primercast-monitor-smtp-key
+  MONITOR_SMTP_HOST: smtp-relay.brevo.com
+  MONITOR_SMTP_PORT: "587"
 
 # Two images are produced from one Dockerfile (see the TORCH_VARIANT build arg):
 #   GHCR  -> multi-arch (amd64+arm64), GPU-enabled. Used by training + the
@@ -286,6 +294,21 @@ jobs:
           region: us-central1
           image: ${{ env.GAR_REGISTRY }}:${{ github.ref_name }}
 
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Update monitor job image
+        run: |
+          JOB=primercast-monitor
+          if gcloud run jobs describe "${JOB}" --region="${{ env.GAR_REGION }}" \
+              --project="${{ env.GAR_PROJECT }}" --format='value(name)' >/dev/null 2>&1; then
+            gcloud run jobs update "${JOB}" \
+              --image="${{ env.GAR_REGISTRY }}:${{ github.ref_name }}" \
+              --region="${{ env.GAR_REGION }}" --project="${{ env.GAR_PROJECT }}" --quiet
+          else
+            echo "::warning::Cloud Run job ${JOB} not found (terraform/monitor.tf not applied?); skipped."
+          fi
+
   staging-deploy:
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     needs: [build-gar]
@@ -327,6 +350,9 @@ jobs:
               --format='value(name)' >/dev/null 2>&1; then
             EXTRA_FLAGS+=("--no-traffic")
           fi
+          if [ "${{ vars.MONITOR_EMAIL_ENABLED }}" = "true" ]; then
+            EXTRA_FLAGS+=("--update-secrets=PRIMERCAST_EMAIL_PASSWORD=${{ env.MONITOR_EMAIL_SECRET }}:latest")
+          fi
           # Resource sizing matches terraform/cloud_run.tf + staging.tf.
           gcloud run deploy "${SERVICE}" \
             --image="${{ env.GAR_REGISTRY }}:${{ steps.img.outputs.sha_short }}" \
@@ -344,9 +370,23 @@ jobs:
             --cpu-boost \
             --session-affinity \
             --timeout=600 \
-            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }}" \
+            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }},PRIMERCAST_MONITOR_BUCKET=${{ env.MONITOR_BUCKET }},PRIMERCAST_MONITOR_PREFIX=staging,PRIMERCAST_EMAIL_SENDER=${{ vars.MONITOR_EMAIL_SENDER }},PRIMERCAST_SMTP_HOST=${{ env.MONITOR_SMTP_HOST }},PRIMERCAST_SMTP_PORT=${{ env.MONITOR_SMTP_PORT }},PRIMERCAST_SMTP_USER=${{ vars.MONITOR_SMTP_USER }}" \
             --quiet \
             "${EXTRA_FLAGS[@]}"
+
+      - name: Update staging monitor job image
+        run: |
+          # Last branch pushed wins; run it by hand with
+          #   gcloud run jobs execute primercast-monitor-staging --region us-central1
+          JOB=primercast-monitor-staging
+          if gcloud run jobs describe "${JOB}" --region="${{ env.GAR_REGION }}" \
+              --project="${{ env.GAR_PROJECT }}" --format='value(name)' >/dev/null 2>&1; then
+            gcloud run jobs update "${JOB}" \
+              --image="${{ env.GAR_REGISTRY }}:${{ steps.img.outputs.sha_short }}" \
+              --region="${{ env.GAR_REGION }}" --project="${{ env.GAR_PROJECT }}" --quiet
+          else
+            echo "::warning::Cloud Run job ${JOB} not found (terraform/monitor.tf not applied?); skipped."
+          fi
 
       - name: Show staging URL
         run: |

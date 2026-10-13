@@ -39,6 +39,52 @@ resource "google_cloud_run_v2_service" "app" {
         value = "prod"
       }
 
+      # Scheduled monitors (see monitor.tf / src/primercast/monitor_schedule.py).
+      env {
+        name  = "PRIMERCAST_MONITOR_BUCKET"
+        value = google_storage_bucket.monitor.name
+      }
+      env {
+        name  = "PRIMERCAST_MONITOR_PREFIX"
+        value = "prod"
+      }
+      env {
+        name  = "PRIMERCAST_MONITOR_TZ"
+        value = var.monitor_time_zone
+      }
+      env {
+        name  = "PRIMERCAST_PUBLIC_URL"
+        value = var.custom_domain != "" ? "https://${var.custom_domain}" : ""
+      }
+      env {
+        name  = "PRIMERCAST_EMAIL_SENDER"
+        value = var.monitor_email_sender
+      }
+      env {
+        name  = "PRIMERCAST_SMTP_HOST"
+        value = var.monitor_smtp_host
+      }
+      env {
+        name  = "PRIMERCAST_SMTP_PORT"
+        value = tostring(var.monitor_smtp_port)
+      }
+      env {
+        name  = "PRIMERCAST_SMTP_USER"
+        value = var.monitor_smtp_user
+      }
+      dynamic "env" {
+        for_each = var.monitor_email_enabled ? [1] : []
+        content {
+          name = "PRIMERCAST_EMAIL_PASSWORD"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.monitor_smtp_key.secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       resources {
         limits = {
           cpu    = var.cloud_run_cpu

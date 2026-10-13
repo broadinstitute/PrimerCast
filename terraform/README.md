@@ -37,7 +37,50 @@ This stack creates:
   `PRIMERCAST_REPORT_PREFIX` from terraform; staging gets them from CI's `staging-deploy` flags.
   Reports submitted within the same 5 minutes are folded into one email (alert rate limit).
 
-It does **not** create the GPU image (that lives in GHCR) or any GCS bucket (see Deferred).
+- **Scheduled monitoring** (`monitor.tf`): a private bucket (`sabeti-adapt-primercast-monitor`)
+  holding each scheduled monitor (`<prefix>/schedules/<id>.json`) and its run data
+  (`<prefix>/runs/<id>/<YYYYMMDD>/`: accession history, reports, log); a Cloud Run Job
+  (`primercast-monitor`) running `adapt monitor-dispatch`, started daily at 00:00
+  America/New_York by Cloud Scheduler; a `primercast-monitor-staging` job (prefix `staging`,
+  no scheduler, run by hand); and a Secret Manager secret for the SMTP key used to send
+  reports through the Brevo SMTP relay. The web app (which may be scaled to zero) only creates/stops schedules and
+  runs the first monitor immediately. Users manage a schedule through the private link
+  `/?monitor=<id>.<token>` shown on creation and included in every report email. Stopped
+  schedules' data is deleted 90 days after they were stopped; active schedules are capped
+  at 50 (`PRIMERCAST_MONITOR_MAX_SCHEDULES`).
+
+It does **not** create the GPU image (that lives in GHCR) or persist design/evaluate results
+(see Deferred).
+
+### Enabling monitor emails (one-time)
+
+Reports are sent through Brevo's SMTP relay (`smtp-relay.brevo.com:587`, STARTTLS; free
+tier is 300 emails/day).
+
+1. Create a Brevo account. Under **Senders, Domains & Dedicated IPs → Senders**, add and
+   verify the From address (Brevo emails it a confirmation link).
+2. Under **SMTP & API → SMTP**, note the **SMTP login** (e.g. `1a2b3c001@smtp-brevo.com`)
+   and generate an **SMTP key**.
+3. In `terraform.tfvars` set `monitor_email_sender = "<verified address>"` and
+   `monitor_smtp_user = "<SMTP login>"`, then `terraform apply` (this creates the bucket,
+   jobs, scheduler and the *empty* secret).
+4. Add the SMTP key as a secret version (it never enters terraform state or the repo):
+   ```bash
+   printf '%s' 'SMTP_KEY' | gcloud secrets versions add primercast-monitor-smtp-key \
+     --data-file=- --project=sabeti-adapt
+   ```
+5. Set `monitor_email_enabled = true` and `terraform apply` again (Cloud Run refuses
+   revisions that reference a secret with no versions, hence the two steps).
+6. For staging, set GitHub repo **variables** (Settings → Secrets and variables → Actions →
+   Variables): `MONITOR_EMAIL_SENDER` = the sender address, `MONITOR_SMTP_USER` = the SMTP
+   login, `MONITOR_EMAIL_ENABLED` = `true`.
+
+To switch providers later, change `monitor_smtp_host` / `monitor_smtp_port` /
+`monitor_smtp_user` and add the new password as a secret version.
+
+Test the dispatcher without waiting for midnight:
+`gcloud run jobs execute primercast-monitor-staging --region us-central1` (or the prod job).
+Logs are in Cloud Logging under the job; each run's `monitor.log` is also saved in the bucket.
 
 ## Image split (why GAR is CPU-only)
 
