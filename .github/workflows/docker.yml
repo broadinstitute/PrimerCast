@@ -361,7 +361,7 @@ jobs:
             --tag="${{ steps.rev.outputs.tag }}" \
             --port=8080 \
             --allow-unauthenticated \
-            --memory=4Gi \
+            --memory=8Gi \
             --cpu=4 \
             --concurrency=8 \
             --min-instances=0 \
@@ -369,8 +369,8 @@ jobs:
             --no-cpu-throttling \
             --cpu-boost \
             --session-affinity \
-            --timeout=600 \
-            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }},PRIMERCAST_MONITOR_BUCKET=${{ env.MONITOR_BUCKET }},PRIMERCAST_MONITOR_PREFIX=staging,PRIMERCAST_EMAIL_SENDER=${{ vars.MONITOR_EMAIL_SENDER }},PRIMERCAST_SMTP_HOST=${{ env.MONITOR_SMTP_HOST }},PRIMERCAST_SMTP_PORT=${{ env.MONITOR_SMTP_PORT }},PRIMERCAST_SMTP_USER=${{ vars.MONITOR_SMTP_USER }}" \
+            --timeout=3600 \
+            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }},PRIMERCAST_MONITOR_BUCKET=${{ env.MONITOR_BUCKET }},PRIMERCAST_MONITOR_PREFIX=staging,PRIMERCAST_MONITOR_JOB=projects/${{ env.GAR_PROJECT }}/locations/${{ env.GAR_REGION }}/jobs/primercast-monitor-staging,PRIMERCAST_EMAIL_SENDER=${{ vars.MONITOR_EMAIL_SENDER }},PRIMERCAST_SMTP_HOST=${{ env.MONITOR_SMTP_HOST }},PRIMERCAST_SMTP_PORT=${{ env.MONITOR_SMTP_PORT }},PRIMERCAST_SMTP_USER=${{ vars.MONITOR_SMTP_USER }}" \
             --quiet \
             "${EXTRA_FLAGS[@]}"
 

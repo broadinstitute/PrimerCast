@@ -52,6 +52,11 @@ resource "google_cloud_run_v2_service" "app" {
         name  = "PRIMERCAST_MONITOR_TZ"
         value = var.monitor_time_zone
       }
+      # The first run of a new schedule executes on the monitor job, not here.
+      env {
+        name  = "PRIMERCAST_MONITOR_JOB"
+        value = "projects/${var.project_id}/locations/${var.region}/jobs/${local.monitor_jobs.prod.name}"
+      }
       env {
         name  = "PRIMERCAST_PUBLIC_URL"
         value = var.custom_domain != "" ? "https://${var.custom_domain}" : ""

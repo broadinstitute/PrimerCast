@@ -6,7 +6,8 @@
 # Scheduler starts the `primercast-monitor` Cloud Run Job, which runs          #
 # `adapt monitor-dispatch`: every due schedule is fetched + evaluated, its     #
 # report emailed, and its outputs written to runs/<id>/<YYYYMMDD>/. The web    #
-# service can scale to zero; nothing depends on it being up at run time.       #
+# app starts a new schedule's first run as a separate execution of the same    #
+# job. The web service can scale to zero; nothing depends on it at run time.   #
 #                                                                              #
 # Email: Brevo SMTP relay (var.monitor_smtp_*). The From address is          #
 # var.monitor_email_sender (a verified Brevo sender); the SMTP key lives in    #
@@ -60,7 +61,7 @@ resource "google_service_account" "monitor_scheduler" {
   project      = var.project_id
 }
 
-# The web app creates/stops schedules and uploads first-run results; the job
+# The web app creates/stops schedules and reads run reports; the job
 # reads schedules, reads/writes run data and purges stopped schedules.
 resource "google_storage_bucket_iam_member" "monitor_bucket" {
   for_each = {
@@ -72,7 +73,8 @@ resource "google_storage_bucket_iam_member" "monitor_bucket" {
   member = "serviceAccount:${each.value}"
 }
 
-# The web app emails the immediate first run; the job emails scheduled runs.
+# The job emails scheduled and first runs; the web app only sends when no job
+# is configured (PRIMERCAST_MONITOR_JOB unset).
 resource "google_secret_manager_secret_iam_member" "monitor_smtp_key" {
   for_each = {
     runtime = google_service_account.runtime.email
@@ -187,6 +189,17 @@ resource "google_cloud_run_v2_job" "monitor" {
     google_project_service.services,
     google_secret_manager_secret_iam_member.monitor_smtp_key,
   ]
+}
+
+# The web app starts each new schedule's first run as its own execution
+# (`monitor-dispatch --schedule-id <id>`), which needs runWithOverrides.
+resource "google_cloud_run_v2_job_iam_member" "monitor_runtime_executor" {
+  for_each = local.monitor_jobs
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_job.monitor[each.key].name
+  role     = "roles/run.jobsExecutorWithOverrides"
+  member   = "serviceAccount:${google_service_account.runtime.email}"
 }
 
 # --- Daily trigger (prod only) -------------------------------------------------

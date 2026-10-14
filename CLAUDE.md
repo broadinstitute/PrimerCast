@@ -132,7 +132,9 @@ saves each schedule to a store (`src/primercast/monitor_schedule.py`): the GCS b
 `PRIMERCAST_MONITOR_BUCKET` on Cloud Run, `DATA_DIR/monitor_schedules/` locally. A daily
 `adapt monitor-dispatch` (Cloud Run Job + Cloud Scheduler, `terraform/monitor.tf`; a cron
 line locally) runs every due schedule and persists its accession history, which is what
-makes monitoring incremental. No accounts: each schedule has a private manage link
+makes monitoring incremental. On Cloud Run a new schedule's first run is also a job
+execution (`monitor-dispatch --schedule-id <id>`, started by the GUI); locally it runs in
+the GUI. No accounts: each schedule has a private manage link
 `/?monitor=<id>.<token>`.
 
 ## Snakemake Workflows
@@ -160,8 +162,10 @@ snakemake -s Snakefile.example --dry-run
   and offered as a download.
 - `PRIMERCAST_MONITOR_BUCKET` / `PRIMERCAST_MONITOR_PREFIX`: GCS bucket + prefix for scheduled
   monitors (set by terraform for prod/jobs, CI for staging). Unset → local store.
+- `PRIMERCAST_MONITOR_JOB`: full name of the Cloud Run Job (`projects/<p>/locations/<r>/jobs/<name>`)
+  that runs a new schedule's first run (set by terraform/CI). Unset → the GUI runs it in-process.
 - `PRIMERCAST_MONITOR_TZ`: time zone for scheduled run dates (default `America/New_York`).
-- `PRIMERCAST_MONITOR_MAX_SCHEDULES`: cap on active scheduled monitors (default 50).
+- `PRIMERCAST_MONITOR_MAX_SCHEDULES`: cap on active scheduled monitors (default 100).
 - `PRIMERCAST_EMAIL_SENDER` / `PRIMERCAST_EMAIL_PASSWORD`: From address + SMTP password/key for
   monitor reports when not in `params.txt` (key from Secret Manager on Cloud Run).
 - `PRIMERCAST_SMTP_HOST` / `PRIMERCAST_SMTP_PORT` / `PRIMERCAST_SMTP_USER`: SMTP server, port

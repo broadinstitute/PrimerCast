@@ -44,10 +44,11 @@ This stack creates:
   America/New_York by Cloud Scheduler; a `primercast-monitor-staging` job (prefix `staging`,
   no scheduler, run by hand); and a Secret Manager secret for the SMTP key used to send
   reports through the Brevo SMTP relay. The web app (which may be scaled to zero) only creates/stops schedules and
-  runs the first monitor immediately. Users manage a schedule through the private link
+  starts each new schedule's first run as its own job execution
+  (`monitor-dispatch --schedule-id <id>`). Users manage a schedule through the private link
   `/?monitor=<id>.<token>` shown on creation and included in every report email. Stopped
   schedules' data is deleted 90 days after they were stopped; active schedules are capped
-  at 50 (`PRIMERCAST_MONITOR_MAX_SCHEDULES`).
+  at 100 (`PRIMERCAST_MONITOR_MAX_SCHEDULES`).
 
 It does **not** create the GPU image (that lives in GHCR) or persist design/evaluate results
 (see Deferred).

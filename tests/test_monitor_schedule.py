@@ -206,6 +206,31 @@ class TestDispatch:
         runner = lambda *a: pytest.fail("should not run")
         assert ms.dispatch(store, day=date(2026, 2, 1), dry_run=True, runner=runner) == []
 
+    def test_schedule_id_runs_now_without_purge(self, store):
+        new = _schedule(store, created=date(2026, 2, 5))
+        _schedule(store, created=date(2026, 1, 10))  # due, but not selected
+        old = _schedule(store, status="stopped", stopped_at="2025-01-01")
+        ran = []
+
+        def runner(store_, schedule, scratch, cores):
+            ran.append(schedule["id"])
+            return ms.DispatchResult(schedule["id"], True)
+
+        ms.dispatch(store, day=date(2026, 2, 5), runner=runner, schedule_id=new["id"])
+        assert ran == [new["id"]]
+        saved = ms.load_schedule(store, new["id"])
+        assert saved["last_run"] == "2026-02-05"
+        assert not ms.is_due(saved, date(2026, 2, 28))
+        assert ms.is_due(saved, date(2026, 3, 1))
+        assert ms.load_schedule(store, old["id"]) is not None
+
+    def test_schedule_id_skips_stopped_or_missing(self, store):
+        stopped = _schedule(store, status="stopped", stopped_at="2026-02-01")
+        runner = lambda *a: pytest.fail("should not run")
+        for sid in (stopped["id"], "0123456789ab"):
+            assert ms.dispatch(store, day=date(2026, 2, 5), runner=runner,
+                               schedule_id=sid) == []
+
     def test_purges_long_stopped(self, store):
         old = _schedule(store, status="stopped", stopped_at="2026-01-01")
         recent = _schedule(store, status="stopped", stopped_at="2026-03-01")
@@ -266,3 +291,41 @@ class TestRunSchedule:
 def test_get_store_selects_backend(tmp_path, monkeypatch):
     monkeypatch.delenv("PRIMERCAST_MONITOR_BUCKET", raising=False)
     assert isinstance(ms.get_store(tmp_path), ms.LocalStore)
+
+
+class TestStartJobRun:
+    def test_posts_override_args(self):
+        calls = {}
+
+        class FakeSession:
+            def __init__(self, credentials):
+                pass
+
+            def post(self, url, json, timeout):
+                calls.update(url=url, json=json)
+                return type("R", (), {
+                    "raise_for_status": lambda self: None,
+                    "json": lambda self: {"metadata": {"name": "projects/p/executions/e1"}},
+                })()
+
+        job = "projects/p/locations/r/jobs/primercast-monitor"
+        with patch("google.auth.default", return_value=(object(), "p")), \
+                patch("google.auth.transport.requests.AuthorizedSession", FakeSession):
+            assert ms.start_job_run(job, "abc123def456") == "projects/p/executions/e1"
+        assert calls["url"] == f"https://run.googleapis.com/v2/{job}:run"
+        assert calls["json"]["overrides"]["containerOverrides"][0]["args"] == [
+            "monitor-dispatch", "--schedule-id", "abc123def456"]
+
+
+class TestLatestReports:
+    def test_picks_most_recent_date(self, store):
+        store.write_text("runs/abc/20260101/SC2_N1.xlsx", "old")
+        store.write_text("runs/abc/20260201/SC2_N1.xlsx", "new")
+        store.write_text("runs/abc/20260201/SC2_accessions.txt", "A\n")
+        day, keys = ms.latest_reports(store, "abc")
+        assert day == "20260201"
+        assert keys == ["runs/abc/20260201/SC2_N1.xlsx"]
+        assert store.read_bytes(keys[0]) == b"new"
+
+    def test_no_runs(self, store):
+        assert ms.latest_reports(store, "abc") == ("", [])

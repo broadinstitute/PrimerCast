@@ -44,7 +44,7 @@ FREQUENCIES = ("biweekly", "monthly", "quarterly")
 MAX_HISTORY = 24
 # Daily attempts per scheduled date before a failing run waits for the next date.
 MAX_ATTEMPTS = 3
-DEFAULT_MAX_ACTIVE = int(os.environ.get("PRIMERCAST_MONITOR_MAX_SCHEDULES", "50"))
+DEFAULT_MAX_ACTIVE = int(os.environ.get("PRIMERCAST_MONITOR_MAX_SCHEDULES", "100"))
 DEFAULT_PURGE_AFTER_DAYS = 90
 MAX_RECIPIENTS = 10
 _EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
@@ -74,6 +74,9 @@ class LocalStore:
     def read_text(self, key: str) -> str | None:
         path = self._path(key)
         return path.read_text() if path.is_file() else None
+
+    def read_bytes(self, key: str) -> bytes:
+        return self._path(key).read_bytes()
 
     def write_text(self, key: str, text: str) -> None:
         path = self._path(key)
@@ -125,6 +128,9 @@ class GCSStore:
             return self._bucket.blob(self._name(key)).download_as_text()
         except NotFound:
             return None
+
+    def read_bytes(self, key: str) -> bytes:
+        return self._bucket.blob(self._name(key)).download_as_bytes()
 
     def write_text(self, key: str, text: str) -> None:
         self._bucket.blob(self._name(key)).upload_from_string(text)
@@ -325,6 +331,20 @@ def pull_history(store, schedule_id: str, work_dir: Path) -> int:
     return count
 
 
+def latest_reports(store, schedule_id: str) -> tuple[str, list[str]]:
+    """Date (YYYYMMDD) and Excel report keys of a schedule's most recent run."""
+    prefix = f"runs/{schedule_id}/"
+    by_date: dict[str, list[str]] = {}
+    for key in store.list(prefix):
+        rel = key[len(prefix):]
+        if rel.count("/") == 1:
+            by_date.setdefault(rel.split("/")[0], []).append(key)
+    if not by_date:
+        return "", []
+    day = max(by_date)
+    return day, [k for k in by_date[day] if k.endswith(".xlsx")]
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -425,11 +445,22 @@ def dispatch(
     purge_after_days: int = DEFAULT_PURGE_AFTER_DAYS,
     dry_run: bool = False,
     runner: Callable[..., DispatchResult] = run_schedule,
+    schedule_id: str | None = None,
 ) -> list[DispatchResult]:
-    """Run every due schedule, then purge long-stopped ones."""
+    """Run every due schedule, then purge long-stopped ones.
+
+    With ``schedule_id``, run just that schedule now if it is active (a new
+    schedule's first run), whether due or not, and purge nothing.
+    """
     day = day or today()
-    due = [s for s in list_schedules(store) if is_due(s, day)]
-    print(f"{day}: {len(due)} due schedule(s) in {store!r}", flush=True)
+    if schedule_id:
+        schedule = load_schedule(store, schedule_id)
+        due = [schedule] if schedule and schedule.get("status") == "active" else []
+        print(f"{day}: running schedule {schedule_id} now "
+              f"({'found' if due else 'not found or stopped'}) in {store!r}", flush=True)
+    else:
+        due = [s for s in list_schedules(store) if is_due(s, day)]
+        print(f"{day}: {len(due)} due schedule(s) in {store!r}", flush=True)
 
     results = []
     if dry_run:
@@ -448,6 +479,28 @@ def dispatch(
         _record(store, schedule["id"], day, result)
         results.append(result)
 
-    for sid in purge_stopped(store, day, purge_after_days):
-        print(f"Purged stopped schedule {sid}", flush=True)
+    if not schedule_id:
+        for sid in purge_stopped(store, day, purge_after_days):
+            print(f"Purged stopped schedule {sid}", flush=True)
     return results
+
+
+def start_job_run(job: str, schedule_id: str) -> str:
+    """Start one Cloud Run Job execution running just ``schedule_id``.
+
+    ``job`` is the full resource name (``projects/<p>/locations/<r>/jobs/<name>``).
+    Returns the execution name. The caller needs ``run.jobs.runWithOverrides``.
+    """
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    response = AuthorizedSession(credentials).post(
+        f"https://run.googleapis.com/v2/{job}:run",
+        json={"overrides": {"containerOverrides": [
+            {"args": ["monitor-dispatch", "--schedule-id", schedule_id]}]}},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json().get("metadata", {}).get("name", "")

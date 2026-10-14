@@ -47,15 +47,15 @@ variable "cloud_run_cpu" {
 }
 
 variable "cloud_run_memory" {
-  description = "Memory per Cloud Run instance. Validate against a real design run for OOM headroom."
+  description = "Memory per Cloud Run instance, shared by its concurrent sessions. Scratch files live in memory on Cloud Run. Matches the monitor job."
   type        = string
-  default     = "4Gi"
+  default     = "8Gi"
 }
 
 variable "cloud_run_timeout_seconds" {
-  description = "Per-request timeout. Typical design runs ~2 min after recent optimizations; 600s gives headroom."
+  description = "Per-request timeout, which also caps how long a Streamlit websocket (one browser session) stays connected before it reconnects. 3600s is the Cloud Run maximum."
   type        = number
-  default     = 600
+  default     = 3600
 }
 
 variable "cloud_run_concurrency" {
@@ -146,7 +146,7 @@ variable "monitor_job_memory" {
 }
 
 variable "monitor_job_timeout_seconds" {
-  description = "Max runtime of one dispatcher execution (all due schedules run sequentially). Cloud Run Jobs allow up to 24h."
+  description = "Max runtime of one dispatcher execution (all due schedules run sequentially; a first run is its own execution). Cloud Run Jobs allow up to 24h."
   type        = number
-  default     = 21600
+  default     = 43200
 }

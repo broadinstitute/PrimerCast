@@ -1627,6 +1627,7 @@ def cmd_monitor_dispatch(args):
         cores=args.cores,
         purge_after_days=args.purge_after_days,
         dry_run=args.dry_run,
+        schedule_id=args.schedule_id,
     )
     failed = [r for r in results if not r.ok]
     print(f"\nDispatch finished: {len(results) - len(failed)} ok, {len(failed)} failed.")
@@ -1797,6 +1798,9 @@ Examples:
                             help="Delete data of schedules stopped this many days ago "
                                  "(default: 90)")
     p_dispatch.add_argument("--dry-run", action="store_true", help="List due schedules only")
+    p_dispatch.add_argument("--schedule-id", default=None,
+                            help="Run only this schedule, now, even if not due (a new "
+                                 "schedule's first run); skips the purge")
     p_dispatch.set_defaults(func=cmd_monitor_dispatch)
 
     args = parser.parse_args()

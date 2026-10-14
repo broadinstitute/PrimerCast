@@ -165,6 +165,9 @@ MONITOR_DIR = DATA_DIR / "monitor"
 # (terraform/monitor.tf); locally they live here and a daily cron line runs them.
 MONITOR_STORE_DIR = DATA_DIR / "monitor_schedules"
 MONITOR_ON_CLOUD = bool(os.environ.get("PRIMERCAST_MONITOR_BUCKET", "").strip())
+# Cloud Run Job that runs a new schedule's first run (instead of this web instance,
+# which has less time and memory to spare); unset → the first run happens here.
+MONITOR_JOB = os.environ.get("PRIMERCAST_MONITOR_JOB", "").strip()
 
 # Error reports ("Report a problem" button). On Cloud Run, bundles go to the GCS
 # bucket in PRIMERCAST_REPORT_BUCKET (see terraform/error_reports.tf); without it
@@ -217,7 +220,7 @@ def _reset_workflow_state():
                 "monitor_primer_name", "monitor_primer_fwd",
                 "monitor_primer_rev", "monitor_primer_pro",
                 "monitor_frequency", "monitor_skip_fetch",
-                "monitor_resume_run", "monitor_schedule"):
+                "monitor_resume_run", "monitor_schedule", "monitor_first_run"):
         st.session_state.pop(key, None)
     _clear_pipeline_state()
 
@@ -4376,27 +4379,32 @@ def _page_monitor_primer():
         st.session_state["monitor_manual_primers"] = []
 
     with st.expander("Enter primer sequences"):
-        name = st.text_input("Primer set name", key="monitor_primer_name",
-                             placeholder="e.g. My_primer_1")
-        fwd = st.text_input("Forward primer (5'→3')", key="monitor_primer_fwd",
-                            placeholder="ATCGATCG...")
-        rev = st.text_input("Reverse primer (5'→3')", key="monitor_primer_rev",
-                            placeholder="ATCGATCG...")
-        pro = st.text_input("Probe (5'→3', optional)", key="monitor_primer_pro",
-                            placeholder="ATCGATCG...")
+        st.text_input("Primer set name", key="monitor_primer_name",
+                      placeholder="e.g. My_primer_1")
+        st.text_input("Forward primer (5'→3')", key="monitor_primer_fwd",
+                      placeholder="ATCGATCG...")
+        st.text_input("Reverse primer (5'→3')", key="monitor_primer_rev",
+                      placeholder="ATCGATCG...")
+        st.text_input("Probe (5'→3', optional)", key="monitor_primer_pro",
+                      placeholder="ATCGATCG...")
 
-        if st.button("Add primer set", key="monitor_add_primer"):
-            if name and fwd and rev:
-                st.session_state["monitor_manual_primers"].append({
-                    "name": name, "Forward": fwd, "Reverse": rev, "Probe": pro,
-                })
-                st.session_state["monitor_primer_name"] = ""
-                st.session_state["monitor_primer_fwd"] = ""
-                st.session_state["monitor_primer_rev"] = ""
-                st.session_state["monitor_primer_pro"] = ""
-                st.rerun()
-            else:
-                st.warning("Name, Forward, and Reverse are required.")
+        def _add_primer():
+            # A callback runs before the inputs are drawn, so they can be cleared here.
+            ss = st.session_state
+            name, fwd, rev, pro = (ss.get(f"monitor_primer_{k}", "").strip()
+                                   for k in ("name", "fwd", "rev", "pro"))
+            if not (name and fwd and rev):
+                ss["_monitor_primer_missing"] = True
+                return
+            ss["monitor_manual_primers"].append({
+                "name": name, "Forward": fwd.upper(), "Reverse": rev.upper(), "Probe": pro.upper(),
+            })
+            for k in ("name", "fwd", "rev", "pro"):
+                ss[f"monitor_primer_{k}"] = ""
+
+        st.button("Add primer set", key="monitor_add_primer", on_click=_add_primer)
+        if st.session_state.pop("_monitor_primer_missing", False):
+            st.warning("Name, Forward, and Reverse are required.")
 
     # Show manually added primers
     manual = st.session_state.get("monitor_manual_primers", [])
@@ -4993,6 +5001,10 @@ def _run_monitor():
 def _tab_run_monitor():
     """Run page for monitor workflow."""
     st.header("Run Monitor")
+    if MONITOR_JOB:
+        st.session_state.pipeline_return_code = None
+        _render_first_run_submitted()
+        return
 
     # Run ID for identifying this run later
     sheet_data = st.session_state.get("monitor_spreadsheet_data")
@@ -5278,10 +5290,17 @@ def _page_monitor_report():
         key="monitor_frequency",
     )
     frequency = frequency_options[selected_label]
-    st.caption(
-        "The monitor runs once now, then on each scheduled date. Every report email "
-        "includes a private link for viewing or stopping the schedule."
-    )
+    if MONITOR_JOB:
+        st.caption(
+            "The monitor runs once now on our servers, then on each scheduled date. "
+            "Reports are emailed, and each email includes a private link for viewing "
+            "or stopping the schedule."
+        )
+    else:
+        st.caption(
+            "The monitor runs once now, then on each scheduled date. Every report email "
+            "includes a private link for viewing or stopping the schedule."
+        )
 
     st.divider()
 
@@ -5294,7 +5313,8 @@ def _page_monitor_report():
     with col_cont:
         if st.button("Continue →", type="primary", use_container_width=True,
                       key="report_cont", disabled=not email_configured):
-            if _create_monitor_schedule(frequency):
+            if _create_monitor_schedule(frequency) and (
+                    not MONITOR_JOB or _start_first_run_job()):
                 st.session_state._run_page_fresh = True
                 _navigate("run")
                 st.rerun()
@@ -5382,6 +5402,40 @@ def _create_monitor_schedule(frequency: str) -> bool:
     return True
 
 
+def _start_first_run_job() -> bool:
+    """Start the new schedule's first run on the monitor job; False (error shown) if not."""
+    schedule = st.session_state["monitor_schedule"]
+    try:
+        execution = monitor_schedule.start_job_run(MONITOR_JOB, schedule["id"])
+    except Exception as e:
+        st.error(f"The schedule was saved, but its first run could not be started: {e}. "
+                 "It will still run on the next scheduled date.")
+        return False
+    st.session_state["monitor_first_run"] = execution.rsplit("/", 1)[-1] or "started"
+    return True
+
+
+def _render_first_run_submitted():
+    """Run page when the first run executes on the monitor job."""
+    schedule = st.session_state.get("monitor_schedule")
+    first_run = st.session_state.get("monitor_first_run")
+    if not schedule or not first_run:
+        st.info("Set up the monitor on the previous pages; its first run starts when "
+                "you click Continue on the Report page.")
+        return
+    st.success("**First run started.** It runs on our servers, so you can close this page.")
+    st.markdown(
+        f"The report will be emailed to **{', '.join(schedule['recipients'])}** when the "
+        f"run finishes. This can take from a few minutes to several hours for large "
+        f"targets.  \n"
+        f"Later reports arrive on each scheduled date."
+    )
+    st.markdown(f"**Manage link** (keep it private; it is also in every email):  \n"
+                f"{schedule['manage_url']}")
+    st.caption("The manage page shows each run's status and lets you download its "
+               f"reports or stop the schedule. (Job execution: {first_run})")
+
+
 def _page_monitor_manage(ref: str):
     """Manage page for a scheduled monitor, reached via its private link."""
     st.header("Scheduled monitor")
@@ -5411,6 +5465,10 @@ def _page_monitor_manage(ref: str):
         st.subheader("Recent runs")
         st.dataframe(list(reversed(schedule["history"])), hide_index=True,
                      use_container_width=True)
+    elif active:
+        st.info("No runs recorded yet. The first run may still be in progress; "
+                "refresh this page later.")
+    _render_latest_reports(schedule["id"])
 
     if active:
         if st.button("Stop monitoring", type="primary"):
@@ -5420,6 +5478,29 @@ def _page_monitor_manage(ref: str):
     else:
         st.info(f"Stored data for this monitor is deleted "
                 f"{monitor_schedule.DEFAULT_PURGE_AFTER_DAYS} days after it was stopped.")
+
+
+def _render_latest_reports(schedule_id: str):
+    """Download buttons for the Excel reports of a schedule's most recent run."""
+    store = _monitor_store()
+    try:
+        day, keys = monitor_schedule.latest_reports(store, schedule_id)
+    except Exception as e:
+        st.warning(f"Could not list reports: {e}")
+        return
+    if not keys:
+        return
+    st.subheader(f"Latest reports ({datetime.strptime(day, '%Y%m%d'):%Y-%m-%d})")
+    for key in keys:
+        name = key.rsplit("/", 1)[-1]
+        try:
+            data = store.read_bytes(key)
+        except Exception as e:
+            st.warning(f"Could not load {name}: {e}")
+            continue
+        st.download_button(
+            name, data, file_name=name, key=f"report_{key}",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 _SCROLL_JS = """
