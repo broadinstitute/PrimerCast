@@ -164,6 +164,9 @@ snakemake -s Snakefile.example --dry-run
   monitors (set by terraform for prod/jobs, CI for staging). Unset → local store.
 - `PRIMERCAST_MONITOR_JOB`: full name of the Cloud Run Job (`projects/<p>/locations/<r>/jobs/<name>`)
   that runs a new schedule's first run (set by terraform/CI). Unset → the GUI runs it in-process.
+- `PRIMERCAST_IDLE_TIMEOUT_MINUTES`: close a browser session after this many idle minutes (default 30
+  on Cloud Run, off locally; 0 disables).
+- `PRIMERCAST_RUN_TIME_LIMIT`: seconds before a GUI design/evaluate run is stopped (default 3600).
 - `PRIMERCAST_MONITOR_TZ`: time zone for scheduled run dates (default `America/New_York`).
 - `PRIMERCAST_MONITOR_MAX_SCHEDULES`: cap on active scheduled monitors (default 100).
 - `PRIMERCAST_EMAIL_SENDER` / `PRIMERCAST_EMAIL_PASSWORD`: From address + SMTP password/key for

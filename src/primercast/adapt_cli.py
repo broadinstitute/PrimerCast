@@ -17,6 +17,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from primercast.external.gget_virus import GGET_VIRUS
+from primercast.utils.cpu import available_cores
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings
 from primercast.utils.params import parse_params, parse_list_param
 
@@ -1704,7 +1705,7 @@ Examples:
     p_design.add_argument("--probe", action="store_true", help="Enable probe design")
     p_design.add_argument("--multiplex", action="store_true", help="Enable multiplex mode")
     p_design.add_argument("--runid", help="Run ID for output directory (default: timestamp)")
-    p_design.add_argument("--cores", type=int, default=os.cpu_count() or 1, help="Number of cores (default: all)")
+    p_design.add_argument("--cores", type=int, default=available_cores(), help="Number of cores (default: all)")
     p_design.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
     p_design.set_defaults(func=cmd_design)
 
@@ -1716,7 +1717,7 @@ Examples:
     )
     p_eval.add_argument("--params", default="params.txt", help="Parameters file (default: params.txt)")
     p_eval.add_argument("--runid", help="Run ID for output directory (default: timestamp)")
-    p_eval.add_argument("--cores", type=int, default=os.cpu_count() or 1, help="Number of cores (default: all)")
+    p_eval.add_argument("--cores", type=int, default=available_cores(), help="Number of cores (default: all)")
     p_eval.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
 
     # Primer input: either --pset or --for/--rev/--pro
@@ -1770,7 +1771,7 @@ Examples:
                                            "(overrides EMAIL_RECIPIENTS in params.txt)")
     p_monitor.add_argument("--manage-url", dest="manage_url",
                            help="Link appended to the report email for managing the schedule")
-    p_monitor.add_argument("--cores", type=int, default=os.cpu_count() or 1,
+    p_monitor.add_argument("--cores", type=int, default=available_cores(),
                            help="Number of cores (default: all)")
     p_monitor.add_argument("--skip-fetch", action="store_true",
                            help="Skip fetch step and use existing files in date directory")
@@ -1792,7 +1793,7 @@ Examples:
     p_dispatch.add_argument("--store-dir", default="monitor_schedules",
                             help="Local schedule store when PRIMERCAST_MONITOR_BUCKET is "
                                  "unset (default: monitor_schedules/)")
-    p_dispatch.add_argument("--cores", type=int, default=os.cpu_count() or 1,
+    p_dispatch.add_argument("--cores", type=int, default=available_cores(),
                             help="Number of cores (default: all)")
     p_dispatch.add_argument("--purge-after-days", type=int, default=90,
                             help="Delete data of schedules stopped this many days ago "

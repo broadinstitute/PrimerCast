@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import date, datetime, timezone
@@ -158,6 +159,18 @@ from primercast.adapt_cli import (
     MANUAL_SHEET_HEADERS,
 )
 from primercast import monitor_schedule
+from primercast.utils.cpu import available_cores
+
+# Every run uses all of this instance's cores; concurrent runs share them.
+CORES = available_cores()
+# Browser sessions with no activity for this long are closed so an open but
+# forgotten tab doesn't keep a Cloud Run instance up. On by default only on
+# Cloud Run (K_SERVICE is set there); 0 disables it.
+IDLE_TIMEOUT_MINUTES = int(os.environ.get(
+    "PRIMERCAST_IDLE_TIMEOUT_MINUTES", "30" if os.environ.get("K_SERVICE") else "0"))
+# Design/evaluate runs are stopped after this long so a stuck run can't hold the
+# instance (a run keeps going on the server even after its browser tab closes).
+RUN_TIME_LIMIT = int(os.environ.get("PRIMERCAST_RUN_TIME_LIMIT", "3600"))
 
 MONITOR_DIR = DATA_DIR / "monitor"
 # Scheduled monitors (see primercast/monitor_schedule.py). On Cloud Run they live in
@@ -447,10 +460,47 @@ def _fasta_info(stem: str) -> dict:
                 path = alt
                 break
     if not path.exists():
-        return {"seqs": 0, "size": 0}
+        return {"seqs": 0, "size": 0, "max_len": 0}
+    stat = path.stat()
+    n_seqs, max_len = _fasta_stats(str(path), stat.st_mtime, stat.st_size)
+    return {"seqs": n_seqs, "size": stat.st_size, "max_len": max_len}
+
+
+@st.cache_data(max_entries=512, show_spinner=False)
+def _fasta_stats(path: str, mtime: float, size: int) -> tuple[int, int]:
+    """Sequence count and longest sequence length (cached per file version)."""
+    n_seqs = max_len = cur = 0
     with open(path) as f:
-        n_seqs = sum(1 for line in f if line.startswith(">"))
-    return {"seqs": n_seqs, "size": path.stat().st_size}
+        for line in f:
+            if line.startswith(">"):
+                n_seqs += 1
+                max_len = max(max_len, cur)
+                cur = 0
+            else:
+                cur += len(line.strip())
+    return n_seqs, max(max_len, cur)
+
+
+# Targets beyond these sizes can make design runs very slow.
+LARGE_TARGET_SEQS = 1000
+LARGE_TARGET_LEN = 5000
+
+
+def _large_target_warning(stem: str) -> str:
+    """Runtime warning for a large target FASTA, or "" if it is small enough."""
+    info = _fasta_info(stem)
+    reasons = []
+    if info["seqs"] > LARGE_TARGET_SEQS:
+        reasons.append(f"{info['seqs']:,} sequences (more than {LARGE_TARGET_SEQS:,})")
+    if info["max_len"] > LARGE_TARGET_LEN:
+        reasons.append(f"a sequence of {info['max_len']:,} bp (longer than "
+                       f"{LARGE_TARGET_LEN // 1000} kb)")
+    if not reasons:
+        return ""
+    return (f"**{stem}** has {' and '.join(reasons)}, so runs may take a very long time. "
+            f"Runs on this server stop after {RUN_TIME_LIMIT // 60} minutes; consider "
+            "narrowing the sequences (e.g. by date or location, or a target region) or "
+            "running the pipeline locally.")
 
 
 def _format_size(nbytes: int) -> str:
@@ -1701,7 +1751,7 @@ def _build_command() -> list[str]:
     mode = st.session_state.get("mode", "Singleplex")
     probe = st.session_state.get("probe_enabled",
                                   st.session_state.get("_probe_enabled_saved", False))
-    cores = st.session_state.get("cores", 1)
+    cores = CORES
     dry_run = st.session_state.get("dry_run", False)
 
     snakemake_bin = _find_tool("snakemake") or "snakemake"
@@ -1909,7 +1959,7 @@ def _save_run_config(status: str | None = None):
         "host": st.session_state.get("host", []),
         "probe_enabled": st.session_state.get("probe_enabled",
                                               st.session_state.get("_probe_enabled_saved", False)),
-        "cores": st.session_state.get("cores", 1),
+        "cores": CORES,
     }
     if status:
         config["status"] = status
@@ -1971,10 +2021,7 @@ def _tab_run():
                   help="Identifier for this run. Results will be saved under this name.")
 
     # Controls
-    c1, c2 = st.columns(2)
-    max_cpu = os.cpu_count() or 1
-    c1.slider("CPU cores", min_value=1, max_value=max_cpu, value=min(4, max_cpu), key="cores")
-    c2.checkbox("Dry run (plan only, no execution)", key="dry_run")
+    st.checkbox("Dry run (plan only, no execution)", key="dry_run")
 
     # Preflight
     errors = _preflight_checks()
@@ -2137,6 +2184,8 @@ def _tab_run():
         _update_progress()
         _live_timer(status_area, start_time)
 
+        # Own process group, so Stop and the time limit end snakemake's children
+        # without signalling the web server.
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -2144,8 +2193,22 @@ def _tab_run():
             cwd=str(scratch_dir),
             env=env,
             text=True,
+            start_new_session=True,
         )
         st.session_state.pipeline_pid = proc.pid
+
+        timed_out = threading.Event()
+
+        def _time_out():
+            timed_out.set()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        limit_timer = threading.Timer(RUN_TIME_LIMIT, _time_out)
+        limit_timer.daemon = True
+        limit_timer.start()
 
         while proc.poll() is None:
             line = proc.stdout.readline()
@@ -2185,6 +2248,8 @@ def _tab_run():
                 elif "Finished job" in stripped:
                     _finish_current()
                     _update_progress()
+
+        limit_timer.cancel()
 
         # Read remaining output
         remaining = proc.stdout.read()
@@ -2238,9 +2303,16 @@ def _tab_run():
         status_area.caption(f"Completed in {mins}m {secs}s")
 
         warnings = _pipeline_warnings()
-        _save_run_config(status=(f"failed (exit code {rc})" if rc != 0
+        limit_minutes = RUN_TIME_LIMIT // 60
+        _save_run_config(status=(f"stopped at the {limit_minutes}-minute time limit"
+                                 if timed_out.is_set()
+                                 else f"failed (exit code {rc})" if rc != 0
                                  else "succeeded with warnings" if warnings
                                  else "succeeded"))
+        if timed_out.is_set():
+            st.error(f"**Run stopped after {limit_minutes} minutes**, the time limit for "
+                     "runs on this server. Try fewer or smaller targets, or run the "
+                     "pipeline locally.")
         _render_pipeline_outcome(rc, warnings)
         if rc != 0:
             with st.expander("Show error log"):
@@ -3365,6 +3437,8 @@ def _page_select_target():
             # Extract stem name (everything before the first double-space)
             selected_stem = selected_label.split("  (")[0]
             st.session_state.targets = [selected_stem]
+            if warning := _large_target_warning(selected_stem):
+                st.warning(warning)
         else:
             st.session_state.targets = []
     else:
@@ -4624,7 +4698,7 @@ def _run_monitor():
         f.write(f"EMAIL_RECIPIENTS = {recipients_str}\n")
     # Note: EMAIL_PASSWORD is read from params.txt / env at send time, never copied
 
-    cores = st.session_state.get("cores", 1)
+    cores = CORES
     progress_area = st.empty()
     status_area = st.empty()
     start_time = time.time()
@@ -5018,10 +5092,6 @@ def _tab_run_monitor():
         key="monitor_run_id",
         help="A short identifier for this run. Used to organize output directories.",
     )
-
-    c1, _ = st.columns(2)
-    max_cpu = os.cpu_count() or 1
-    c1.slider("CPU cores", min_value=1, max_value=max_cpu, value=min(4, max_cpu), key="cores")
 
     # Preflight
     errors = _monitor_preflight_checks()
@@ -5521,6 +5591,65 @@ setTimeout(function() {
 """
 
 
+# Runs in the app page itself (injected once from a component iframe). Streamlit's
+# "Running..." icon counts as activity, so long runs and fetches never time out.
+# Leaving the page is what closes the websocket; Streamlit would just reconnect
+# a socket closed in place. The goodbye page is a blob URL because Streamlit
+# serves static .html files as text/plain.
+_IDLE_JS = """
+(function () {
+  if (window.__pcIdle) return;
+  window.__pcIdle = true;
+  const LIMIT = __LIMIT__ * 1000, WARN = Math.min(120000, LIMIT / 2);
+  let last = Date.now(), banner = null;
+  function hideWarning() { if (banner) { banner.remove(); banner = null; } }
+  function bump() { last = Date.now(); hideWarning(); }
+  ["mousemove", "mousedown", "keydown", "scroll", "wheel", "touchstart"].forEach(
+    (e) => document.addEventListener(e, bump, { capture: true, passive: true }));
+  function showWarning(secs) {
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:1000000;" +
+        "background:#fff3cd;color:#664d03;padding:10px 16px;text-align:center;" +
+        "font-family:sans-serif;border-bottom:1px solid #ffe69c";
+      document.body.appendChild(banner);
+    }
+    banner.textContent = "No activity for a while: this session will close in " + secs +
+      " s to free server resources. Move the mouse or press a key to stay.";
+  }
+  function closeSession() {
+    const back = location.href.replace(/"/g, "%22").replace(/</g, "%3C");
+    const html = '<!doctype html><meta charset="utf-8"><title>PrimerCast: session closed</title>' +
+      '<body style="font-family:sans-serif;max-width:560px;margin:15vh auto;padding:0 16px">' +
+      "<h2>Session closed</h2><p>This PrimerCast session was closed after " + __LIMIT_MIN__ +
+      " minutes of inactivity to free server resources. Settings and results shown on " +
+      "the page were not kept.</p>" +
+      '<p><a href="' + back + '" style="font-size:1.1em">Reconnect</a></p></body>';
+    location.replace(URL.createObjectURL(new Blob([html], { type: "text/html" })));
+  }
+  setInterval(function () {
+    if (document.querySelector('[data-testid="stStatusWidgetRunningIcon"]')) { bump(); return; }
+    const idle = Date.now() - last;
+    if (idle >= LIMIT) closeSession();
+    else if (idle >= LIMIT - WARN) showWarning(Math.ceil((LIMIT - idle) / 1000));
+  }, 1000);
+})();
+"""
+
+
+def _idle_timeout():
+    """Close this browser session after IDLE_TIMEOUT_MINUTES without activity."""
+    if IDLE_TIMEOUT_MINUTES <= 0:
+        return
+    js = (_IDLE_JS.replace("__LIMIT_MIN__", str(IDLE_TIMEOUT_MINUTES))
+          .replace("__LIMIT__", str(IDLE_TIMEOUT_MINUTES * 60)))
+    st.components.v1.html(
+        "<script>const p = window.parent; if (!p.__pcIdle) {"
+        " const s = p.document.createElement('script');"
+        f" s.textContent = {json.dumps(js)}; p.document.head.appendChild(s); }}</script>",
+        height=0)
+
+
 def _scroll_to_top():
     """Inject JS to scroll to the top of the page if navigation just happened."""
     if st.session_state.pop("_need_scroll_top", False):
@@ -5529,6 +5658,7 @@ def _scroll_to_top():
 
 def main():
     _render_sidebar()
+    _idle_timeout()
 
     monitor_ref = st.query_params.get("monitor")
     if monitor_ref:

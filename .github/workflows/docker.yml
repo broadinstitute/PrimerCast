@@ -361,8 +361,8 @@ jobs:
             --tag="${{ steps.rev.outputs.tag }}" \
             --port=8080 \
             --allow-unauthenticated \
-            --memory=8Gi \
-            --cpu=4 \
+            --memory=16Gi \
+            --cpu=8 \
             --concurrency=8 \
             --min-instances=0 \
             --max-instances=5 \

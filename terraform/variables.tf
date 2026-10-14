@@ -43,13 +43,13 @@ variable "cloud_run_max_instances" {
 variable "cloud_run_cpu" {
   description = "CPU per Cloud Run instance. Heavier than carmen because the primer-design pipeline runs bowtie2 + MAFFT + torch in-process."
   type        = string
-  default     = "4"
+  default     = "8"
 }
 
 variable "cloud_run_memory" {
-  description = "Memory per Cloud Run instance, shared by its concurrent sessions. Scratch files live in memory on Cloud Run. Matches the monitor job."
+  description = "Memory per Cloud Run instance, shared by its concurrent sessions. Scratch files live in memory on Cloud Run. Every run uses all cores, so memory grows with CPU."
   type        = string
-  default     = "8Gi"
+  default     = "16Gi"
 }
 
 variable "cloud_run_timeout_seconds" {
