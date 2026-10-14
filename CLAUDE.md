@@ -10,8 +10,8 @@ This is a Python package for ML-guided qPCR primer design. Key directories:
   - `models/` - PyTorch ML model architectures
   - `external/` - Wrappers for external tools (ViennaRNA, bowtie2, MAFFT)
   - `utils/` - Shared utilities (sequence ops, encoding, params)
-  - `data/` - Pre-trained ML models (bundled as package data)
-- `workflows/` - Snakemake workflow templates
+  - `data/` - Pre-trained ML models and `Snakefile.template` (bundled as package data)
+- `workflows/` - Example Snakefile and `params.txt.template`
 - `training/` - Historical model training code (not production)
 - `tests/` - pytest test suite
 

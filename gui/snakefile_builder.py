@@ -2,10 +2,8 @@
 
 import re
 from datetime import datetime
-from pathlib import Path
 
-
-TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "workflows" / "Snakefile.template"
+from primercast.adapt_cli import TEMPLATE_PATH
 
 
 def build_snakefile(

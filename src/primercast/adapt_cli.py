@@ -13,15 +13,15 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 from email.message import EmailMessage
+from importlib.resources import files
 from pathlib import Path
 
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings
 from primercast.utils.params import parse_params, parse_list_param
 
 
-# Resolve template path relative to package location
-# Package is at src/primercast/, template is at workflows/
-TEMPLATE_PATH = Path(__file__).resolve().parent.parent.parent / "workflows" / "Snakefile.template"
+# Bundled as package data so it is found however the package is installed.
+TEMPLATE_PATH = files("primercast.data").joinpath("Snakefile.template")
 
 
 def _setup_run_dir(run_id: str, params_file: Path, targets: list[str]) -> Path:
