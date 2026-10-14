@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from primercast.external.gget_virus import GGET_VIRUS
 from primercast.adapt_cli import (
     _is_empty,
     _parse_boolean,
@@ -228,7 +229,7 @@ class TestBuildGgetCommand:
     def test_basic_command(self):
         row = {"TaxID": "2697049"}
         cmd = _build_gget_command(row, "/tmp/out")
-        assert cmd[:3] == ["gget", "virus", "2697049"]
+        assert cmd[len(GGET_VIRUS)] == "2697049"
         assert "--out" in cmd
         assert "/tmp/out" in cmd
 
@@ -626,7 +627,7 @@ class TestManualSheet:
         assert len(rows) == 1
         assert _make_target_name(rows[0]) == "SC2"
         cmd = _build_gget_command(rows[0], "out")
-        assert cmd[:3] == ["gget", "virus", "2697049"]
+        assert cmd[len(GGET_VIRUS)] == "2697049"
         assert "--host" in cmd and "--refseq_only" in cmd
         assert "--Target name" not in cmd and "--Forward" not in cmd
 

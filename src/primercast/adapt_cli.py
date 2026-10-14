@@ -16,6 +16,7 @@ from email.message import EmailMessage
 from importlib.resources import files
 from pathlib import Path
 
+from primercast.external.gget_virus import GGET_VIRUS
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings
 from primercast.utils.params import parse_params, parse_list_param
 
@@ -398,12 +399,12 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
 
 
 def _build_gget_command(row: dict, output_dir: str) -> list[str] | None:
-    """Build a gget virus command from a spreadsheet row."""
+    """Build a gget virus command (via our wrapper) from a spreadsheet row."""
     taxid = row.get("TaxID")
     if _is_empty(taxid):
         return None
 
-    cmd = ["gget", "virus", str(taxid).strip(), "--out", output_dir]
+    cmd = [*GGET_VIRUS, str(taxid).strip(), "--out", output_dir]
 
     for col, value in row.items():
         if col in _METADATA_COLUMNS or col == "TaxID":

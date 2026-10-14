@@ -38,8 +38,30 @@ def _safe_path_under(base_dir: Path, filename: str) -> Path | None:
     return Path(candidate)
 
 
+def _live_timer(area, start_time: float) -> None:
+    """Show an elapsed-time counter in ``area`` that ticks in the browser.
+
+    Progress views only redraw when a run prints output, so a server-drawn
+    counter freezes during quiet steps. Replace ``area`` to stop it.
+    """
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    with area:
+        st.components.v1.html(f"""
+<div id="t" style="font-family:'Source Sans Pro',sans-serif;font-size:14px;color:#808495"></div>
+<script>
+  const start = Date.now() - {elapsed_ms};
+  const el = document.getElementById("t");
+  function tick() {{
+    const s = Math.floor((Date.now() - start) / 1000);
+    el.textContent = "Elapsed: " + Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }}
+  tick();
+  setInterval(tick, 1000);
+</script>""", height=24)
+
+
 def _build_fetch_command(
-    gget_bin: str, taxid: str, out_dir: str, params: dict,
+    taxid: str, out_dir: str, params: dict,
 ) -> list[str] | None:
     """Build and validate a gget virus command. Returns None if taxid is invalid."""
     safe_taxid = str(taxid).strip()
@@ -53,7 +75,7 @@ def _build_fetch_command(
     _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
     _SAFE_STR = re.compile(r"[\w\s.,\-]+")
 
-    cmd = [gget_bin, "virus", safe_taxid, "--out", real_out]
+    cmd = [*GGET_VIRUS, safe_taxid, "--out", real_out]
 
     nuc = params.get("nuc_completeness", "complete")
     if nuc and nuc in _ALLOWED_NUC:
@@ -110,6 +132,7 @@ from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
 from gui import error_report
 from primercast.utils.params import parse_params
+from primercast.external.gget_virus import GGET_VIRUS
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings, step_baselines
 from primercast.adapt_cli import (
     _extract_spreadsheet_id,
@@ -2106,12 +2129,10 @@ def _tab_run():
             for rule_name, label in rules:
                 is_current = rule_name == current_rule
                 lines.append(_render_rule_line(rule_name, label, is_current))
-            elapsed = int(time.time() - start_time)
-            mins, secs = divmod(elapsed, 60)
             progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
-            status_area.caption(f"Elapsed: {mins}m {secs}s")
 
         _update_progress()
+        _live_timer(status_area, start_time)
 
         proc = subprocess.Popen(
             cmd,
@@ -3651,10 +3672,12 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                 detail = ""
                 start_time = time.time()
                 timeout = 1800
+                _live_timer(status_area, start_time)
 
                 while proc.poll() is None:
                     if time.time() - start_time > timeout:
                         proc.kill()
+                        status_area.empty()
                         st.error("Fetch timed out after 30 minutes.")
                         return False
                     line = proc.stdout.readline()
@@ -3673,10 +3696,9 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         elif "PROCESS COMPLETED" in line:
                             current_step = len(_FETCH_STEPS)
                         _render_progress(current_step, detail, loc_label=loc_label)
-                    elapsed = int(time.time() - start_time)
-                    mins, secs = divmod(elapsed, 60)
-                    status_area.caption(f"Elapsed: {mins}m {secs}s")
 
+                mins, secs = divmod(int(time.time() - start_time), 60)
+                status_area.caption(f"Fetched in {mins}m {secs}s")
                 remaining = proc.stdout.read()
                 if remaining and "PROCESS COMPLETED" in remaining:
                     _render_progress(len(_FETCH_STEPS), loc_label=loc_label)
@@ -3699,7 +3721,7 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         validated_out_dir = os.path.realpath(str(gget_tmp))
 
                     loc_params = dict(fetch_params, geo_location=geo_loc)
-                    cmd = _build_fetch_command(gget_bin, taxid, validated_out_dir, loc_params)
+                    cmd = _build_fetch_command(taxid, validated_out_dir, loc_params)
                     if not cmd:
                         st.error("TaxID must be numeric.")
                         return
@@ -4599,14 +4621,10 @@ def _run_monitor():
     status_area = st.empty()
     start_time = time.time()
 
-    def _elapsed():
-        s = int(time.time() - start_time)
-        m, s = divmod(s, 60)
-        return f"{m}m {s}s"
-
     def _update(lines):
         progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
-        status_area.caption(f"Elapsed: {_elapsed()}")
+
+    _live_timer(status_area, start_time)
 
     progress_lines = []
     fetch_results: dict[str, dict] = {}
