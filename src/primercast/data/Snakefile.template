@@ -439,7 +439,7 @@ if PROBE_MODE:
             probe_csv=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe.csv",
             probe_pair_csv=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe_pair_assignments.csv"
         threads:
-            min(4, MAX_CORES)
+            MAX_CORES
         shell:
             "primercast quick-design "
             "--target '{input.target}' --msa '{input.msa}' "
@@ -463,7 +463,7 @@ else:
             fasta=f"{RUN_DIR}/{{virus}}_init.fa",
             features=f"{RUN_DIR}/{{virus}}_init.feat"
         threads:
-            min(4, MAX_CORES)
+            MAX_CORES
         shell:
             "primercast quick-design "
             "--target '{input.target}' --msa '{input.msa}' "
@@ -634,7 +634,7 @@ rule align:
         mapOption="--mp 2,2 --np 2 --rdg 4,4 --rfg 4,4 -L 6 -N 1 --score-min L,-0.6,-0.6"
     shell:
         "bowtie2 -x '{params.reference}' -U '{input.fasta}' -f "
-        "-p {threads} -k 50000 {params.mapOption} "
+        "-p {threads} --reorder -k 50000 {params.mapOption} "
         "--no-hd --no-unal -S '{output}'"
 
 
@@ -660,7 +660,7 @@ rule align_probes:
         mapOption="--mp 3,3 --np 2 --rdg 6,4 --rfg 6,4 -L 6 -N 1 --score-min L,-0.6,-0.6"
     shell:
         "bowtie2 -x '{params.reference}' -U '{input.fasta}' -f "
-        "-p {threads} -k 50000 {params.mapOption} "
+        "-p {threads} --reorder -k 50000 {params.mapOption} "
         "--no-hd --no-unal -S '{output}'"
 
 
@@ -800,7 +800,7 @@ rule evaluate:
     output:
         f"{RUN_DIR}/_{{target}}/{{virus}}.{{target}}.eval"
     threads:
-        min(2, MAX_CORES)
+        MAX_CORES
     resources:
         gpu=1
     params:
@@ -856,7 +856,7 @@ rule rescue_evaluate:
             if EVALUATE and EVAL_HAS_PROBE else ""
         )
     threads:
-        min(4, MAX_CORES)
+        MAX_CORES
     shell:
         "primercast rescue-evaluate "
         "--eval '{input.eval}' --report-dir '{params.report_dir}' "
@@ -875,18 +875,27 @@ if PROBE_MODE:
             init=f"{RUN_DIR}/{{virus}}_init.fa",
             probe_mapping=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe.csv",
             probe_seqs=f"{RUN_DIR}/{{virus}}_probe.fa",
-            probe_pair_csv=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe_pair_assignments.csv"
+            # Only quick design writes pair assignments; standard mode uses .eval.full.
+            probe_pair_csv=lambda wc: (
+                f"{RUN_DIR}/_{wc.virus}/{wc.virus}.{wc.virus}.probe_pair_assignments.csv"
+                if wc.virus in QUICK_SET else []
+            )
         output:
             fasta=f"{RUN_DIR}/{{virus}}_filt.fa",
             csv=f"{RUN_DIR}/{{virus}}_filt.csv",
             probe_csv=f"{RUN_DIR}/{{virus}}_filt_probes.csv",
             probe_fasta=f"{RUN_DIR}/{{virus}}_filt_probes.fa"
+        params:
+            pair_arg=lambda wc, input: (
+                f"--probe-pair-csv {shlex.quote(str(input.probe_pair_csv))}"
+                if input.probe_pair_csv else ""
+            )
         shell:
             "primercast filter --init '{input.init}' --scores '{input.res}' "
             "--out '{output.fasta}' --params '{PARAMS}' "
             "--probe-mapping '{input.probe_mapping}' "
             "--probe-seqs '{input.probe_seqs}' "
-            "--probe-pair-csv '{input.probe_pair_csv}' "
+            "{params.pair_arg} "
             "--probe-out '{output.probe_csv}' && "
             "touch '{output.probe_fasta}'"
 else:

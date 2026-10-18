@@ -911,7 +911,7 @@ def _align_batch(fasta_path, index_prefix, n_targets, threads, tmpdir, batch_idx
         "-x", str(index_prefix),
         "-U", str(fasta_path),
         "-f",
-        "-p", str(threads),
+        "-p", str(threads), "--reorder",
         "-k", str(k),
         "--mp", "2,2", "--np", "2",
         "--rdg", "4,4", "--rfg", "4,4",

@@ -173,7 +173,8 @@ snakemake -s Snakefile.example --dry-run
   monitor reports when not in `params.txt` (key from Secret Manager on Cloud Run).
 - `PRIMERCAST_SMTP_HOST` / `PRIMERCAST_SMTP_PORT` / `PRIMERCAST_SMTP_USER`: SMTP server, port
   (465 = TLS, else STARTTLS) and login (empty = sender). Defaults to Gmail; Cloud Run uses
-  the Brevo relay (`smtp-relay.brevo.com:587`, set by terraform/CI).
+  the SendGrid relay (`smtp.sendgrid.net:587`, login `apikey`, set by terraform/CI; key in the
+  `primercast-monitor-sendgrid-key` secret). SendGrid emails turn off click tracking.
 - `PRIMERCAST_PUBLIC_URL`: base URL for manage links in emails (falls back to the request host).
 - `PRIMERCAST_FONT_PATH`: Custom font directory for training plots (optional)
 - `PRIMERCAST_TOOLPATH`: Custom tool installation path for training scripts (optional)

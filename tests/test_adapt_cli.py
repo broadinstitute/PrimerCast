@@ -733,6 +733,30 @@ class TestSmtp:
             ("send", "alerts@lab.org", "a@x.org, b@x.org"),
         ]
 
+    def test_sendgrid_disables_link_tracking(self):
+        import json
+        from primercast import adapt_cli
+        sent = []
+        FakeSMTP = self._fake_smtp([])
+        FakeSMTP.send_message = lambda self, msg: sent.append(msg)
+        with patch.object(adapt_cli.smtplib, "SMTP", FakeSMTP):
+            assert adapt_cli._send_email(
+                "a@x.org", "SG.key", ["b@x.org"], "s", "b",
+                smtp=("smtp.sendgrid.net", 587, "apikey"))
+        filters = json.loads(sent[0]["X-SMTPAPI"])["filters"]
+        assert filters["clicktrack"]["settings"]["enable"] == 0
+        assert filters["opentrack"]["settings"]["enable"] == 0
+
+    def test_other_hosts_have_no_sendgrid_header(self):
+        from primercast import adapt_cli
+        sent = []
+        FakeSMTP = self._fake_smtp([])
+        FakeSMTP.send_message = lambda self, msg: sent.append(msg)
+        with patch.object(adapt_cli.smtplib, "SMTP", FakeSMTP):
+            adapt_cli._send_email("a@x.org", "k", ["b@x.org"], "s", "b",
+                                  smtp=("smtp-relay.brevo.com", 587, "u"))
+        assert "X-SMTPAPI" not in sent[0]
+
     def test_port_465_uses_ssl_and_sender_login(self):
         from primercast import adapt_cli
         calls = []

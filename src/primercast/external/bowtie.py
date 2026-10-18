@@ -106,7 +106,7 @@ def align_primers(
         "-x", str(index_prefix),
         "-U", str(query_fasta),
         "-S", str(output_sam),
-        "-p", str(threads),
+        "-p", str(threads), "--reorder",
         "--no-hd",  # No header
         "-a",  # Report all alignments
     ]

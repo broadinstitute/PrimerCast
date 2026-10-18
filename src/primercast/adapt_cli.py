@@ -3,6 +3,7 @@
 import argparse
 import csv
 import io
+import json
 import os
 import re
 import shutil
@@ -1238,7 +1239,8 @@ def _smtp_config(params: dict) -> tuple[str, int, str]:
     params.txt ``SMTP_HOST`` / ``SMTP_PORT`` / ``SMTP_USER`` win; otherwise
     ``PRIMERCAST_SMTP_HOST`` / ``PRIMERCAST_SMTP_PORT`` / ``PRIMERCAST_SMTP_USER``.
     Defaults to Gmail. An empty login means "log in as the sender" (Gmail);
-    relays such as Brevo (smtp-relay.brevo.com:587) have their own SMTP login.
+    relays have their own SMTP login (SendGrid, smtp.sendgrid.net:587: ``apikey``,
+    with the API key as the password).
     """
     def get(key: str) -> str:
         return str(params.get(key, "")).strip() \
@@ -1268,6 +1270,13 @@ def _send_email(
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
+    if host.lower().endswith("sendgrid.net"):
+        # SendGrid rewrites links for click tracking, which would route the
+        # private manage links through its redirect server.
+        msg["X-SMTPAPI"] = json.dumps({"filters": {
+            "clicktrack": {"settings": {"enable": 0}},
+            "opentrack": {"settings": {"enable": 0}},
+        }})
     msg.set_content(body)
 
     if attachments:

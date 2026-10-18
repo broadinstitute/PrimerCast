@@ -94,7 +94,7 @@ def _run_rescue_pipeline(primer_fa, subset_ref, features, params_file,
     subprocess.run([
         "bowtie2", "-x", index_prefix,
         "-U", str(primer_fa), "-f",
-        "-p", str(threads),
+        "-p", str(threads), "--reorder",
         "-k", str(k_value),
         "--mp", "2,2", "--np", "2",
         "--rdg", "4,4", "--rfg", "4,4",

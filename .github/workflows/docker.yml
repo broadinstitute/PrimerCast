@@ -25,13 +25,14 @@ env:
   # vars from terraform; staging's are set by the staging-deploy flags below.
   REPORT_BUCKET: sabeti-adapt-primercast-error-reports
   # Scheduled-monitor bucket + jobs (terraform/monitor.tf). Emails go through the
-  # Brevo SMTP relay; the From address, SMTP login and whether the SMTP-key secret
-  # is wired into staging come from repo variables MONITOR_EMAIL_SENDER /
-  # MONITOR_SMTP_USER / MONITOR_EMAIL_ENABLED ('true' once the secret has a version).
+  # SendGrid SMTP relay; the From address and whether the API-key secret is wired
+  # into staging come from repo variables MONITOR_EMAIL_SENDER /
+  # MONITOR_EMAIL_ENABLED ('true' once the secret has a version).
   MONITOR_BUCKET: sabeti-adapt-primercast-monitor
-  MONITOR_EMAIL_SECRET: primercast-monitor-smtp-key
-  MONITOR_SMTP_HOST: smtp-relay.brevo.com
+  MONITOR_EMAIL_SECRET: primercast-monitor-sendgrid-key
+  MONITOR_SMTP_HOST: smtp.sendgrid.net
   MONITOR_SMTP_PORT: "587"
+  MONITOR_SMTP_USER: apikey
 
 # Two images are produced from one Dockerfile (see the TORCH_VARIANT build arg):
 #   GHCR  -> multi-arch (amd64+arm64), GPU-enabled. Used by training + the
@@ -370,7 +371,7 @@ jobs:
             --cpu-boost \
             --session-affinity \
             --timeout=3600 \
-            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }},PRIMERCAST_MONITOR_BUCKET=${{ env.MONITOR_BUCKET }},PRIMERCAST_MONITOR_PREFIX=staging,PRIMERCAST_MONITOR_JOB=projects/${{ env.GAR_PROJECT }}/locations/${{ env.GAR_REGION }}/jobs/primercast-monitor-staging,PRIMERCAST_EMAIL_SENDER=${{ vars.MONITOR_EMAIL_SENDER }},PRIMERCAST_SMTP_HOST=${{ env.MONITOR_SMTP_HOST }},PRIMERCAST_SMTP_PORT=${{ env.MONITOR_SMTP_PORT }},PRIMERCAST_SMTP_USER=${{ vars.MONITOR_SMTP_USER }}" \
+            --update-env-vars="PRIMERCAST_REPORT_BUCKET=${{ env.REPORT_BUCKET }},PRIMERCAST_REPORT_PREFIX=staging/${{ steps.rev.outputs.tag }},PRIMERCAST_MONITOR_BUCKET=${{ env.MONITOR_BUCKET }},PRIMERCAST_MONITOR_PREFIX=staging,PRIMERCAST_MONITOR_JOB=projects/${{ env.GAR_PROJECT }}/locations/${{ env.GAR_REGION }}/jobs/primercast-monitor-staging,PRIMERCAST_EMAIL_SENDER=${{ vars.MONITOR_EMAIL_SENDER }},PRIMERCAST_SMTP_HOST=${{ env.MONITOR_SMTP_HOST }},PRIMERCAST_SMTP_PORT=${{ env.MONITOR_SMTP_PORT }},PRIMERCAST_SMTP_USER=${{ env.MONITOR_SMTP_USER }}" \
             --quiet \
             "${EXTRA_FLAGS[@]}"
 
@@ -378,12 +379,20 @@ jobs:
         run: |
           # Last branch pushed wins; run it by hand with
           #   gcloud run jobs execute primercast-monitor-staging --region us-central1
+          # Email settings are set here too, so staging can try a new relay
+          # before terraform moves prod (and the jobs) to it.
           JOB=primercast-monitor-staging
+          EXTRA_FLAGS=()
+          if [ "${{ vars.MONITOR_EMAIL_ENABLED }}" = "true" ]; then
+            EXTRA_FLAGS+=("--update-secrets=PRIMERCAST_EMAIL_PASSWORD=${{ env.MONITOR_EMAIL_SECRET }}:latest")
+          fi
           if gcloud run jobs describe "${JOB}" --region="${{ env.GAR_REGION }}" \
               --project="${{ env.GAR_PROJECT }}" --format='value(name)' >/dev/null 2>&1; then
             gcloud run jobs update "${JOB}" \
               --image="${{ env.GAR_REGISTRY }}:${{ steps.img.outputs.sha_short }}" \
-              --region="${{ env.GAR_REGION }}" --project="${{ env.GAR_PROJECT }}" --quiet
+              --update-env-vars="PRIMERCAST_SMTP_HOST=${{ env.MONITOR_SMTP_HOST }},PRIMERCAST_SMTP_PORT=${{ env.MONITOR_SMTP_PORT }},PRIMERCAST_SMTP_USER=${{ env.MONITOR_SMTP_USER }}" \
+              --region="${{ env.GAR_REGION }}" --project="${{ env.GAR_PROJECT }}" --quiet \
+              "${EXTRA_FLAGS[@]}"
           else
             echo "::warning::Cloud Run job ${JOB} not found (terraform/monitor.tf not applied?); skipped."
           fi
