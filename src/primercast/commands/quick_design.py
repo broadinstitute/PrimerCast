@@ -2486,8 +2486,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 else:
                     eval_full_pos = pd.DataFrame()
 
-                # Greedy probe assignment: walk pairs by score, assign best unclaimed probe
-                claimed_probes = set()
+                # Assign the best compatible probe independently for each pair.
                 pair_assigned_probe = {}  # pair_key -> probe dict
 
                 for _, row in combined.iterrows():
@@ -2498,13 +2497,12 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                     valid_probes = []
                     for pi in position_probes:
                         p = selected_probes[pi]
-                        if p['name'] in dimer_probes and p['name'] not in claimed_probes:
+                        if p['name'] in dimer_probes:
                             valid_probes.append(p)
                     if valid_probes:
                         # Pick probe with highest coverage
                         best = max(valid_probes, key=lambda p: p['coverage'])
                         pair_assigned_probe[pair_key] = best
-                        claimed_probes.add(best['name'])
 
                 # Compute per-pair coverage
                 cov_target_map = {}
@@ -2546,7 +2544,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 combined['probe_seq'] = combined.index.map(assigned_probe_seq_map)
 
                 n_assigned = sum(1 for v in assigned_probe_name_map.values() if v)
-                print(f"  Greedy probe assignment: {n_assigned}/{len(combined)} pairs got a probe")
+                print(f"  Probe assignment: {n_assigned}/{len(combined)} pairs got a probe")
                 for idx, row in combined.iterrows():
                     if assigned_probe_name_map.get(idx):
                         print(f"    {row['pname_f']},{row['pname_r']} → "

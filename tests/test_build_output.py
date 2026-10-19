@@ -167,3 +167,24 @@ class TestRunTopPairSelection:
         final = pd.read_csv(inputs / "virusA_final.csv")
         assert list(zip(final["pname_f"], final["pname_r"])) == [("p5_f", "p5_r"), ("p6_f", "p6_r")]
         assert list(final["valid_probes"]) == ["probe_a", "probe_b"]
+
+    def test_highest_coverage_probe_can_be_reused_across_pairs(self, inputs):
+        pd.DataFrame({
+            "pname_f": ["p5_f", "p6_f"], "pname_r": ["p5_r", "p6_r"],
+            "probe_names": ["shared_probe,probe_b", "probe_b,shared_probe"],
+        }).to_csv(inputs / "virusA_filt.csv", index=False)
+        shared_sequence = "ACGTTGCAACGTTGCAACGTTGCA"
+        (inputs / "probes.fa").write_text(
+            f">shared_probe\n{shared_sequence}\n>probe_b\nTGCAACGTTGCAACGTTGCAACGT\n")
+        pd.DataFrame({
+            "probe_name": ["shared_probe", "shared_probe", "probe_b"],
+            "target_id": ["s1", "s2", "s1"],
+        }).to_csv(inputs / "probe_on.csv", index=False)
+
+        run_build_output(self._args(inputs, probe_mapping_on=str(inputs / "probe_on.csv"),
+                                    probe_seqs=str(inputs / "probes.fa")))
+
+        final = pd.read_csv(inputs / "virusA_final.csv", keep_default_na=False)
+        assert list(zip(final["pname_f"], final["pname_r"])) == [("p5_f", "p5_r"), ("p6_f", "p6_r")]
+        assert final["valid_probes"].tolist() == ["shared_probe", "shared_probe"]
+        assert final["valid_probe_sequences"].tolist() == [shared_sequence, shared_sequence]

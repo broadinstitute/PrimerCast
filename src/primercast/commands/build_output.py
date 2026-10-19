@@ -377,7 +377,7 @@ def run(args):
                 for pair_key in final.index
             }
 
-        # Store all valid probes per pair (greedy assignment happens after sorting)
+        # Store all valid probes per pair (assignment happens after sorting)
         final['_all_valid_probes'] = final.index.map(
             lambda p: valid_probes_dict.get(p, [])
         )
@@ -399,9 +399,8 @@ def run(args):
         print(f"Sorted by sum of off-target scores")
 
 
-    # Greedy probe assignment: walk pairs in rank order, assign each the
-    # best unclaimed probe (by coverage). Keep ALL pairs — those without
-    # a probe get empty valid_probes.
+    # Assign each pair its highest-coverage compatible probe independently.
+    # Alternative primer pairs can reuse the same probe.
     if '_all_valid_probes' in final.columns:
         # Compute per-probe coverage (number of unique targets hit) for ranking
         probe_coverage = {}
@@ -410,26 +409,19 @@ def run(args):
             if not _probe_df.empty:
                 probe_coverage = _probe_df.groupby('probe_name')['target_id'].nunique().to_dict()
 
-        claimed_probes = set()
         assigned_probe = {}
         for pair_key in final.index:
             probes = final.at[pair_key, '_all_valid_probes']
             if not probes:
                 continue
-            # Sort by coverage descending so we pick the highest-coverage unclaimed probe
-            probes_sorted = sorted(probes, key=lambda p: -probe_coverage.get(p, 0))
-            for p in probes_sorted:
-                if p not in claimed_probes:
-                    assigned_probe[pair_key] = p
-                    claimed_probes.add(p)
-                    break
+            assigned_probe[pair_key] = max(probes, key=lambda p: probe_coverage.get(p, 0))
         n_with_probe = len(assigned_probe)
         final['valid_probes'] = final.index.map(lambda p: assigned_probe.get(p, ''))
         final['valid_probe_sequences'] = final['valid_probes'].map(
             lambda p: probe_seqs_dict.get(p, '') if p else ''
         )
         final = final.drop(columns=['_all_valid_probes'])
-        print(f"Greedy probe assignment: {n_with_probe}/{len(final)} pairs got a probe")
+        print(f"Probe assignment: {n_with_probe}/{len(final)} pairs got a probe")
 
     # Convert coverage columns from numbers to "N / total" strings
     # When probe mode is active, recompute coverage as targets with BOTH
