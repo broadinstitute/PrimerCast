@@ -1,4 +1,4 @@
-"""adapt - User-facing CLI for running the ADAPT PCR primer design pipeline."""
+"""adapt - User-facing CLI for running the PrimerCast PCR primer design pipeline."""
 
 import argparse
 import csv
@@ -1510,7 +1510,7 @@ def cmd_monitor(args):
 
     # Step 2: Build pset.fa and evaluate for each target with new sequences
     email_body_parts = []
-    email_body_parts.append(f"ADAPT Monitor Report — {date_str}\n{'='*50}\n")
+    email_body_parts.append(f"PrimerCast Monitor Report — {date_str}\n{'='*50}\n")
 
     all_xlsx: list[Path] = []
     n_warnings = 0
@@ -1604,7 +1604,7 @@ def cmd_monitor(args):
     email_body = "\n".join(email_body_parts)
 
     if email_sender and email_password and email_recipients:
-        subject = f"[ADAPT Monitor] {date_str} — {len(target_groups)} target(s)"
+        subject = f"[PrimerCast Monitor] {date_str} — {len(target_groups)} target(s)"
         _send_email(
             sender=email_sender,
             password=email_password,
@@ -1649,7 +1649,7 @@ def main():
     """Main entry point for the adapt CLI."""
     parser = argparse.ArgumentParser(
         prog="adapt",
-        description="ADAPT PCR primer design pipeline",
+        description="PrimerCast PCR primer design pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

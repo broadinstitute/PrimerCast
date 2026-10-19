@@ -4870,7 +4870,7 @@ def _run_monitor():
 
     all_xlsx: list[Path] = []
     monitor_warnings: list[str] = []
-    email_body_parts = [f"ADAPT Monitor Report — {date_str}\n{'=' * 50}\n"]
+    email_body_parts = [f"PrimerCast Monitor Report — {date_str}\n{'=' * 50}\n"]
 
     if targets_with_new:
         progress_lines.append("⏳ &nbsp; **Evaluating primers...**")
@@ -5021,7 +5021,7 @@ def _run_monitor():
         progress_lines.append("⏳ &nbsp; **Sending email report...**")
         _update(progress_lines)
 
-        subject = f"[ADAPT Monitor] {date_str} — {len(target_names)} target(s)"
+        subject = f"[PrimerCast Monitor] {date_str} — {len(target_names)} target(s)"
         ok = _send_email(
             sender=email_sender,
             password=_email_password,
