@@ -130,7 +130,8 @@ def generate_primers_multi(
                 if dG >= min_dg:
                     tm, gc = tm_gc_passed[pseq]
                     features[pseq]["Tm"] = round(tm, 1)
-                    features[pseq]["GC"] = round(gc, 2)
+                    # Keep model input precision consistent with prepare-features.
+                    features[pseq]["GC"] = gc
                     features[pseq]["len"] = len(pseq)
                     features[pseq]["dG"] = round(dG, 1)
                     features[pseq]["rep_count"] = counts.get(pseq, 1)
