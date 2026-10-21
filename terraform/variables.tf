@@ -59,9 +59,9 @@ variable "cloud_run_timeout_seconds" {
 }
 
 variable "cloud_run_concurrency" {
-  description = "Max concurrent requests per container. Must be >1: Streamlit's persistent websocket plus file-upload XHRs are separate Cloud Run requests, and routing the upload to a fresh sessionless instance returns 400. Kept modest so a single instance runs only a few heavy pipeline jobs; max_instances absorbs additional load. Session affinity pins a browser to one instance."
+  description = "Max concurrent requests per container. Streamlit's websocket and each file-upload PUT are separate Cloud Run requests, and the browser sends a multi-file upload as parallel PUTs. When an instance is at this limit, Cloud Run overrides session affinity and routes the overflow to another instance, which doesn't know the session and returns 400 (\"AxiosError ... status code 400\" in the GUI). Keep it well above the number of files a user uploads at once. Instances still scale out on CPU load."
   type        = number
-  default     = 8
+  default     = 80
 }
 
 variable "custom_domain" {

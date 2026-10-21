@@ -364,7 +364,7 @@ jobs:
             --allow-unauthenticated \
             --memory=16Gi \
             --cpu=8 \
-            --concurrency=8 \
+            --concurrency=80 \
             --min-instances=0 \
             --max-instances=5 \
             --no-cpu-throttling \
