@@ -39,7 +39,15 @@ from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-FREQUENCIES = ("biweekly", "monthly", "quarterly")
+FREQUENCIES = ("biweekly", "monthly", "quarterly", "custom")
+FREQUENCY_LABELS = {
+    "biweekly": "Biweekly (1st & 15th)",
+    "monthly": "Monthly (1st)",
+    "quarterly": "Quarterly (Jan, Apr, Jul, Oct)",
+}
+# Range for "custom" (every N days) schedules; the dispatcher runs daily.
+MIN_INTERVAL_DAYS = 1
+MAX_INTERVAL_DAYS = 365
 # Run history entries kept per schedule.
 MAX_HISTORY = 24
 # Daily attempts per scheduled date before a failing run waits for the next date.
@@ -180,17 +188,35 @@ def today() -> date:
     return datetime.now(ZoneInfo(tz)).date()
 
 
-def last_occurrence(frequency: str, day: date) -> date:
+def last_occurrence(frequency: str, day: date, *, start: date | None = None,
+                    interval_days: int | None = None) -> date:
     """Most recent scheduled run date on or before ``day``.
 
     biweekly = 1st and 15th of each month, monthly = 1st, quarterly = 1st of
-    Jan/Apr/Jul/Oct (the same calendar the cron schedules used).
+    Jan/Apr/Jul/Oct (the same calendar the cron schedules used); custom = every
+    ``interval_days`` days counted from ``start``.
     """
+    if frequency == "custom":
+        return day - timedelta(days=(day - start).days % interval_days)
     if frequency == "biweekly":
         return day.replace(day=15) if day.day >= 15 else day.replace(day=1)
     if frequency == "quarterly":
         return date(day.year, day.month - (day.month - 1) % 3, 1)
     return day.replace(day=1)
+
+
+def _last_scheduled(schedule: dict, day: date) -> date:
+    return last_occurrence(schedule["frequency"], day,
+                           start=date.fromisoformat(schedule["created"]),
+                           interval_days=schedule.get("interval_days"))
+
+
+def describe_frequency(schedule: dict) -> str:
+    """Human-readable frequency, e.g. "Monthly (1st)" or "Every 10 days"."""
+    if schedule["frequency"] == "custom":
+        n = schedule.get("interval_days")
+        return "Every day" if n == 1 else f"Every {n} days"
+    return FREQUENCY_LABELS.get(schedule["frequency"], schedule["frequency"])
 
 
 def is_due(schedule: dict, day: date) -> bool:
@@ -202,7 +228,7 @@ def is_due(schedule: dict, day: date) -> bool:
     if schedule.get("status") != "active":
         return False
     baseline = date.fromisoformat(schedule.get("last_run") or schedule["created"])
-    return last_occurrence(schedule["frequency"], day) > baseline
+    return _last_scheduled(schedule, day) > baseline
 
 
 def clean_recipients(value: str) -> list[str]:
@@ -222,16 +248,27 @@ def new_schedule(
     spreadsheet_url: str = "",
     query_ids: list[str] | None = None,
     created: date | None = None,
+    interval_days: int | None = None,
 ) -> dict:
-    """Build a new active schedule (not yet saved)."""
+    """Build a new active schedule (not yet saved).
+
+    ``interval_days`` is required for (and only used by) the "custom" frequency.
+    """
     if frequency not in FREQUENCIES:
         raise ValueError(f"Unknown frequency: {frequency}")
+    if frequency != "custom":
+        interval_days = None
+    elif not (isinstance(interval_days, int)
+              and MIN_INTERVAL_DAYS <= interval_days <= MAX_INTERVAL_DAYS):
+        raise ValueError(f"Custom frequency needs an interval of {MIN_INTERVAL_DAYS}"
+                         f"-{MAX_INTERVAL_DAYS} days, got {interval_days!r}")
     return {
         "id": uuid.uuid4().hex[:12],
         "token": secrets.token_urlsafe(18),
         "status": "active",
         "created": (created or today()).isoformat(),
         "frequency": frequency,
+        "interval_days": interval_days,
         "recipients": recipients,
         "targets": targets,
         "primer_sets": primer_sets,
@@ -417,7 +454,7 @@ def _record(store, schedule_id: str, day: date, result: DispatchResult) -> None:
         {"date": day.isoformat(), "status": status, "detail": result.detail}
     ])[-MAX_HISTORY:]
     # A failed run stays due (retried at the next daily dispatch) up to MAX_ATTEMPTS.
-    since = last_occurrence(schedule["frequency"], day).isoformat()
+    since = _last_scheduled(schedule, day).isoformat()
     failures = sum(1 for h in schedule["history"]
                    if h["status"] == "failed" and h["date"] >= since)
     if result.ok or failures >= MAX_ATTEMPTS:
@@ -465,7 +502,7 @@ def dispatch(
     results = []
     if dry_run:
         for s in due:
-            print(f"  would run {s['id']} ({s['frequency']}, targets: {', '.join(s['targets'])})")
+            print(f"  would run {s['id']} ({describe_frequency(s)}, targets: {', '.join(s['targets'])})")
         return results
 
     for schedule in due:

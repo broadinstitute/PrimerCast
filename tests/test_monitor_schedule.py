@@ -19,6 +19,7 @@ def _schedule(store=None, **overrides):
         params_txt="AMPLEN_MIN = 60\n",
         csv_text="Pathogen,TaxID\nSARS-CoV-2,2697049\n",
         created=overrides.pop("created", date(2026, 1, 10)),
+        interval_days=overrides.pop("interval_days", None),
     )
     schedule.update(overrides)
     if store is not None:
@@ -72,6 +73,47 @@ class TestIsDue:
 
     def test_stopped_never_due(self):
         assert not ms.is_due(_schedule(status="stopped"), date(2027, 1, 1))
+
+
+class TestCustomFrequency:
+    def _custom(self, n=10, **kw):
+        return _schedule(frequency="custom", interval_days=n,
+                         created=date(2026, 1, 10), **kw)
+
+    def test_due_every_n_days_from_creation(self):
+        s = self._custom()
+        assert not ms.is_due(s, date(2026, 1, 19))
+        assert ms.is_due(s, date(2026, 1, 20))
+        s["last_run"] = "2026-01-20"
+        assert not ms.is_due(s, date(2026, 1, 29))
+        assert ms.is_due(s, date(2026, 1, 30))
+
+    def test_late_run_keeps_the_original_cadence(self):
+        # Run three days late on 1/23; the next date is still 1/30, not 2/2.
+        s = self._custom(last_run="2026-01-23")
+        assert ms.is_due(s, date(2026, 1, 30))
+
+    def test_daily(self):
+        s = self._custom(n=1)
+        assert not ms.is_due(s, date(2026, 1, 10))
+        assert ms.is_due(s, date(2026, 1, 11))
+
+    @pytest.mark.parametrize("n", [None, 0, 366, 2.5])
+    def test_invalid_interval(self, n):
+        with pytest.raises(ValueError):
+            self._custom(n=n)
+
+    def test_interval_ignored_for_calendar_frequencies(self):
+        assert _schedule(interval_days=10)["interval_days"] is None
+
+    def test_describe(self):
+        assert ms.describe_frequency(self._custom()) == "Every 10 days"
+        assert ms.describe_frequency(self._custom(n=1)) == "Every day"
+        assert ms.describe_frequency(_schedule()) == "Monthly (1st)"
+        # Schedules saved before interval_days existed.
+        old = _schedule()
+        del old["interval_days"]
+        assert ms.is_due(old, date(2026, 2, 1))
 
 
 class TestCleanRecipients:

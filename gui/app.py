@@ -232,7 +232,7 @@ def _reset_workflow_state():
                 "monitor_pset_upload",
                 "monitor_primer_name", "monitor_primer_fwd",
                 "monitor_primer_rev", "monitor_primer_pro",
-                "monitor_frequency", "monitor_skip_fetch",
+                "monitor_frequency", "monitor_interval_days", "monitor_skip_fetch",
                 "monitor_resume_run", "monitor_schedule", "monitor_first_run"):
         st.session_state.pop(key, None)
     _clear_pipeline_state()
@@ -656,7 +656,7 @@ def _render_sidebar():
                 with st.expander(", ".join(sched["targets"]) or sched["id"]):
                     st.markdown(
                         "<div style='font-size:0.85em; line-height:1.4;'>"
-                        f"<b>Frequency:</b> {sched['frequency']}<br>"
+                        f"<b>Frequency:</b> {monitor_schedule.describe_frequency(sched)}<br>"
                         f"<b>Email:</b> {', '.join(sched['recipients'])}<br>"
                         f"<a href='{sched['manage_url']}' target='_blank'>Manage / stop</a>"
                         "</div>",
@@ -2377,29 +2377,37 @@ def _render_funnel_table(steps: list):
     ])
 
 
+def _render_funnel_stage(funnel):
+    """One stage's funnel table under a heading (expanders can't be nested)."""
+    st.markdown(f"**Filter stage: {funnel.stage_label}"
+                + (f" ({funnel.target})" if funnel.target else "") + "**")
+    _render_funnel_table(funnel.steps)
+
+
 def _render_run_funnels(funnels: list):
-    """Which filters narrowed the candidates, shown for successful runs too."""
+    """Which filters narrowed the candidates, collapsed for successful runs."""
     if not funnels:
         return
-    st.markdown("**Where filters narrowed the candidates**")
-    summaries = [f.summary for f in funnels if f.summary]
-    if summaries:
-        st.markdown("\n".join(f"- {s}" for s in summaries))
-    else:
-        st.caption("No filter removed any candidates.")
-    for funnel in funnels:
-        with st.expander(f"Filter stage: {funnel.stage_label}"
-                         + (f" ({funnel.target})" if funnel.target else "")):
-            _render_funnel_table(funnel.steps)
+    with st.expander("Filter statistics", expanded=False):
+        st.markdown("**Where filters narrowed the candidates**")
+        summaries = [f.summary for f in funnels if f.summary]
+        if summaries:
+            st.markdown("\n".join(f"- {s}" for s in summaries))
+        else:
+            st.caption("No filter removed any candidates.")
+        for funnel in funnels:
+            _render_funnel_stage(funnel)
 
 
 def _render_failure_diagnosis():
-    """Name the filter that stopped the pipeline, with its candidate funnel."""
-    for diagnosis in _pipeline_diagnoses(st.session_state.get("pipeline_run_id", "")):
+    """Name the filter that stopped the pipeline; its funnel is shown expanded."""
+    diagnoses = _pipeline_diagnoses(st.session_state.get("pipeline_run_id", ""))
+    for diagnosis in diagnoses:
         st.error(f"**No candidates left.** {diagnosis.message}")
-        with st.expander(f"Filter stage: {diagnosis.stage_label}"
-                         + (f" ({diagnosis.target})" if diagnosis.target else "")):
-            _render_funnel_table(diagnosis.steps)
+    if diagnoses:
+        with st.expander("Filter statistics", expanded=True):
+            for diagnosis in diagnoses:
+                _render_funnel_stage(diagnosis)
 
 
 def _render_run_warnings(warnings: list):
@@ -5263,23 +5271,46 @@ def _render_report_button(run_id: str, context: str):
         _report_dialog(run_id, context)
 
 
+def _render_params_download(run_id: str, context: str):
+    """Download the params.txt a run used (offered whether or not it succeeded)."""
+    if st.session_state.get("workflow", "design") == "monitor":
+        schedule = st.session_state.get("monitor_schedule") or {}
+        text = schedule.get("params_txt", "")
+        file_name = f"params_monitor_{schedule.get('id', '')}.txt"
+    else:
+        path = RUNS_DIR / run_id / "params.txt" if run_id else None
+        text = path.read_text() if path and path.is_file() else ""
+        file_name = f"params_{run_id}.txt"
+    if not text:
+        return
+    st.download_button(
+        ":material/download: Download parameters (params.txt)",
+        data=text,
+        file_name=file_name,
+        mime="text/plain",
+        key=f"dl_params_{context}",
+    )
+
+
 def _page_run():
     """Run pipeline page."""
     _render_workflow_progress("run")
 
     workflow = st.session_state.get("workflow", "design")
 
-    # Back button (only when pipeline is not running)
-    if not st.session_state.get("pipeline_running"):
-        if workflow == "monitor":
-            back_label = "← Back to Report"
-            back_target = "monitor_report"
-        else:
-            back_label = "← Back to Configuration"
-            back_target = f"{workflow}_config"
-        if st.button(back_label, key="run_back"):
-            _navigate(back_target)
-            st.rerun()
+    # Back button, disabled while the pipeline runs. It is always rendered: hiding
+    # it would shift the page up when Run is clicked, leaving a faded stale copy
+    # of the Run/Stop buttons on screen until the progress display replaced it.
+    if workflow == "monitor":
+        back_label = "← Back to Report"
+        back_target = "monitor_report"
+    else:
+        back_label = "← Back to Configuration"
+        back_target = f"{workflow}_config"
+    if st.button(back_label, key="run_back",
+                 disabled=bool(st.session_state.get("pipeline_running"))):
+        _navigate(back_target)
+        st.rerun()
 
     if workflow == "monitor":
         _tab_run_monitor()
@@ -5293,6 +5324,7 @@ def _page_run():
         if st.button("View Results →", type="primary", use_container_width=True):
             _navigate("results")
             st.rerun()
+        _render_params_download(st.session_state.get("pipeline_run_id", ""), "run_page")
         if workflow != "monitor":
             _render_report_button(st.session_state.get("pipeline_run_id", ""), "run_page")
 
@@ -5304,8 +5336,9 @@ def _page_results():
         _navigate("run")
         st.rerun()
     _tab_results()
+    st.divider()
+    _render_params_download(st.session_state.get("run_id", ""), "results_page")
     if st.session_state.get("workflow", "design") != "monitor":
-        st.divider()
         _render_report_button(st.session_state.get("run_id", ""), "results_page")
 
 
@@ -5348,11 +5381,9 @@ def _page_monitor_report():
     # --- Schedule ---
     st.subheader("Schedule")
 
-    frequency_options = {
-        "Biweekly (1st & 15th)": "biweekly",
-        "Monthly (1st)": "monthly",
-        "Quarterly (Jan, Apr, Jul, Oct)": "quarterly",
-    }
+    frequency_options = {label: freq for freq, label
+                         in monitor_schedule.FREQUENCY_LABELS.items()}
+    frequency_options["Custom (every N days)"] = "custom"
     selected_label = st.radio(
         "Report frequency",
         options=list(frequency_options.keys()),
@@ -5360,6 +5391,17 @@ def _page_monitor_report():
         key="monitor_frequency",
     )
     frequency = frequency_options[selected_label]
+    interval_days = None
+    if frequency == "custom":
+        interval_days = int(st.number_input(
+            "Run every N days",
+            min_value=monitor_schedule.MIN_INTERVAL_DAYS,
+            max_value=monitor_schedule.MAX_INTERVAL_DAYS,
+            value=30,
+            step=1,
+            key="monitor_interval_days",
+            help="Counted from today: with 10, the monitor runs now, then every 10 days.",
+        ))
     if MONITOR_JOB:
         st.caption(
             "The monitor runs once now on our servers, then on each scheduled date. "
@@ -5383,7 +5425,7 @@ def _page_monitor_report():
     with col_cont:
         if st.button("Continue →", type="primary", use_container_width=True,
                       key="report_cont", disabled=not email_configured):
-            if _create_monitor_schedule(frequency) and (
+            if _create_monitor_schedule(frequency, interval_days) and (
                     not MONITOR_JOB or _start_first_run_job()):
                 st.session_state._run_page_fresh = True
                 _navigate("run")
@@ -5405,7 +5447,7 @@ def _monitor_store():
     return monitor_schedule.get_store(MONITOR_STORE_DIR)
 
 
-def _create_monitor_schedule(frequency: str) -> bool:
+def _create_monitor_schedule(frequency: str, interval_days: int | None = None) -> bool:
     """Save a schedule for the current monitor setup; False (with an error shown) if not."""
     recipients = monitor_schedule.clean_recipients(
         st.session_state.get("monitor_email_recipients", ""))
@@ -5437,6 +5479,7 @@ def _create_monitor_schedule(frequency: str) -> bool:
         targets=targets,
         primer_sets=primer_names,
         frequency=frequency,
+        interval_days=interval_days,
         recipients=recipients,
         params_txt=build_params_txt(st.session_state.params),
         csv_text=sheet_data.get("csv_text", ""),
@@ -5518,14 +5561,12 @@ def _page_monitor_manage(ref: str):
         st.error("This monitor link is invalid or the schedule no longer exists.")
         return
 
-    labels = {"biweekly": "Biweekly (1st & 15th)", "monthly": "Monthly (1st)",
-              "quarterly": "Quarterly (Jan, Apr, Jul, Oct)"}
     active = schedule["status"] == "active"
     st.markdown(
         f"**Status:** {'Active' if active else 'Stopped on ' + str(schedule['stopped_at'])}  \n"
         f"**Targets:** {', '.join(schedule['targets']) or '—'}  \n"
         f"**Primer sets:** {', '.join(schedule['primer_sets']) or '—'}  \n"
-        f"**Frequency:** {labels.get(schedule['frequency'], schedule['frequency'])}  \n"
+        f"**Frequency:** {monitor_schedule.describe_frequency(schedule)}  \n"
         f"**Recipients:** {', '.join(schedule['recipients'])}  \n"
         f"**Created:** {schedule['created']}"
     )
