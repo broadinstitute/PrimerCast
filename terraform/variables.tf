@@ -98,7 +98,7 @@ variable "monitor_bucket_name" {
 }
 
 variable "monitor_email_sender" {
-  description = "From address of monitor reports. Must be a verified sender in SendGrid (Settings -> Sender Authentication)."
+  description = "From address of monitor reports. Must be a verified sender in Brevo (Senders, Domains & Dedicated IPs)."
   type        = string
   default     = ""
 }
@@ -106,7 +106,7 @@ variable "monitor_email_sender" {
 variable "monitor_smtp_host" {
   description = "SMTP server for monitor reports."
   type        = string
-  default     = "smtp.sendgrid.net"
+  default     = "smtp-relay.brevo.com"
 }
 
 variable "monitor_smtp_port" {
@@ -116,13 +116,13 @@ variable "monitor_smtp_port" {
 }
 
 variable "monitor_smtp_user" {
-  description = "SMTP login. SendGrid's is the literal \"apikey\"; the API key itself goes in the primercast-monitor-sendgrid-key secret (see monitor.tf). Empty = log in as monitor_email_sender."
+  description = "SMTP login (Brevo: the login shown under SMTP & API -> SMTP, e.g. 1a2b3c001@smtp-brevo.com). Empty = log in as monitor_email_sender. The SMTP key goes in the primercast-monitor-smtp-key secret (see monitor.tf)."
   type        = string
-  default     = "apikey"
+  default     = ""
 }
 
 variable "monitor_email_enabled" {
-  description = "Wire the SendGrid-key secret into the service and jobs. Set true only after adding a secret version (Cloud Run rejects a secret reference with no versions)."
+  description = "Wire the SMTP-key secret into the service and jobs. Set true only after adding a secret version (Cloud Run rejects a secret reference with no versions)."
   type        = bool
   default     = false
 }

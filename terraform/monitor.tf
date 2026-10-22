@@ -9,12 +9,12 @@
 # app starts a new schedule's first run as a separate execution of the same    #
 # job. The web service can scale to zero; nothing depends on it at run time.   #
 #                                                                              #
-# Email: SendGrid SMTP relay (var.monitor_smtp_*, login "apikey"). The From   #
-# address is var.monitor_email_sender (a verified SendGrid sender); the API    #
-# key lives in Secret Manager and is never in terraform state. Bootstrap:      #
+# Email: Brevo SMTP relay (var.monitor_smtp_*). The From address is          #
+# var.monitor_email_sender (a verified Brevo sender); the SMTP key lives in    #
+# Secret Manager and is never in terraform state. Bootstrap:                   #
 #   1. terraform apply                    (creates the empty secret)           #
-#   2. printf '%s' 'SG.KEY' | gcloud secrets versions add \                    #
-#        primercast-monitor-sendgrid-key --data-file=- --project=sabeti-adapt  #
+#   2. printf '%s' 'SMTP_KEY' | gcloud secrets versions add \                  #
+#        primercast-monitor-smtp-key --data-file=- --project=sabeti-adapt      #
 #   3. set monitor_email_enabled = true and terraform apply again              #
 # (Cloud Run refuses to start a revision that references a secret with no     #
 # versions, hence the flag.)                                                   #
@@ -36,35 +36,6 @@ resource "google_storage_bucket" "monitor" {
   depends_on = [google_project_service.services]
 }
 
-resource "google_secret_manager_secret" "monitor_sendgrid_key" {
-  secret_id = "${var.service_name}-monitor-sendgrid-key"
-  project   = var.project_id
-
-  replication {
-    auto {}
-  }
-
-  depends_on = [google_project_service.services]
-}
-
-# The secret and its accessor bindings were created by hand (with the key)
-# before terraform managed them.
-import {
-  to = google_secret_manager_secret.monitor_sendgrid_key
-  id = "projects/${var.project_id}/secrets/${var.service_name}-monitor-sendgrid-key"
-}
-
-import {
-  for_each = {
-    runtime = google_service_account.runtime.email
-    job     = google_service_account.monitor_job.email
-  }
-  to = google_secret_manager_secret_iam_member.monitor_sendgrid_key[each.key]
-  id = "projects/${var.project_id}/secrets/${var.service_name}-monitor-sendgrid-key roles/secretmanager.secretAccessor serviceAccount:${each.value}"
-}
-
-# Brevo SMTP key from the previous relay, kept for rollback (nothing has access;
-# re-grant secretAccessor to the runtime and job SAs to use it again).
 resource "google_secret_manager_secret" "monitor_smtp_key" {
   secret_id = "${var.service_name}-monitor-smtp-key"
   project   = var.project_id
@@ -104,13 +75,13 @@ resource "google_storage_bucket_iam_member" "monitor_bucket" {
 
 # The job emails scheduled and first runs; the web app only sends when no job
 # is configured (PRIMERCAST_MONITOR_JOB unset).
-resource "google_secret_manager_secret_iam_member" "monitor_sendgrid_key" {
+resource "google_secret_manager_secret_iam_member" "monitor_smtp_key" {
   for_each = {
     runtime = google_service_account.runtime.email
     job     = google_service_account.monitor_job.email
   }
   project   = var.project_id
-  secret_id = google_secret_manager_secret.monitor_sendgrid_key.secret_id
+  secret_id = google_secret_manager_secret.monitor_smtp_key.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${each.value}"
 }
@@ -188,7 +159,7 @@ resource "google_cloud_run_v2_job" "monitor" {
             name = "PRIMERCAST_EMAIL_PASSWORD"
             value_source {
               secret_key_ref {
-                secret  = google_secret_manager_secret.monitor_sendgrid_key.secret_id
+                secret  = google_secret_manager_secret.monitor_smtp_key.secret_id
                 version = "latest"
               }
             }
@@ -216,7 +187,7 @@ resource "google_cloud_run_v2_job" "monitor" {
 
   depends_on = [
     google_project_service.services,
-    google_secret_manager_secret_iam_member.monitor_sendgrid_key,
+    google_secret_manager_secret_iam_member.monitor_smtp_key,
   ]
 }
 

@@ -42,8 +42,8 @@ This stack creates:
   (`<prefix>/runs/<id>/<YYYYMMDD>/`: accession history, reports, log); a Cloud Run Job
   (`primercast-monitor`) running `adapt monitor-dispatch`, started daily at 00:00
   America/New_York by Cloud Scheduler; a `primercast-monitor-staging` job (prefix `staging`,
-  no scheduler, run by hand); and a Secret Manager secret for the SendGrid API key used
-  to send reports through SendGrid's SMTP relay. The web app (which may be scaled to zero) only creates/stops schedules and
+  no scheduler, run by hand); and a Secret Manager secret for the SMTP key used to send
+  reports through the Brevo SMTP relay. The web app (which may be scaled to zero) only creates/stops schedules and
   starts each new schedule's first run as its own job execution
   (`monitor-dispatch --schedule-id <id>`). Users manage a schedule through the private link
   `/?monitor=<id>.<token>` shown on creation and included in every report email. Stopped
@@ -55,31 +55,29 @@ It does **not** create the GPU image (that lives in GHCR) or persist design/eval
 
 ### Enabling monitor emails (one-time)
 
-Reports are sent through SendGrid's SMTP relay (`smtp.sendgrid.net:587`, STARTTLS; login
-`apikey`, password = the API key). Report emails disable SendGrid's click tracking (an
-`X-SMTPAPI` header), which would otherwise route the private manage links through
-SendGrid's redirect server.
+Reports are sent through Brevo's SMTP relay (`smtp-relay.brevo.com:587`, STARTTLS; free
+tier is 300 emails/day).
 
-1. In SendGrid, verify the From address under **Settings → Sender Authentication** (single
-   sender, or authenticate the domain for better deliverability), and create an API key
-   with **Mail Send** permission. Optionally also turn off click tracking account-wide
-   (**Settings → Tracking**).
-2. In `terraform.tfvars` set `monitor_email_sender = "<verified address>"` (the SMTP host
-   and the `apikey` login are the defaults), then `terraform apply` (this creates the
-   bucket, jobs, scheduler and the *empty* secret).
-3. Add the API key as a secret version (it never enters terraform state or the repo):
+1. Create a Brevo account. Under **Senders, Domains & Dedicated IPs → Senders**, add and
+   verify the From address (Brevo emails it a confirmation link).
+2. Under **SMTP & API → SMTP**, note the **SMTP login** (e.g. `1a2b3c001@smtp-brevo.com`)
+   and generate an **SMTP key**.
+3. In `terraform.tfvars` set `monitor_email_sender = "<verified address>"` and
+   `monitor_smtp_user = "<SMTP login>"`, then `terraform apply` (this creates the bucket,
+   jobs, scheduler and the *empty* secret).
+4. Add the SMTP key as a secret version (it never enters terraform state or the repo):
    ```bash
-   printf '%s' 'SG.KEY' | gcloud secrets versions add primercast-monitor-sendgrid-key \
+   printf '%s' 'SMTP_KEY' | gcloud secrets versions add primercast-monitor-smtp-key \
      --data-file=- --project=sabeti-adapt
    ```
-4. Set `monitor_email_enabled = true` and `terraform apply` again (Cloud Run refuses
+5. Set `monitor_email_enabled = true` and `terraform apply` again (Cloud Run refuses
    revisions that reference a secret with no versions, hence the two steps).
-5. For staging, set GitHub repo **variables** (Settings → Secrets and variables → Actions →
-   Variables): `MONITOR_EMAIL_SENDER` = the sender address, `MONITOR_EMAIL_ENABLED` = `true`.
-   CI points the staging service and the staging job at the same secret.
+6. For staging, set GitHub repo **variables** (Settings → Secrets and variables → Actions →
+   Variables): `MONITOR_EMAIL_SENDER` = the sender address, `MONITOR_SMTP_USER` = the SMTP
+   login, `MONITOR_EMAIL_ENABLED` = `true`.
 
-The previous Brevo key (`primercast-monitor-smtp-key`) is kept for rollback: point
-`monitor_smtp_host` / `monitor_smtp_user` and the secret references back at it.
+To switch providers later, change `monitor_smtp_host` / `monitor_smtp_port` /
+`monitor_smtp_user` and add the new password as a secret version.
 
 Test the dispatcher without waiting for midnight:
 `gcloud run jobs execute primercast-monitor-staging --region us-central1` (or the prod job).

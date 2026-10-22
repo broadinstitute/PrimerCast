@@ -83,7 +83,7 @@ resource "google_cloud_run_v2_service" "app" {
           name = "PRIMERCAST_EMAIL_PASSWORD"
           value_source {
             secret_key_ref {
-              secret  = google_secret_manager_secret.monitor_sendgrid_key.secret_id
+              secret  = google_secret_manager_secret.monitor_smtp_key.secret_id
               version = "latest"
             }
           }
@@ -119,10 +119,10 @@ resource "google_cloud_run_v2_service" "app" {
     ]
   }
 
-  # The revision must be able to read the SendGrid-key secret when it is created.
+  # The revision must be able to read the SMTP-key secret when it is created.
   depends_on = [
     google_project_service.services,
-    google_secret_manager_secret_iam_member.monitor_sendgrid_key,
+    google_secret_manager_secret_iam_member.monitor_smtp_key,
   ]
 }
 

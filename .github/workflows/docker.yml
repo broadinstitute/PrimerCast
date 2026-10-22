@@ -25,14 +25,16 @@ env:
   # vars from terraform; staging's are set by the staging-deploy flags below.
   REPORT_BUCKET: sabeti-adapt-primercast-error-reports
   # Scheduled-monitor bucket + jobs (terraform/monitor.tf). Emails go through the
-  # SendGrid SMTP relay; the From address and whether the API-key secret is wired
-  # into staging come from repo variables MONITOR_EMAIL_SENDER /
-  # MONITOR_EMAIL_ENABLED ('true' once the secret has a version).
+  # Brevo SMTP relay; the From address, SMTP login and whether the SMTP-key secret
+  # is wired into staging come from repo variables MONITOR_EMAIL_SENDER /
+  # MONITOR_SMTP_USER / MONITOR_EMAIL_ENABLED ('true' once the secret has a version).
+  # (SendGrid: host smtp.sendgrid.net, login apikey, secret
+  # primercast-monitor-sendgrid-key; on hold until its sender is verified.)
   MONITOR_BUCKET: sabeti-adapt-primercast-monitor
-  MONITOR_EMAIL_SECRET: primercast-monitor-sendgrid-key
-  MONITOR_SMTP_HOST: smtp.sendgrid.net
+  MONITOR_EMAIL_SECRET: primercast-monitor-smtp-key
+  MONITOR_SMTP_HOST: smtp-relay.brevo.com
   MONITOR_SMTP_PORT: "587"
-  MONITOR_SMTP_USER: apikey
+  MONITOR_SMTP_USER: ${{ vars.MONITOR_SMTP_USER }}
 
 # Two images are produced from one Dockerfile (see the TORCH_VARIANT build arg):
 #   GHCR  -> multi-arch (amd64+arm64), GPU-enabled. Used by training + the
