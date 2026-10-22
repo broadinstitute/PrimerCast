@@ -213,6 +213,7 @@ def _clear_pipeline_state():
     """Clear all pipeline run state for a fresh workflow."""
     for key in ("pipeline_return_code", "pipeline_log", "pipeline_running",
                 "pipeline_completed_rules", "pipeline_should_start",
+                "pipeline_elapsed", "pipeline_timed_out", "monitor_outcome",
                 "_run_page_fresh"):
         st.session_state.pop(key, None)
 
@@ -2070,6 +2071,8 @@ def _tab_run():
         st.session_state.pipeline_return_code = None
         st.session_state.pipeline_log = ""
         st.session_state.pipeline_completed_rules = set()
+        st.session_state.pipeline_elapsed = ""
+        st.session_state.pipeline_timed_out = False
         st.rerun()
 
     # Execute pipeline (triggered after rerun from Run click)
@@ -2286,21 +2289,8 @@ def _tab_run():
 
         elapsed = int(time.time() - start_time)
         mins, secs = divmod(elapsed, 60)
-
-        # Final progress
-        lines = []
-        for rule_name, label in rules:
-            if rule_name in completed_rules:
-                done_targets = rule_done_targets.get(rule_name, set())
-                if rule_name in _PER_TARGET_RULES and show_targets and done_targets:
-                    tstr = ", ".join(sorted(done_targets))
-                    lines.append(f"✅ &nbsp; {label} — {tstr}")
-                else:
-                    lines.append(f"✅ &nbsp; {label}")
-            else:
-                lines.append(f"⚪ &nbsp; {label}")
-        progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
-        status_area.caption(f"Completed in {mins}m {secs}s")
+        st.session_state.pipeline_elapsed = f"Completed in {mins}m {secs}s"
+        st.session_state.pipeline_timed_out = timed_out.is_set()
 
         warnings = _pipeline_warnings()
         limit_minutes = RUN_TIME_LIMIT // 60
@@ -2309,15 +2299,9 @@ def _tab_run():
                                  else f"failed (exit code {rc})" if rc != 0
                                  else "succeeded with warnings" if warnings
                                  else "succeeded"))
-        if timed_out.is_set():
-            st.error(f"**Run stopped after {limit_minutes} minutes**, the time limit for "
-                     "runs on this server. Try fewer or smaller targets, or run the "
-                     "pipeline locally.")
-        _render_pipeline_outcome(rc, warnings)
-        if rc != 0:
-            with st.expander("Show error log"):
-                last_lines = "\n".join(log.splitlines()[-50:])
-                st.code(last_lines, language="text")
+        # Rerun so the Run/Stop/Back buttons, drawn before the run started, are
+        # redrawn as idle; the branch below then shows the outcome.
+        st.rerun()
 
     # Show previous run result if not currently running
     elif not running and st.session_state.get("pipeline_return_code") is not None:
@@ -2339,7 +2323,13 @@ def _tab_run():
             else:
                 lines.append(f"⚪ &nbsp; {label}")
         st.markdown("<br>".join(lines), unsafe_allow_html=True)
+        if st.session_state.get("pipeline_elapsed"):
+            st.caption(st.session_state.pipeline_elapsed)
 
+        if st.session_state.get("pipeline_timed_out"):
+            st.error(f"**Run stopped after {RUN_TIME_LIMIT // 60} minutes**, the time "
+                     "limit for runs on this server. Try fewer or smaller targets, or run "
+                     "the pipeline locally.")
         _render_pipeline_outcome(rc, _pipeline_warnings())
         if rc != 0:
             log = st.session_state.get("pipeline_log", "")
@@ -5054,30 +5044,35 @@ def _run_monitor():
 
     # Persist this first run's accession lists so the scheduled runs only
     # report sequences that are new since today.
+    notes = []
     if schedule and not skip_fetch:
         try:
             monitor_schedule.upload_run_dir(_monitor_store(), schedule["id"], date_dir)
         except Exception as e:
-            st.warning(f"Could not save this run for the scheduled monitor: {e}")
+            notes.append(f"Could not save this run for the scheduled monitor: {e}")
 
-    # Done
+    # Done; _tab_run_monitor reruns and shows this saved outcome.
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
-    status_area.caption(f"Completed in {mins}m {secs}s")
+    if all_xlsx:
+        kind, message = "success", f"Monitor complete — {len(all_xlsx)} report(s) generated."
+    elif total_new == 0:
+        kind, message = "info", "No new sequences found. Nothing to evaluate."
+    else:
+        kind, message = "warning", "Fetch succeeded but evaluation produced no reports."
+    st.session_state.monitor_outcome = {
+        "lines": progress_lines,
+        "elapsed": f"Completed in {mins}m {secs}s",
+        "notes": notes,
+        "kind": kind,
+        "message": message,
+        "detail": f"{len(all_xlsx)} report(s) generated. " if all_xlsx else "",
+    }
 
     st.session_state.pipeline_running = False
     st.session_state.pipeline_return_code = 0
     st.session_state.monitor_results_dir = str(date_dir)
     st.session_state.monitor_warnings = monitor_warnings
-
-    if all_xlsx and monitor_warnings:
-        _render_monitor_warnings(monitor_warnings, f"{len(all_xlsx)} report(s) generated. ")
-    elif all_xlsx:
-        st.success(f"Monitor complete — {len(all_xlsx)} report(s) generated.")
-    elif total_new == 0:
-        st.info("No new sequences found. Nothing to evaluate.")
-    else:
-        st.warning("Fetch succeeded but evaluation produced no reports.")
 
 
 def _tab_run_monitor():
@@ -5124,15 +5119,32 @@ def _tab_run_monitor():
 
     if st.session_state.get("pipeline_should_start"):
         st.session_state.pipeline_should_start = False
-        _run_monitor()
+        st.session_state.monitor_outcome = None
+        try:
+            _run_monitor()
+        except Exception as e:
+            st.session_state.pipeline_running = False
+            st.session_state.pipeline_return_code = 1
+            st.session_state.monitor_outcome = {"error": f"{type(e).__name__}: {e}"}
+        # Rerun so the buttons drawn before the run are redrawn as idle.
+        st.rerun()
 
     elif not running and st.session_state.get("pipeline_return_code") is not None:
         rc = st.session_state.pipeline_return_code
         monitor_warnings = st.session_state.get("monitor_warnings", [])
+        outcome = st.session_state.get("monitor_outcome") or {}
+        if outcome.get("lines"):
+            st.markdown("<br>".join(outcome["lines"]), unsafe_allow_html=True)
+        if outcome.get("elapsed"):
+            st.caption(outcome["elapsed"])
+        for note in outcome.get("notes", []):
+            st.warning(note)
         if rc != 0:
-            st.error("Monitor failed.")
+            st.error("Monitor failed." + (f" {outcome['error']}" if outcome.get("error") else ""))
         elif monitor_warnings:
-            _render_monitor_warnings(monitor_warnings)
+            _render_monitor_warnings(monitor_warnings, outcome.get("detail", ""))
+        elif outcome.get("message"):
+            getattr(st, outcome["kind"])(outcome["message"])
         else:
             st.success("Monitor completed successfully!")
 
