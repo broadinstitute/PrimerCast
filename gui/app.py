@@ -5720,6 +5720,20 @@ def main():
 
     page = _current_page()
 
+    # The setup pages can take a moment to build (e.g. counting the sequences in
+    # every target FASTA on a fresh server). The spinner only shows if a page
+    # takes longer than half a second. Run / monitor report are left out: their
+    # long steps show their own progress.
+    if page in ("run", "monitor_report"):
+        _render_page(page)
+    else:
+        with st.spinner("Loading..."):
+            _render_page(page)
+
+    _scroll_to_top()
+
+
+def _render_page(page: str):
     if page == "home":
         _page_home()
     elif page == "virus_map":
@@ -5754,8 +5768,6 @@ def main():
         _page_monitor_report()
     else:
         _page_home()
-
-    _scroll_to_top()
 
 
 if __name__ == "__main__":
