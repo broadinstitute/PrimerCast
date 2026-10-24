@@ -120,7 +120,10 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
 
     Returns the process exit code.
     """
-    cmd = ["snakemake", "-s", "Snakefile", "--cores", str(cores)]
+    # gpu=1 serializes the evaluate rules on a GPU box; where there is no GPU
+    # the Snakefile prices them at 0 so they overlap freely (see GPU_COST).
+    cmd = ["snakemake", "-s", "Snakefile", "--cores", str(cores),
+           "--resources", "gpu=1"]
 
     if config_args:
         cmd += ["--config"] + config_args
@@ -1193,7 +1196,7 @@ def _monitor_evaluate(
     started_at = time.time()
     rc = subprocess.run(
         ["snakemake", "-s", "Snakefile", "--cores", str(cores),
-         "--config"] + config_args,
+         "--resources", "gpu=1", "--config"] + config_args,
         cwd=str(eval_dir),
     ).returncode
 

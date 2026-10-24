@@ -55,6 +55,25 @@ from pathlib import Path
 import shlex
 import shutil
 
+# NOTE on `threads:` below. Snakemake does not reliably hold this workflow to
+# the --cores budget: with 4 targets it runs all 4 evaluate jobs at once even
+# though each declares threads == MAX_CORES (measured on snakemake 9.16.3,
+# 8 cores). Lowering the declared threads therefore does NOT buy extra overlap
+# -- the overlap already happens -- it only makes each job slower. Measured on
+# a 4-target design: threads=MAX_CORES 176s, MAX_CORES//2 200s, 2 229s, with
+# peak RSS within 10% across all three. So leave these at MAX_CORES, and bound
+# the real risk (several runs sharing one box) with gui/run_gate.py instead.
+#
+# `resources:` IS honoured, which is what GPU_COST below relies on.
+
+# Two evaluate jobs must not share one GPU. This only binds when the caller
+# passes --resources gpu=N (the GUI and `adapt` pass gpu=1); where there is no
+# GPU each job costs 0, leaving them free to overlap on CPU. Without this the
+# gpu resource was dead config -- declared on the rule, never given a limit, so
+# snakemake left it unconstrained. Checking for nvidia-smi keeps this cheap;
+# importing torch at parse time would not be.
+GPU_COST = 1 if shutil.which("nvidia-smi") else 0
+
 ############################################
 # Normalize FASTA file extensions
 ############################################
@@ -802,7 +821,7 @@ rule evaluate:
     threads:
         MAX_CORES
     resources:
-        gpu=1
+        gpu=GPU_COST
     params:
         ref_type=lambda wc: "on" if (wc.virus == wc.target or (EVALUATE and wc.target == PRIMARY_TARGET)) else "off",
         # Design: stop if no target is predicted to amplify. Evaluate mode
@@ -857,6 +876,10 @@ rule rescue_evaluate:
         )
     threads:
         MAX_CORES
+    resources:
+        # Shells out to `primercast evaluate`, so it contends for the GPU just
+        # like rule evaluate does.
+        gpu=GPU_COST
     shell:
         "primercast rescue-evaluate "
         "--eval '{input.eval}' --report-dir '{params.report_dir}' "

@@ -131,7 +131,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
-from gui import error_report
+from gui import error_report, run_gate
 from primercast.utils.params import parse_params
 from primercast.external.gget_virus import GGET_VIRUS
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings, step_baselines
@@ -161,7 +161,9 @@ from primercast.adapt_cli import (
 from primercast import monitor_schedule
 from primercast.utils.cpu import available_cores
 
-# Every run uses all of this instance's cores; concurrent runs share them.
+# Every run offers snakemake all of this instance's cores, and snakemake does
+# not hold the workflow strictly to that budget (see the threads note in
+# Snakefile.template), so run_gate caps how many runs share the box at once.
 CORES = available_cores()
 # Browser sessions with no activity for this long are closed so an open but
 # forgotten tab doesn't keep a Cloud Run instance up. On by default only on
@@ -1756,7 +1758,10 @@ def _build_command() -> list[str]:
     dry_run = st.session_state.get("dry_run", False)
 
     snakemake_bin = _find_tool("snakemake") or "snakemake"
-    cmd = [snakemake_bin, "-s", "Snakefile", "--cores", str(cores)]
+    # gpu=1 serializes the evaluate rules on a GPU box; where there is no GPU
+    # the Snakefile prices them at 0 so they overlap freely (see GPU_COST).
+    cmd = [snakemake_bin, "-s", "Snakefile", "--cores", str(cores),
+           "--resources", "gpu=1"]
 
     config_args: list[str] = []
     if mode == "Multiplex":
@@ -2051,6 +2056,12 @@ def _tab_run():
 
     # Handle Stop
     if stop_clicked:
+        # Stop also cancels a run that is still queued behind another one, so
+        # clear the start flag the queue loop below re-reads on every rerun.
+        st.session_state.pipeline_should_start = False
+        ticket = st.session_state.pop("run_ticket", None)
+        if ticket is not None:
+            run_gate.release(ticket)
         pid = st.session_state.get("pipeline_pid")
         if pid:
             try:
@@ -2077,231 +2088,281 @@ def _tab_run():
 
     # Execute pipeline (triggered after rerun from Run click)
     if st.session_state.get("pipeline_should_start"):
+        # Admission control. One instance's cores and (on Cloud Run) its tmpfs
+        # scratch are shared by every session in this process, so only a couple
+        # of runs may execute at once; the rest queue here. pipeline_should_start
+        # stays set until we are admitted, so each rerun comes back through this
+        # branch -- and try_start doubles as the heartbeat that holds our place.
+        # The Stop button above cancels a queued run.
+        ticket = st.session_state.get("run_ticket")
+        if ticket is None:
+            ticket = run_gate.take_ticket()
+            st.session_state.run_ticket = ticket
+        admitted, ahead = run_gate.try_start(ticket)
+        if not admitted:
+            st.info(
+                ("You're next in line — waiting for a running job to finish."
+                 if ahead == 0 else
+                 f"Waiting for a free slot on this server — {ahead} run"
+                 f"{'s' if ahead > 1 else ''} ahead of you.")
+                + " Press Stop to cancel."
+            )
+            time.sleep(2)
+            st.rerun()
+
         st.session_state.pipeline_should_start = False
 
-        scratch_dir = _write_pipeline_files()
+        # Bound before the try so the finally can always see them.
+        proc = None
+        limit_timer = None
+        try:
+            scratch_dir = _write_pipeline_files()
 
-        # Keep a copy of the run's inputs and a live log next to its outputs
-        # (the scratch dir is deleted afterwards); error reports bundle these.
-        run_out_dir = RUNS_DIR / st.session_state.run_id
-        run_out_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("Snakefile", "params.txt"):
-            if (scratch_dir / name).is_file():
-                shutil.copy2(scratch_dir / name, run_out_dir / name)
-        st.session_state.pipeline_run_id = st.session_state.run_id
-        st.session_state.pipeline_started_at = time.time()
-        _save_run_config(status="running")
-        log_fh = open(run_out_dir / "pipeline.log", "w", buffering=1)
+            # Keep a copy of the run's inputs and a live log next to its outputs
+            # (the scratch dir is deleted afterwards); error reports bundle these.
+            run_out_dir = RUNS_DIR / st.session_state.run_id
+            run_out_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("Snakefile", "params.txt"):
+                if (scratch_dir / name).is_file():
+                    shutil.copy2(scratch_dir / name, run_out_dir / name)
+            st.session_state.pipeline_run_id = st.session_state.run_id
+            st.session_state.pipeline_started_at = time.time()
+            _save_run_config(status="running")
+            log_fh = open(run_out_dir / "pipeline.log", "w", buffering=1)
 
-        # Unlock the (fresh) scratch dir in case of a leftover lock from a crash.
-        snakemake_bin = _find_tool("snakemake") or "snakemake"
-        subprocess.run(
-            [snakemake_bin, "-s", "Snakefile", "--unlock", "--cores", "1"],
-            capture_output=True, cwd=str(scratch_dir),
-        )
+            # Unlock the (fresh) scratch dir in case of a leftover lock from a crash.
+            snakemake_bin = _find_tool("snakemake") or "snakemake"
+            subprocess.run(
+                [snakemake_bin, "-s", "Snakefile", "--unlock", "--cores", "1"],
+                capture_output=True, cwd=str(scratch_dir),
+            )
 
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        # Ensure the conda env bin dir is on PATH (for sam2pairwise, bowtie2, etc.)
-        # Use snakemake's location to find the correct env bin dir, since
-        # CONDA_PREFIX may point to the base env rather than primercast.
-        snakemake_path = _find_tool("snakemake")
-        env_bin = str(Path(sys.executable).parent)
-        extra_dirs = [env_bin]
-        if snakemake_path:
-            extra_dirs.append(str(Path(snakemake_path).parent))
-        for d in extra_dirs:
-            if d and d not in env.get("PATH", ""):
-                env["PATH"] = d + os.pathsep + env.get("PATH", "")
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            # Ensure the conda env bin dir is on PATH (for sam2pairwise, bowtie2, etc.)
+            # Use snakemake's location to find the correct env bin dir, since
+            # CONDA_PREFIX may point to the base env rather than primercast.
+            snakemake_path = _find_tool("snakemake")
+            env_bin = str(Path(sys.executable).parent)
+            extra_dirs = [env_bin]
+            if snakemake_path:
+                extra_dirs.append(str(Path(snakemake_path).parent))
+            for d in extra_dirs:
+                if d and d not in env.get("PATH", ""):
+                    env["PATH"] = d + os.pathsep + env.get("PATH", "")
 
-        cmd = _build_command()
+            cmd = _build_command()
 
-        progress_area = st.empty()
-        status_area = st.empty()
+            progress_area = st.empty()
+            status_area = st.empty()
 
-        all_targets = _get_all_targets()
-        show_targets = len(all_targets) > 1
+            all_targets = _get_all_targets()
+            show_targets = len(all_targets) > 1
 
-        completed_rules: set[str] = set()
-        # Per-target tracking: rule_name -> set of completed targets
-        rule_done_targets: dict[str, set[str]] = {}
-        current_rule = rules[0][0] if rules else ""
-        current_target = ""
-        log = ""
-        start_time = time.time()
+            completed_rules: set[str] = set()
+            # Per-target tracking: rule_name -> set of completed targets
+            rule_done_targets: dict[str, set[str]] = {}
+            current_rule = rules[0][0] if rules else ""
+            current_target = ""
+            log = ""
+            start_time = time.time()
 
-        def _finish_current():
-            """Mark the current rule+target as completed."""
-            nonlocal current_target
-            if current_rule and current_target:
-                rule_done_targets.setdefault(current_rule, set()).add(current_target)
-                current_target = ""
+            def _finish_current():
+                """Mark the current rule+target as completed."""
+                nonlocal current_target
+                if current_rule and current_target:
+                    rule_done_targets.setdefault(current_rule, set()).add(current_target)
+                    current_target = ""
 
-        def _render_rule_line(rule_name, label, is_current=False):
-            done_targets = rule_done_targets.get(rule_name, set())
-            is_per_target = rule_name in _PER_TARGET_RULES and show_targets
+            def _render_rule_line(rule_name, label, is_current=False):
+                done_targets = rule_done_targets.get(rule_name, set())
+                is_per_target = rule_name in _PER_TARGET_RULES and show_targets
 
-            if is_per_target:
-                is_done = done_targets >= set(all_targets)
-            else:
-                is_done = rule_name in completed_rules
-
-            if is_done:
                 if is_per_target:
-                    tstr = ", ".join(sorted(done_targets))
-                    return f"✅ &nbsp; {label} — {tstr}"
-                return f"✅ &nbsp; {label}"
-            elif is_current:
-                if is_per_target:
+                    is_done = done_targets >= set(all_targets)
+                else:
+                    is_done = rule_name in completed_rules
+
+                if is_done:
+                    if is_per_target:
+                        tstr = ", ".join(sorted(done_targets))
+                        return f"✅ &nbsp; {label} — {tstr}"
+                    return f"✅ &nbsp; {label}"
+                elif is_current:
+                    if is_per_target:
+                        parts = []
+                        for t in all_targets:
+                            if t in done_targets:
+                                parts.append(f"{t} ✓")
+                            elif t == current_target:
+                                parts.append(f"**{t}**")
+                            else:
+                                parts.append(f"<span style='color:#ccc'>{t}</span>")
+                        tstr = ", ".join(parts)
+                        return f"⏳ &nbsp; **{label}** — {tstr}"
+                    return f"⏳ &nbsp; **{label}** ..."
+                elif is_per_target and done_targets:
+                    # Not current rule but has some targets done (partially complete)
                     parts = []
                     for t in all_targets:
                         if t in done_targets:
                             parts.append(f"{t} ✓")
-                        elif t == current_target:
-                            parts.append(f"**{t}**")
                         else:
                             parts.append(f"<span style='color:#ccc'>{t}</span>")
                     tstr = ", ".join(parts)
-                    return f"⏳ &nbsp; **{label}** — {tstr}"
-                return f"⏳ &nbsp; **{label}** ..."
-            elif is_per_target and done_targets:
-                # Not current rule but has some targets done (partially complete)
-                parts = []
-                for t in all_targets:
-                    if t in done_targets:
-                        parts.append(f"{t} ✓")
-                    else:
-                        parts.append(f"<span style='color:#ccc'>{t}</span>")
-                tstr = ", ".join(parts)
-                return f"⏳ &nbsp; {label} — {tstr}"
-            else:
-                return f"⚪ &nbsp; {label}"
+                    return f"⏳ &nbsp; {label} — {tstr}"
+                else:
+                    return f"⚪ &nbsp; {label}"
 
-        def _update_progress():
-            lines = []
-            for rule_name, label in rules:
-                is_current = rule_name == current_rule
-                lines.append(_render_rule_line(rule_name, label, is_current))
-            progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
+            def _update_progress():
+                lines = []
+                for rule_name, label in rules:
+                    is_current = rule_name == current_rule
+                    lines.append(_render_rule_line(rule_name, label, is_current))
+                progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
 
-        _update_progress()
-        _live_timer(status_area, start_time)
+            _update_progress()
+            _live_timer(status_area, start_time)
 
-        # Own process group, so Stop and the time limit end snakemake's children
-        # without signalling the web server.
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=str(scratch_dir),
-            env=env,
-            text=True,
-            start_new_session=True,
-        )
-        st.session_state.pipeline_pid = proc.pid
+            # Own process group, so Stop and the time limit end snakemake's children
+            # without signalling the web server.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(scratch_dir),
+                env=env,
+                text=True,
+                start_new_session=True,
+            )
+            st.session_state.pipeline_pid = proc.pid
 
-        timed_out = threading.Event()
+            timed_out = threading.Event()
 
-        def _time_out():
-            timed_out.set()
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            def _time_out():
+                timed_out.set()
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
-        limit_timer = threading.Timer(RUN_TIME_LIMIT, _time_out)
-        limit_timer.daemon = True
-        limit_timer.start()
+            limit_timer = threading.Timer(RUN_TIME_LIMIT, _time_out)
+            limit_timer.daemon = True
+            limit_timer.start()
 
-        while proc.poll() is None:
-            line = proc.stdout.readline()
-            if line:
-                log += line
-                log_fh.write(line)
-                stripped = line.strip()
-                if stripped.startswith("rule ") or stripped.startswith("localrule "):
-                    rule_name = stripped.split("rule ")[1].rstrip(":")
-                    # Finish previous rule+target
-                    _finish_current()
-                    if current_rule and current_rule != rule_name:
-                        # Only mark non-per-target rules as completed on transition
-                        if current_rule not in _PER_TARGET_RULES or not show_targets:
-                            completed_rules.add(current_rule)
-                    current_rule = rule_name
-                    current_target = ""
-                    _update_progress()
-                elif stripped.startswith("wildcards:"):
-                    # Parse target from wildcards line (target=, virus=, on=, or filename=)
-                    wc_target = ""
-                    for wc_name in ("target", "virus", "on"):
-                        m = re.search(rf"{wc_name}=(\S+)", stripped)
-                        if m:
-                            wc_target = m.group(1).rstrip(",")
-                            break
-                    if not wc_target:
-                        # Try filename= (format: "virus.target")
-                        m = re.search(r"filename=(\S+)", stripped)
-                        if m:
-                            parts = m.group(1).rstrip(",").split(".")
-                            if len(parts) >= 2:
-                                wc_target = parts[-1]
-                    if wc_target:
-                        current_target = wc_target
+            while proc.poll() is None:
+                line = proc.stdout.readline()
+                if line:
+                    log += line
+                    log_fh.write(line)
+                    stripped = line.strip()
+                    if stripped.startswith("rule ") or stripped.startswith("localrule "):
+                        rule_name = stripped.split("rule ")[1].rstrip(":")
+                        # Finish previous rule+target
+                        _finish_current()
+                        if current_rule and current_rule != rule_name:
+                            # Only mark non-per-target rules as completed on transition
+                            if current_rule not in _PER_TARGET_RULES or not show_targets:
+                                completed_rules.add(current_rule)
+                        current_rule = rule_name
+                        current_target = ""
                         _update_progress()
-                elif "Finished job" in stripped:
-                    _finish_current()
-                    _update_progress()
+                    elif stripped.startswith("wildcards:"):
+                        # Parse target from wildcards line (target=, virus=, on=, or filename=)
+                        wc_target = ""
+                        for wc_name in ("target", "virus", "on"):
+                            m = re.search(rf"{wc_name}=(\S+)", stripped)
+                            if m:
+                                wc_target = m.group(1).rstrip(",")
+                                break
+                        if not wc_target:
+                            # Try filename= (format: "virus.target")
+                            m = re.search(r"filename=(\S+)", stripped)
+                            if m:
+                                parts = m.group(1).rstrip(",").split(".")
+                                if len(parts) >= 2:
+                                    wc_target = parts[-1]
+                        if wc_target:
+                            current_target = wc_target
+                            _update_progress()
+                    elif "Finished job" in stripped:
+                        _finish_current()
+                        _update_progress()
 
-        limit_timer.cancel()
+            limit_timer.cancel()
 
-        # Read remaining output
-        remaining = proc.stdout.read()
-        if remaining:
-            log += remaining
-            log_fh.write(remaining)
-        log_fh.close()
+            # Read remaining output
+            remaining = proc.stdout.read()
+            if remaining:
+                log += remaining
+                log_fh.write(remaining)
+            log_fh.close()
 
-        # Mark last rule as complete
-        _finish_current()
-        if current_rule:
-            if current_rule not in _PER_TARGET_RULES or not show_targets:
-                completed_rules.add(current_rule)
-        # Mark per-target rules with any completed targets as done
-        # (pipeline finished, so all instances have run)
-        for rn, _ in rules:
-            if rn in _PER_TARGET_RULES and rule_done_targets.get(rn):
-                completed_rules.add(rn)
+            # Mark last rule as complete
+            _finish_current()
+            if current_rule:
+                if current_rule not in _PER_TARGET_RULES or not show_targets:
+                    completed_rules.add(current_rule)
+            # Mark per-target rules with any completed targets as done
+            # (pipeline finished, so all instances have run)
+            for rn, _ in rules:
+                if rn in _PER_TARGET_RULES and rule_done_targets.get(rn):
+                    completed_rules.add(rn)
 
-        rc = proc.returncode
-        st.session_state.pipeline_running = False
-        st.session_state.pipeline_return_code = rc
+            rc = proc.returncode
+            st.session_state.pipeline_running = False
+            st.session_state.pipeline_return_code = rc
 
-        # Clean up the scratch dir now that the subprocess is done — it held
-        # only the generated Snakefile/params.txt and .snakemake lock, all of
-        # which are ephemeral. Outputs landed in the shared RUNS_DIR via symlink.
-        scratch_path = st.session_state.pop("pipeline_scratch_dir", None)
-        if scratch_path:
-            import shutil as _shutil
-            _shutil.rmtree(scratch_path, ignore_errors=True)
-        st.session_state.pipeline_log = log
-        st.session_state.pipeline_completed_rules = completed_rules
-        st.session_state.pipeline_rule_done_targets = rule_done_targets
+            # Clean up the scratch dir now that the subprocess is done — it held
+            # only the generated Snakefile/params.txt and .snakemake lock, all of
+            # which are ephemeral. Outputs landed in the shared RUNS_DIR via symlink.
+            scratch_path = st.session_state.pop("pipeline_scratch_dir", None)
+            if scratch_path:
+                import shutil as _shutil
+                _shutil.rmtree(scratch_path, ignore_errors=True)
+            st.session_state.pipeline_log = log
+            st.session_state.pipeline_completed_rules = completed_rules
+            st.session_state.pipeline_rule_done_targets = rule_done_targets
 
-        elapsed = int(time.time() - start_time)
-        mins, secs = divmod(elapsed, 60)
-        st.session_state.pipeline_elapsed = f"Completed in {mins}m {secs}s"
-        st.session_state.pipeline_timed_out = timed_out.is_set()
+            elapsed = int(time.time() - start_time)
+            mins, secs = divmod(elapsed, 60)
+            st.session_state.pipeline_elapsed = f"Completed in {mins}m {secs}s"
+            st.session_state.pipeline_timed_out = timed_out.is_set()
 
-        warnings = _pipeline_warnings()
-        limit_minutes = RUN_TIME_LIMIT // 60
-        _save_run_config(status=(f"stopped at the {limit_minutes}-minute time limit"
-                                 if timed_out.is_set()
-                                 else f"failed (exit code {rc})" if rc != 0
-                                 else "succeeded with warnings" if warnings
-                                 else "succeeded"))
-        # Rerun so the Run/Stop/Back buttons, drawn before the run started, are
-        # redrawn as idle; the branch below then shows the outcome.
-        st.rerun()
+            warnings = _pipeline_warnings()
+            limit_minutes = RUN_TIME_LIMIT // 60
+            _save_run_config(status=(f"stopped at the {limit_minutes}-minute time limit"
+                                     if timed_out.is_set()
+                                     else f"failed (exit code {rc})" if rc != 0
+                                     else "succeeded with warnings" if warnings
+                                     else "succeeded"))
+            # Rerun so the Run/Stop/Back buttons, drawn before the run started, are
+            # redrawn as idle; the branch below then shows the outcome.
+            st.rerun()
+        finally:
+            # Streamlit aborts this script run with StopException when the
+            # browser tab closes or the user navigates away, and the normal
+            # path above ends in st.rerun() (RerunException) -- so control
+            # leaves this block without reaching any trailing cleanup. The
+            # subprocess was started with start_new_session=True, so an
+            # abandoned run would otherwise keep every core it was given and
+            # its tmpfs scratch until the time limit fired, long after its
+            # queue slot had been handed to someone else.
+            if limit_timer is not None:
+                limit_timer.cancel()
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            # A no-op on the normal path, which has already popped this; on an
+            # abandoned run it reclaims the scratch dir, which on Cloud Run is
+            # tmpfs and so counts against the instance's memory.
+            scratch_path = st.session_state.pop("pipeline_scratch_dir", None)
+            if scratch_path:
+                shutil.rmtree(scratch_path, ignore_errors=True)
+            run_gate.release(ticket)
+            st.session_state.pop("run_ticket", None)
 
     # Show previous run result if not currently running
     elif not running and st.session_state.get("pipeline_return_code") is not None:
