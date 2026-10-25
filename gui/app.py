@@ -687,6 +687,26 @@ def _init_params():
         st.session_state.params = dict(DEFAULT_PARAMS)
 
 
+# Every widget on the parameters page is keyed with this prefix, and the page
+# owns the prefix exclusively -- _reset_params_to_defaults() clears by it.
+PARAM_WIDGET_KEY_PREFIX = "p_"
+
+
+def _reset_params_to_defaults() -> None:
+    """Restore DEFAULT_PARAMS, including what the widgets display.
+
+    Streamlit gives a keyed widget's stored value precedence over its `value=`
+    argument, so resetting st.session_state.params on its own is invisible:
+    each widget redraws from its own key and immediately writes the stale
+    value back into params. The widget keys have to be dropped too, which
+    makes the next render fall back to `value=` -- i.e. the defaults.
+    """
+    st.session_state.params = dict(DEFAULT_PARAMS)
+    for key in [k for k in st.session_state
+                if str(k).startswith(PARAM_WIDGET_KEY_PREFIX)]:
+        del st.session_state[key]
+
+
 def _find_tool(name: str) -> str | None:
     """Find a tool in PATH or the current Python environment's bin directory."""
     found = shutil.which(name)
@@ -1645,8 +1665,13 @@ def _tab_parameters(mode: str = "design"):
     p = st.session_state.params
 
     if st.button("Reset to defaults"):
-        st.session_state.params = dict(DEFAULT_PARAMS)
+        _reset_params_to_defaults()
+        st.session_state["_params_reset_done"] = True
         st.rerun()
+    # Shown after the rerun: with every control already at its default, a
+    # reset is otherwise indistinguishable from the button doing nothing.
+    if st.session_state.pop("_params_reset_done", False):
+        st.success("Parameters reset to defaults.")
 
     if mode == "evaluate":
         # Evaluate only needs amplicon length parameters
