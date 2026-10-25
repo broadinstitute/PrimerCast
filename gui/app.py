@@ -446,11 +446,23 @@ def _decompress_bz2_fastas(directory: Path) -> None:
     """Auto-decompress any .fa.bz2 files that don't have a corresponding .fa."""
     import bz2 as _bz2
     for p in directory.iterdir():
-        if p.name.endswith(".fa.bz2") and p.is_file():
+        if p.name.lower().endswith(".fa.bz2") and p.is_file():
             fa_path = directory / p.name[:-4]  # strip .bz2
             if not fa_path.exists():
                 with open(p, "rb") as fin, open(fa_path, "wb") as fout:
                     fout.write(_bz2.decompress(fin.read()))
+
+
+# Plain-FASTA extensions, lowercase. Every comparison against them goes through
+# _fasta_suffix(), because uploads arrive as .fa, .FA, .Fasta, ... and a
+# case-sensitive check would silently drop the ones that don't match.
+FASTA_EXTENSIONS = (".fa", ".fasta", ".fna")
+
+
+def _fasta_suffix(name: str) -> str | None:
+    """Return ``name``'s plain-FASTA extension, lowercased, else None."""
+    suffix = Path(name).suffix.lower()
+    return suffix if suffix in FASTA_EXTENSIONS else None
 
 
 # Extensions every FASTA uploader accepts. Compressed forms matter more than
@@ -480,8 +492,6 @@ def _render_upload_note() -> None:
         "For anything larger, compress it first and upload the compressed "
         "file — it is decompressed here automatically:\n\n"
         "`gzip -k yourfile.fa` &nbsp;or&nbsp; `bzip2 -k yourfile.fa`\n\n"
-        "FASTA compresses well, so this clears the limit for genome-scale "
-        "files — the 63 MB human transcriptome is about 18 MB as `.fa.bz2`."
     )
 
 
@@ -500,12 +510,58 @@ def _decompress_upload(name: str, data: bytes) -> tuple[str, bytes] | None:
         if lowered.endswith(suffix):
             inner = name[: -len(suffix)]
             # Accept both `X.fa.bz2` and a bare `X.bz2`.
-            stem = Path(inner).stem if Path(inner).suffix.lower() in (
-                ".fa", ".fasta", ".fna") else inner
+            stem = Path(inner).stem if _fasta_suffix(inner) else inner
             return stem, decompress(data)
-    if Path(name).suffix.lower() in (".fa", ".fasta", ".fna"):
+    if _fasta_suffix(name):
         return Path(name).stem, data
     return None
+
+
+def _save_uploaded_fastas(files, saved_key: str = "_fasta_saved_ids") -> bool:
+    """Save uploaded FASTAs into FASTA_DIR, expanding .gz/.bz2 along the way.
+
+    Streamlit hands the same UploadedFile objects back on every rerun, so work
+    is keyed on (name, size) to avoid rewriting a genome on each redraw --
+    which also keeps callers that rerun on a True return from looping.
+    """
+    seen = st.session_state.setdefault(saved_key, set())
+    saved = False
+    for upload in files:
+        file_id = (upload.name, upload.size)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        try:
+            decoded = _decompress_upload(upload.name, upload.getvalue())
+        except (OSError, EOFError, ValueError) as exc:
+            st.error(f"Could not read `{upload.name}` — is it a valid archive? ({exc})")
+            continue
+        if decoded is None:
+            st.error(
+                f"`{upload.name}` is not a FASTA file. Accepted extensions: "
+                + ", ".join(f"`.{ext}`" for ext in FASTA_UPLOAD_TYPES)
+            )
+            continue
+        stem, data = decoded
+        # Always land as lowercase `.fa`. The Snakefile reads targets from
+        # `target_seqs/original/{name}.fa` and only renames `.fasta`/`.fna`
+        # spelled in lowercase, so an uploaded `X.FASTA` would list fine in the
+        # GUI and then fail the run with a missing input.
+        dest = _safe_path_under(FASTA_DIR, f"{stem}.fa")
+        if dest is None:
+            st.error(f"Rejected unsafe file name `{upload.name}`.")
+            continue
+        FASTA_DIR.mkdir(parents=True, exist_ok=True)
+        _save_fasta_bytes(dest, data)
+        # Drop a same-stem leftover under another extension, so lookups cannot
+        # resolve to the stale copy.
+        for other in FASTA_DIR.iterdir():
+            if (other != dest and other.is_file() and other.stem == stem
+                    and _fasta_suffix(other.name)):
+                other.unlink()
+        saved = True
+        st.success(f"Saved **{stem}** ({_format_size(len(data))})")
+    return saved
 
 
 def _available_fasta() -> list[str]:
@@ -515,21 +571,31 @@ def _available_fasta() -> list[str]:
     _decompress_bz2_fastas(FASTA_DIR)
     return sorted({
         p.stem for p in FASTA_DIR.iterdir()
-        if p.suffix in (".fa", ".fasta", ".fna") and p.is_file()
+        if _fasta_suffix(p.name) and p.is_file()
     })
+
+
+def _fasta_path(stem: str) -> Path | None:
+    """Locate the plain FASTA for ``stem``, whatever case its extension uses.
+
+    Uploads are normalized to `.fa`, but files placed in target_seqs/original/
+    by hand can be `.FASTA`, `.Fna` and so on, and must still resolve.
+    """
+    if not FASTA_DIR.exists():
+        return None
+    matches = [
+        p for p in FASTA_DIR.iterdir()
+        if p.is_file() and p.stem == stem and _fasta_suffix(p.name)
+    ]
+    # Keep the historical .fa > .fasta > .fna preference when several exist.
+    matches.sort(key=lambda p: FASTA_EXTENSIONS.index(_fasta_suffix(p.name)))
+    return matches[0] if matches else None
 
 
 def _fasta_info(stem: str) -> dict:
     """Return sequence count and file size for a FASTA file."""
-    path = FASTA_DIR / f"{stem}.fa"
-    if not path.exists():
-        # try other extensions
-        for ext in (".fasta", ".fna"):
-            alt = FASTA_DIR / f"{stem}{ext}"
-            if alt.exists():
-                path = alt
-                break
-    if not path.exists():
+    path = _fasta_path(stem)
+    if path is None:
         return {"seqs": 0, "size": 0, "max_len": 0}
     stat = path.stat()
     n_seqs, max_len = _fasta_stats(str(path), stat.st_mtime, stat.st_size)
@@ -1474,12 +1540,11 @@ def _tab_files():
         col2.write(f"{info['seqs']} sequences")
         col3.write(_format_size(info["size"]))
         if col4.button("Delete", key=f"del_{stem}"):
-            # Find and delete the file
-            for ext in (".fa", ".fasta", ".fna"):
-                p = FASTA_DIR / f"{stem}{ext}"
-                if p.exists():
-                    p.unlink()
-                    break
+            # Remove every extension the stem resolves under, not just the
+            # first: the listing keys on the stem, so leaving one behind makes
+            # Delete look like it did nothing.
+            while (p := _fasta_path(stem)) is not None:
+                p.unlink()
             st.rerun()
 
 
