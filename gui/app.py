@@ -201,6 +201,18 @@ st.set_page_config(
     layout="wide",
 )
 
+# Streamlit prints "Limit 200MB per file" under every uploader, taken from its
+# own server.maxUploadSize. Locally that is true but irrelevant; on Cloud Run
+# it is simply wrong, since the ingress rejects anything over 32 MiB first.
+# _render_upload_note() states the real limit and what to do about it, so hide
+# Streamlit's line rather than show two different numbers.
+st.markdown(
+    "<style>"
+    "[data-testid='stFileUploaderDropzoneInstructions'] small { display: none; }"
+    "</style>",
+    unsafe_allow_html=True,
+)
+
 # ---------------------------------------------------------------------------
 # Navigation helpers
 # ---------------------------------------------------------------------------
@@ -439,6 +451,61 @@ def _decompress_bz2_fastas(directory: Path) -> None:
             if not fa_path.exists():
                 with open(p, "rb") as fin, open(fa_path, "wb") as fout:
                     fout.write(_bz2.decompress(fin.read()))
+
+
+# Extensions every FASTA uploader accepts. Compressed forms matter more than
+# convenience here: Cloud Run rejects any request body over 32 MiB with a 413
+# before Streamlit sees it, so a genome-scale FASTA can only be uploaded
+# compressed. HUMAN.fa is 63 MB raw but 18 MB as .fa.bz2.
+FASTA_UPLOAD_TYPES = ["fa", "fasta", "fna", "bz2", "gz"]
+
+# Cloud Run rejects any request body over 32 MiB at the ingress, before the
+# container sees it, so this is a hard ceiling we cannot raise from here. The
+# image pins Streamlit's own limit to match (STREAMLIT_SERVER_MAX_UPLOAD_SIZE),
+# which turns a silent 413 into a readable in-browser refusal -- but Streamlit's
+# wording is just "File must be 32.0MB or smaller", which does not tell anyone
+# what to do about it. Hence the note below, shown next to every uploader.
+UPLOAD_SIZE_LIMIT_MB = 32
+
+UPLOAD_SIZE_HINT = (
+    f"Files over {UPLOAD_SIZE_LIMIT_MB} MB must be compressed — upload the "
+    ".gz or .bz2 and it is expanded automatically."
+)
+
+
+def _render_upload_note() -> None:
+    """Explain the upload ceiling and how to get a large genome past it."""
+    st.caption(
+        f":material/info: **Uploads are limited to {UPLOAD_SIZE_LIMIT_MB} MB.** "
+        "For anything larger, compress it first and upload the compressed "
+        "file — it is decompressed here automatically:\n\n"
+        "`gzip -k yourfile.fa` &nbsp;or&nbsp; `bzip2 -k yourfile.fa`\n\n"
+        "FASTA compresses well, so this clears the limit for genome-scale "
+        "files — the 63 MB human transcriptome is about 18 MB as `.fa.bz2`."
+    )
+
+
+def _decompress_upload(name: str, data: bytes) -> tuple[str, bytes] | None:
+    """Map an uploaded FASTA's (name, bytes) to its stem and plain-text bytes.
+
+    Returns ``None`` for an extension we do not accept, so callers can report
+    it. Compressed payloads are expanded here; everything downstream (bowtie2,
+    mafft, the sequence readers) only ever sees plain FASTA.
+    """
+    lowered = name.lower()
+    for suffix, decompress in (
+        (".bz2", lambda b: __import__("bz2").decompress(b)),
+        (".gz", lambda b: __import__("gzip").decompress(b)),
+    ):
+        if lowered.endswith(suffix):
+            inner = name[: -len(suffix)]
+            # Accept both `X.fa.bz2` and a bare `X.bz2`.
+            stem = Path(inner).stem if Path(inner).suffix.lower() in (
+                ".fa", ".fasta", ".fna") else inner
+            return stem, decompress(data)
+    if Path(name).suffix.lower() in (".fa", ".fasta", ".fna"):
+        return Path(name).stem, data
+    return None
 
 
 def _available_fasta() -> list[str]:
@@ -1381,46 +1448,14 @@ def _tab_files():
     # Upload
     uploaded = st.file_uploader(
         "Upload FASTA file(s)",
-        type=["fa", "fasta", "fna", "bz2"],
+        type=FASTA_UPLOAD_TYPES,
         accept_multiple_files=True,
         key="fasta_upload",
+        help=UPLOAD_SIZE_HINT,
     )
     if uploaded:
-        import bz2 as _bz2
-        already_saved = st.session_state.get("_fasta_saved_ids", set())
-        new_saved = set()
-        for f in uploaded:
-            fid = (f.name, f.size)
-            if fid in already_saved:
-                continue
-            p = Path(f.name)
-            # Handle .fa.bz2 files
-            if p.name.endswith(".fa.bz2"):
-                stem = p.name[:-7]  # strip .fa.bz2
-                dest = _safe_path_under(FASTA_DIR, stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, _bz2.decompress(f.getvalue()))
-            elif p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                st.error(f"Unsupported extension: {p.suffix}")
-                continue
-            else:
-                # Normalize to .fa extension
-                dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, f.getvalue())
-            # Remove any leftover files with other FASTA extensions
-            for ext in (".fasta", ".fna"):
-                old = FASTA_DIR / (p.stem + ext)
-                if old.exists():
-                    old.unlink()
-            st.success(f"Saved {dest.name}")
-            new_saved.add(fid)
-        if new_saved:
-            st.session_state["_fasta_saved_ids"] = already_saved | new_saved
+        _save_uploaded_fastas(uploaded)
+    _render_upload_note()
 
     st.divider()
 
@@ -3514,36 +3549,15 @@ def _page_select_target():
         st.markdown("**Upload FASTA file**")
         uploaded = st.file_uploader(
             "Upload FASTA file(s)",
-            type=["fa", "fasta", "fna"],
+            type=FASTA_UPLOAD_TYPES,
             accept_multiple_files=True,
             key="fasta_upload",
             label_visibility="collapsed",
+            help=UPLOAD_SIZE_HINT,
         )
-        if uploaded:
-            already_saved = st.session_state.get("_fasta_saved_ids", set())
-            new_saved = set()
-            for f in uploaded:
-                fid = (f.name, f.size)
-                if fid in already_saved:
-                    continue
-                p = Path(f.name)
-                if p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                    st.error(f"Unsupported extension: {p.suffix}")
-                    continue
-                dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, f.getvalue())
-                for ext in (".fasta", ".fna"):
-                    old = FASTA_DIR / (p.stem + ext)
-                    if old.exists():
-                        old.unlink()
-                st.success(f"Saved {dest.name}")
-                new_saved.add(fid)
-            if new_saved:
-                st.session_state["_fasta_saved_ids"] = already_saved | new_saved
-                st.rerun()
+        if uploaded and _save_uploaded_fastas(uploaded):
+            st.rerun()
+        _render_upload_note()
 
     with add_col2:
         st.markdown("**Fetch from NCBI Virus (using gget)**")
@@ -3981,36 +3995,15 @@ def _page_select_offtarget():
             st.markdown("**Upload FASTA file**")
             uploaded_cross = st.file_uploader(
                 "Upload FASTA",
-                type=["fa", "fasta", "fna"],
+                type=FASTA_UPLOAD_TYPES,
                 accept_multiple_files=True,
                 key="cross_fasta_upload",
                 label_visibility="collapsed",
+                help=UPLOAD_SIZE_HINT,
             )
-            if uploaded_cross:
-                already_saved = st.session_state.get("_fasta_saved_ids", set())
-                new_saved = set()
-                for f in uploaded_cross:
-                    fid = (f.name, f.size)
-                    if fid in already_saved:
-                        continue
-                    p = Path(f.name)
-                    if p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                        st.error(f"Unsupported extension: {p.suffix}")
-                        continue
-                    dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                    if not dest:
-                        st.error(f"Invalid filename: {f.name}")
-                        continue
-                    _save_fasta_bytes(dest, f.getvalue())
-                    for ext in (".fasta", ".fna"):
-                        old = FASTA_DIR / (p.stem + ext)
-                        if old.exists():
-                            old.unlink()
-                    st.success(f"Saved {dest.name}")
-                    new_saved.add(fid)
-                if new_saved:
-                    st.session_state["_fasta_saved_ids"] = already_saved | new_saved
-                    st.rerun()
+            if uploaded_cross and _save_uploaded_fastas(uploaded_cross):
+                st.rerun()
+            _render_upload_note()
 
         with add_cross_col2:
             st.markdown("**Fetch from NCBI Virus (using gget)**")
@@ -4050,36 +4043,15 @@ def _page_select_offtarget():
     with st.expander("Upload host sequences"):
         uploaded_host = st.file_uploader(
             "Upload FASTA",
-            type=["fa", "fasta", "fna"],
+            type=FASTA_UPLOAD_TYPES,
             accept_multiple_files=True,
             key="host_fasta_upload",
             label_visibility="collapsed",
+            help=UPLOAD_SIZE_HINT,
         )
-        if uploaded_host:
-            already_saved = st.session_state.get("_fasta_saved_ids", set())
-            new_saved = set()
-            for f in uploaded_host:
-                fid = (f.name, f.size)
-                if fid in already_saved:
-                    continue
-                p = Path(f.name)
-                if p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                    st.error(f"Unsupported extension: {p.suffix}")
-                    continue
-                dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, f.getvalue())
-                for ext in (".fasta", ".fna"):
-                    old = FASTA_DIR / (p.stem + ext)
-                    if old.exists():
-                        old.unlink()
-                st.success(f"Saved {dest.name}")
-                new_saved.add(fid)
-            if new_saved:
-                st.session_state["_fasta_saved_ids"] = already_saved | new_saved
-                st.rerun()
+        if uploaded_host and _save_uploaded_fastas(uploaded_host):
+            st.rerun()
+        _render_upload_note()
 
     st.divider()
 

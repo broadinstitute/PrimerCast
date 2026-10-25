@@ -45,6 +45,13 @@ ENV STREAMLIT_SERVER_PORT=8080
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+# Cloud Run returns a bare 413 for any request body over 32 MiB, before the
+# container sees it -- so Streamlit's 200 MB default is a trap: the upload
+# looks accepted, then dies with no in-app error. Matching the limit here makes
+# the browser refuse the file up front with a readable message, and points the
+# user at the direct-to-bucket path (gui/large_upload.py). Image-only, so local
+# runs -- which have no ingress in front of them -- keep the default.
+ENV STREAMLIT_SERVER_MAX_UPLOAD_SIZE=32
 
 EXPOSE 8080
 
