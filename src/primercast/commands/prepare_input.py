@@ -157,7 +157,13 @@ def run(args):
         unit="primers",
     )
 
-    if args.exact:
+    # getattr, like fail_if_empty above: quick-design calls run() in-process with
+    # a Namespace it builds by hand, so only the required arguments are
+    # guaranteed to be there. A bare args.exact crashed every multi-sequence
+    # target. False is also the right value for those callers -- quick design
+    # tiles from one representative and aligns against every variant, where a
+    # mismatched alignment is real coverage, not a chance match.
+    if getattr(args, "exact", False):
         # Standard design tiles its primers out of this one sequence, so each has
         # exactly one true binding site and every imperfect alignment is a chance
         # match elsewhere on the genome. Drop them before pairing, not after: the
