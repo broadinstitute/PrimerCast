@@ -484,6 +484,12 @@ UPLOAD_SIZE_HINT = (
     ".gz or .bz2 and it is expanded automatically."
 )
 
+# Ceiling on the off-target set. Counted across cross-reactivity *and* host
+# together, because the Snakefile runs them as one list (OFF_TARGETS = CROSS +
+# HOST) and each entry costs its own bowtie2 index build plus one alignment per
+# primer set -- so it is the combined count that decides how long a run takes.
+MAX_OFFTARGET_FILES = 10
+
 
 def _render_upload_note() -> None:
     """Explain the upload ceiling and how to get a large genome past it."""
@@ -4051,9 +4057,55 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                 shutil.rmtree(gget_tmp, ignore_errors=True)
 
 
+# The two multiselects on the off-target page. They share one budget, so each
+# one's guard has to look at the other.
+OFFTARGET_SELECT_KEYS = ("cross_select", "host_select")
+
+
+@st.dialog("Off-target limit reached")
+def _offtarget_limit_dialog() -> None:
+    st.warning(
+        f"You can evaluate at most **{MAX_OFFTARGET_FILES}** off-target sequence "
+        "files in one run — cross-reactivity and host sequences count together."
+    )
+    st.caption(
+        "The sequence that went over the limit was not added. Remove one you "
+        "already picked if you want to swap it in."
+    )
+    if st.button("OK", type="primary"):
+        st.rerun()
+
+
+def _enforce_offtarget_limit(changed_key: str) -> None:
+    """Roll back an off-target pick that would push the run past the cap.
+
+    Wired as the multiselects' ``on_change``. Callbacks fire before the script
+    body, which is the only point where this is possible: writing to a widget's
+    own session_state key raises once that widget has been instantiated for the
+    run, and here it has not been yet, so the control redraws without the
+    rejected entry.
+    """
+    others = sum(len(st.session_state.get(key, []))
+                 for key in OFFTARGET_SELECT_KEYS if key != changed_key)
+    allowance = max(0, MAX_OFFTARGET_FILES - others)
+    picked = st.session_state.get(changed_key, [])
+    if len(picked) <= allowance:
+        return
+    # multiselect keeps the order things were picked in, so dropping the tail
+    # removes exactly what the user just added rather than an arbitrary choice.
+    st.session_state[changed_key] = picked[:allowance]
+    st.session_state["_offtarget_limit_hit"] = True
+
+
 def _page_select_offtarget():
     """Page for selecting off-target (cross-reactivity) and host sequences."""
     _render_workflow_progress("select_offtarget")
+
+    # Popped rather than left set: Streamlit closes a dialog by simply not
+    # re-rendering it, so holding the flag would reopen the modal on the next
+    # interaction after an Esc/X dismissal.
+    if st.session_state.pop("_offtarget_limit_hit", False):
+        _offtarget_limit_dialog()
 
     workflow = st.session_state.get("workflow", "design")
     workflow_label = {"design": "Design", "evaluate": "Evaluate", "monitor": "Monitor"}[workflow]
@@ -4062,6 +4114,10 @@ def _page_select_offtarget():
     st.markdown(
         "Optionally specify sequences to check for cross-reactivity or host background. "
         "You can skip this step if not needed."
+    )
+    st.caption(
+        f"Up to **{MAX_OFFTARGET_FILES}** sequence files per run, counting "
+        "cross-reactivity and host together."
     )
 
     st.divider()
@@ -4093,6 +4149,8 @@ def _page_select_offtarget():
             options=cross_labels,
             key="cross_select",
             placeholder="Choose pathogens to avoid...",
+            on_change=_enforce_offtarget_limit,
+            args=("cross_select",),
         )
         st.session_state.cross = [label.split("  (")[0] for label in selected_cross]
     else:
@@ -4145,6 +4203,8 @@ def _page_select_offtarget():
             options=host_labels,
             key="host_select",
             placeholder="Choose host genome...",
+            on_change=_enforce_offtarget_limit,
+            args=("host_select",),
         )
         st.session_state.host = [label.split("  (")[0] for label in selected_host]
     else:
@@ -4167,6 +4227,19 @@ def _page_select_offtarget():
 
     st.divider()
 
+    # Backstop for selections the on_change guard never saw: a restored session
+    # repopulates `cross`/`host`, which seed the multiselects above directly, so
+    # an over-limit set saved before this cap existed would otherwise sail
+    # through to the run.
+    n_offtarget = len(st.session_state.get("cross", [])) + len(st.session_state.get("host", []))
+    over_limit = n_offtarget > MAX_OFFTARGET_FILES
+    if over_limit:
+        st.error(
+            f"{n_offtarget} off-target sequences selected, but a run allows at "
+            f"most {MAX_OFFTARGET_FILES}. Remove "
+            f"{n_offtarget - MAX_OFFTARGET_FILES} to continue."
+        )
+
     # --- Back / Continue ---
     col_back, col_cont = st.columns(2)
     with col_back:
@@ -4174,7 +4247,8 @@ def _page_select_offtarget():
             _navigate("select_target")
             st.rerun()
     with col_cont:
-        if st.button("Continue →", type="primary", use_container_width=True):
+        if st.button("Continue →", type="primary", use_container_width=True,
+                     disabled=over_limit):
             if workflow == "evaluate":
                 _navigate("eval_primer")
             else:
