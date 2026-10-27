@@ -3153,6 +3153,19 @@ def _tab_results():
             )
 
     if past_runs:
+        # A keyed selectbox takes its value from session_state and ignores
+        # `index=`, so without this the page keeps showing whichever run was
+        # selected last time -- and the assignment below writes that stale id
+        # back into run_id, which the params.txt download and the error report
+        # also read. Follow the pipeline whenever it finishes a new run; a
+        # manual pick afterwards still sticks, because _results_shown_run has
+        # already caught up by then.
+        latest_run = st.session_state.get("pipeline_run_id", "")
+        if (latest_run and latest_run in past_runs
+                and st.session_state.get("_results_shown_run") != latest_run):
+            st.session_state["results_run_selector"] = latest_run
+            st.session_state["_results_shown_run"] = latest_run
+
         # Default to current run_id if it exists in the list
         default_idx = 0
         if run_id in past_runs:
@@ -3252,8 +3265,17 @@ def _tab_results():
             options=xlsx_labels,
             key="result_xlsx",
         )
+        # Streamlit only resets a stale keyed selection to `index=` from 1.54
+        # on; before that the stored label survives even when it is gone from
+        # options, and a bare next() would raise StopIteration and take the
+        # whole results section down with it. Rescue is when that bites: it
+        # writes `<name>_final.xlsx` and then renames it over `<name>.xlsx`,
+        # so a label the user selected mid-run can vanish under them.
+        xf = next((f for f in xlsx_files if f.stem == selected_label), None)
+        if xf is None:
+            xf = xlsx_files[0]
+            selected_label = xf.stem
         if selected_label:
-            xf = next(f for f in xlsx_files if f.stem == selected_label)
             try:
                 wb = load_workbook(xf, read_only=True)
                 ws = wb["summary"]

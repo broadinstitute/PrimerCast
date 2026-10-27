@@ -3,7 +3,9 @@
 import argparse
 import ast
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -277,7 +279,10 @@ def _merge_final_xlsx(original_dir, rescue_dir):
     rescue_dir = Path(rescue_dir)
     updated_count = 0
 
-    for orig_xlsx in original_dir.glob("*.xlsx"):
+    # Materialize the listing before writing anything: the merged workbooks
+    # land in this same directory tree, and a lazy glob may or may not yield
+    # files created while it is still running.
+    for orig_xlsx in sorted(original_dir.glob("*.xlsx")):
         rescue_xlsx = rescue_dir / orig_xlsx.name
         if not rescue_xlsx.exists():
             continue
@@ -308,25 +313,27 @@ def _merge_final_xlsx(original_dir, rescue_dir):
                                       header=None)
         _update_summary_sensitivity(orig_summary, orig_detail)
 
-        final_path = original_dir / orig_xlsx.name.replace(".xlsx", "_final.xlsx")
-        with pd.ExcelWriter(final_path, engine="openpyxl") as writer:
+        # Build the merged workbook inside rescue_dir (same filesystem, and
+        # deleted below), then swap it over the original with os.replace,
+        # which is atomic on POSIX. The previous version wrote
+        # `<name>_final.xlsx` next to the original and renamed it in a second
+        # pass, which had two problems: the report directory briefly listed
+        # both files -- and that directory is exactly what the GUI results
+        # page globs, so a user could select a name that then vanished -- and
+        # the second pass matched `*_final.xlsx`, so a primer set genuinely
+        # named `<something>_final` would be renamed over a real report.
+        merged_path = rescue_dir / f"merged_{orig_xlsx.name}"
+        with pd.ExcelWriter(merged_path, engine="openpyxl") as writer:
             orig_summary.to_excel(writer, sheet_name="summary",
                                   index=False, header=False)
             orig_detail.to_excel(writer, sheet_name="detail", index=False)
 
-        _apply_detail_formatting(final_path)
+        _apply_detail_formatting(merged_path)
+        os.replace(merged_path, orig_xlsx)
 
         updated_count += n_replaced
         print(f"  {orig_xlsx.name}: {n_replaced} row(s) rescued")
 
-    # Rename _final.xlsx over original, remove rescue folder
-    for final_xlsx in original_dir.glob("*_final.xlsx"):
-        orig_name = final_xlsx.name.replace("_final.xlsx", ".xlsx")
-        orig_path = original_dir / orig_name
-        orig_path.unlink(missing_ok=True)
-        final_xlsx.rename(orig_path)
-
-    import shutil
     if rescue_dir.exists():
         shutil.rmtree(rescue_dir)
 
