@@ -753,12 +753,25 @@ rule prepare_input:
         # Design on-target pairing must yield pairs; stop with an explanation if
         # not. Off-target references are expected to yield none, and evaluate
         # mode still reports (0 coverage, with a warning) instead of stopping.
-        fail_arg=lambda wc: "--fail-if-empty" if wc.virus == wc.target else ""
+        fail_arg=lambda wc: "--fail-if-empty" if wc.virus == wc.target else "",
+        # Standard design targets hold one sequence (STANDARD_TARGETS above) and
+        # `generate` tiles the primers straight out of it, so a primer's perfect
+        # alignment is its only real binding site. bowtie2 is run permissively
+        # enough to also report ~6-mismatch chance matches, and pairing crosses
+        # every forward alignment with every reverse one, so those inflate the
+        # candidate table several-fold and are scored as if real. Keep the
+        # tolerance everywhere it means something: off-target references need it
+        # to catch near-miss cross-reactivity, and evaluate mode scores primers
+        # that were not tiled from the reference at all.
+        exact_arg=lambda wc: (
+            "--exact" if (not EVALUATE and wc.virus == wc.target) else ""
+        )
     shell:
         "primercast prepare-input "
         "--in '{input.mapped}' {params.prev_arg} --out '{output}' "
         "--ref '{input.ref}' --reftype {params.ref_type} "
-        "--features '{input.features}' --params '{PARAMS}' {params.fail_arg}"
+        "--features '{input.features}' --params '{PARAMS}' "
+        "{params.fail_arg} {params.exact_arg}"
 
 
 rule evaluate:

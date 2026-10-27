@@ -48,6 +48,12 @@ amplicons and computes amplicon-level features.
         "--fail-if-empty", action="store_true",
         help="Exit with an explanation if no primer pairs form (used for on-target references)",
     )
+    parser.add_argument(
+        "--exact", action="store_true",
+        help="Keep only perfect alignments (no mismatches, no indels). Standard design "
+             "passes this for its on-target reference, where every primer was tiled from "
+             "that sequence and so has exactly one true binding site.",
+    )
     parser.set_defaults(func=run)
 
 
@@ -138,6 +144,35 @@ def run(args):
     maptbl['mm'] = maptbl['pseq'].str.len() - maptbl['match'].str.count(r'\|') - maptbl['indel']
     maptbl = maptbl.join(feats[['forrev', 'len', 'Tm', 'GC']], on='pname')
 
+    def _n_primers(df, forrev=None):
+        if forrev is not None:
+            df = df[df['forrev'] == forrev]
+        return df['pname'].nunique()
+
+    n_aligned = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
+    diag.record(
+        f"Primer alignments to {ref_name}", min(n_aligned),
+        breakdown={"forward": n_aligned[0], "reverse": n_aligned[1]},
+        hint="Pairs need at least one forward and one reverse primer that align.",
+        unit="primers",
+    )
+
+    if args.exact:
+        # Standard design tiles its primers out of this one sequence, so each has
+        # exactly one true binding site and every imperfect alignment is a chance
+        # match elsewhere on the genome. Drop them before pairing, not after: the
+        # loop below crosses every forward alignment with every reverse one, so
+        # the spare hits would multiply.
+        maptbl = maptbl[(maptbl['mm'] == 0) & (maptbl['indel'] == 0)]
+        n_exact = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
+        diag.record(
+            "Exact binding sites", min(n_exact),
+            breakdown={"forward": n_exact[0], "reverse": n_exact[1]},
+            hint="Primers are tiled from the target, so only a perfect alignment is a real "
+                 "binding site.",
+            unit="primers",
+        )
+
     drop_cols = ['orientation', 'forrev']
 
     if args.reftype == 'on':
@@ -151,18 +186,6 @@ def run(args):
         minl, maxl = min_off_len, max_off_len
         lfunc = min
 
-    def _n_primers(df, forrev=None):
-        if forrev is not None:
-            df = df[df['forrev'] == forrev]
-        return df['pname'].nunique()
-
-    n_aligned = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
-    diag.record(
-        f"Primer alignments to {ref_name}", min(n_aligned),
-        breakdown={"forward": n_aligned[0], "reverse": n_aligned[1]},
-        hint="Pairs need at least one forward and one reverse primer that align.",
-        unit="primers",
-    )
     n_oriented = (_n_primers(fors), _n_primers(revs))
     if args.reftype == 'on':
         diag.record(
