@@ -92,16 +92,79 @@ def test_reset_returns_a_copy_not_the_defaults_dict(fake_st):
     assert DEFAULT_PARAMS["TM_MIN"] != 1
 
 
-def test_every_parameter_widget_key_uses_the_swept_prefix():
-    """Guards the prefix contract the reset relies on.
+def _params_page():
+    """Script body for AppTest: just the parameters page."""
+    import sys
+    from pathlib import Path
 
-    A control added with some other key would silently stop resetting.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from gui import app as gui_app
+
+    gui_app._tab_parameters()
+
+
+def test_reset_rebuilds_the_controls_in_the_browser():
+    """End-to-end: the element id must change, not just the stored value.
+
+    st.number_input derives its element id from the key alone, so before the
+    nonce the id was identical across a reset. The server reported the default
+    while the mounted control still showed the edited number -- and posted it
+    back on the next interaction. Asserting on the value alone passes either
+    way, so this pins the id.
+    """
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_function(_params_page, default_timeout=60).run()
+    assert not at.exception
+    before_id = at.number_input(key="p_tm_min_0").proto.id
+
+    at.number_input(key="p_tm_min_0").set_value(99.0).run()
+    assert at.session_state["params"]["TM_MIN"] == 99.0
+
+    at.button[0].click().run()
+    widget = at.number_input(key="p_tm_min_1")
+    assert widget.proto.id != before_id, "element id unchanged — browser keeps the old value"
+    assert widget.value == DEFAULT_PARAMS["TM_MIN"]
+    assert at.session_state["params"]["TM_MIN"] == DEFAULT_PARAMS["TM_MIN"]
+
+
+def test_every_parameter_widget_key_goes_through_pkey():
+    """Guards both contracts the reset relies on.
+
+    A control keyed with a bare string keeps its element id across a reset, so
+    the browser never rebuilds it and goes on showing the edited number; one
+    keyed outside the prefix is never swept from session_state.
     """
     import re
 
     source = Path(gui_app.__file__).read_text()
     body = source.split("def _tab_parameters(")[1].split("\ndef ")[0]
-    keys = re.findall(r"""key=["']([^"']+)["']""", body)
 
+    bare = re.findall(r"""key=["']([^"']+)["']""", body)
+    assert bare == [], f"keyed without _pkey(): {bare}"
+
+    keys = re.findall(r"""key=_pkey\(["']([^"']+)["']\)""", body)
     assert keys, "no keyed widgets found on the parameters page"
     assert [k for k in keys if not k.startswith(PARAM_WIDGET_KEY_PREFIX)] == []
+
+
+def test_pkey_changes_when_the_nonce_is_bumped(fake_st):
+    """The element id has to move, or the browser keeps the old control."""
+    fake_st.session_state.params = dict(DEFAULT_PARAMS)
+    before = gui_app._pkey("p_tm_min")
+
+    gui_app._reset_params_to_defaults()
+    after = gui_app._pkey("p_tm_min")
+
+    assert before != after
+    assert after.startswith(PARAM_WIDGET_KEY_PREFIX)
+
+
+def test_repeated_resets_keep_producing_fresh_keys(fake_st):
+    fake_st.session_state.params = dict(DEFAULT_PARAMS)
+    seen = set()
+    for _ in range(3):
+        gui_app._reset_params_to_defaults()
+        seen.add(gui_app._pkey("p_tm_min"))
+
+    assert len(seen) == 3

@@ -697,6 +697,23 @@ def _init_params():
 # owns the prefix exclusively -- _reset_params_to_defaults() clears by it.
 PARAM_WIDGET_KEY_PREFIX = "p_"
 
+# Bumped by a reset; part of every parameter widget's key. See _pkey().
+PARAM_NONCE_KEY = "_params_nonce"
+
+
+def _pkey(name: str) -> str:
+    """Key for a parameter widget, versioned by the reset counter.
+
+    Dropping a widget's session_state entry resets the value the server holds
+    but not the one the browser shows. st.number_input registers its element id
+    from the key alone (`key_as_main_identity=True`), so the id survives the
+    reset, the already-mounted component is never told to re-sync, and it keeps
+    displaying the edited number -- which it then posts back on the next
+    interaction, undoing the reset for real. Changing the key changes the
+    element id, which remounts the widget and makes it read `value=`.
+    """
+    return f"{name}_{st.session_state.get(PARAM_NONCE_KEY, 0)}"
+
 
 def _reset_params_to_defaults() -> None:
     """Restore DEFAULT_PARAMS, including what the widgets display.
@@ -704,13 +721,14 @@ def _reset_params_to_defaults() -> None:
     Streamlit gives a keyed widget's stored value precedence over its `value=`
     argument, so resetting st.session_state.params on its own is invisible:
     each widget redraws from its own key and immediately writes the stale
-    value back into params. The widget keys have to be dropped too, which
-    makes the next render fall back to `value=` -- i.e. the defaults.
+    value back into params. So drop the widget state as well, and bump the
+    nonce in their keys so the browser rebuilds the controls (see _pkey).
     """
     st.session_state.params = dict(DEFAULT_PARAMS)
     for key in [k for k in st.session_state
                 if str(k).startswith(PARAM_WIDGET_KEY_PREFIX)]:
         del st.session_state[key]
+    st.session_state[PARAM_NONCE_KEY] = st.session_state.get(PARAM_NONCE_KEY, 0) + 1
 
 
 def _find_tool(name: str) -> str | None:
@@ -1685,11 +1703,11 @@ def _tab_parameters(mode: str = "design"):
             c11, c12 = st.columns(2)
             p["AMPLEN_MIN"] = c11.number_input(
                 "AMPLEN_MIN", value=int(p["AMPLEN_MIN"]),
-                min_value=30, step=10, key="p_amp_min",
+                min_value=30, step=10, key=_pkey("p_amp_min"),
             )
             p["AMPLEN_MAX"] = c12.number_input(
                 "AMPLEN_MAX", value=int(p["AMPLEN_MAX"]),
-                min_value=30, step=10, key="p_amp_max",
+                min_value=30, step=10, key=_pkey("p_amp_max"),
             )
             if p["AMPLEN_MIN"] >= p["AMPLEN_MAX"]:
                 st.warning("AMPLEN_MIN should be less than AMPLEN_MAX")
@@ -1697,11 +1715,11 @@ def _tab_parameters(mode: str = "design"):
             c13, c14 = st.columns(2)
             p["OFFLEN_MIN"] = c13.number_input(
                 "OFFLEN_MIN", value=int(p["OFFLEN_MIN"]),
-                min_value=30, step=10, key="p_off_min",
+                min_value=30, step=10, key=_pkey("p_off_min"),
             )
             p["OFFLEN_MAX"] = c14.number_input(
                 "OFFLEN_MAX", value=int(p["OFFLEN_MAX"]),
-                min_value=30, step=100, key="p_off_max",
+                min_value=30, step=100, key=_pkey("p_off_max"),
             )
 
         # Show probe cutoffs when a probe sequence is provided
@@ -1713,12 +1731,12 @@ def _tab_parameters(mode: str = "design"):
                 c15, c16 = st.columns(2)
                 p["PROBE_MAX_MISMATCHES"] = c15.number_input(
                     "PROBE_MAX_MISMATCHES", value=int(p["PROBE_MAX_MISMATCHES"]),
-                    min_value=0, max_value=10, key="p_eval_probe_mm",
+                    min_value=0, max_value=10, key=_pkey("p_eval_probe_mm"),
                     help="Maximum mismatches for probe to count as matched",
                 )
                 p["PROBE_MAX_INDELS"] = c16.number_input(
                     "PROBE_MAX_INDELS", value=int(p["PROBE_MAX_INDELS"]),
-                    min_value=0, max_value=5, key="p_eval_probe_indel",
+                    min_value=0, max_value=5, key=_pkey("p_eval_probe_indel"),
                     help="Maximum indels for probe to count as matched",
                 )
         return
@@ -1736,39 +1754,39 @@ def _tab_parameters(mode: str = "design"):
             c_q1, c_q2 = st.columns(2)
             p["QUICK_N_POSITIONS"] = c_q1.number_input(
                 "MSA sites to explore", value=int(p["QUICK_N_POSITIONS"]),
-                min_value=10, max_value=1000, step=10, key="p_quick_n_pos",
+                min_value=10, max_value=1000, step=10, key=_pkey("p_quick_n_pos"),
                 help="Number of top conserved amplicon positions to evaluate across the MSA.",
             )
             p["QUICK_N_VARIANTS"] = c_q2.number_input(
                 "Primer variants per site", value=int(p["QUICK_N_VARIANTS"]),
-                min_value=1, max_value=50, step=1, key="p_quick_n_var",
+                min_value=1, max_value=50, step=1, key=_pkey("p_quick_n_var"),
                 help="Number of wobble-optimized primer variants per position per direction.",
             )
         c1, c2 = st.columns(2)
         p["TM_MIN"] = c1.number_input(
-            "TM_MIN", value=float(p["TM_MIN"]), step=0.5, key="p_tm_min",
+            "TM_MIN", value=float(p["TM_MIN"]), step=0.5, key=_pkey("p_tm_min"),
         )
         p["TM_MAX"] = c2.number_input(
-            "TM_MAX", value=float(p["TM_MAX"]), step=0.5, key="p_tm_max",
+            "TM_MAX", value=float(p["TM_MAX"]), step=0.5, key=_pkey("p_tm_max"),
         )
         if p["TM_MIN"] >= p["TM_MAX"]:
             st.warning("TM_MIN should be less than TM_MAX")
 
         p["GC_MAX"] = st.number_input(
-            "GC_MAX (%)", value=float(p["GC_MAX"]), step=1.0, key="p_gc_max",
+            "GC_MAX (%)", value=float(p["GC_MAX"]), step=1.0, key=_pkey("p_gc_max"),
         )
         p["DG_MIN"] = st.number_input(
-            "DG_MIN (kcal/mol)", value=float(p["DG_MIN"]), step=0.5, key="p_dg_min",
+            "DG_MIN (kcal/mol)", value=float(p["DG_MIN"]), step=0.5, key=_pkey("p_dg_min"),
         )
 
         c3, c4 = st.columns(2)
         p["PRIMER_LEN_MIN"] = c3.number_input(
             "PRIMER_LEN_MIN", value=int(p["PRIMER_LEN_MIN"]),
-            min_value=15, max_value=35, key="p_len_min",
+            min_value=15, max_value=35, key=_pkey("p_len_min"),
         )
         p["PRIMER_LEN_MAX"] = c4.number_input(
             "PRIMER_LEN_MAX", value=int(p["PRIMER_LEN_MAX"]),
-            min_value=15, max_value=35, key="p_len_max",
+            min_value=15, max_value=35, key=_pkey("p_len_max"),
         )
         if p["PRIMER_LEN_MIN"] > p["PRIMER_LEN_MAX"]:
             st.warning("PRIMER_LEN_MIN should be <= PRIMER_LEN_MAX")
@@ -1781,11 +1799,11 @@ def _tab_parameters(mode: str = "design"):
             c5, c6 = st.columns(2)
             p["PROBE_LEN_MIN"] = c5.number_input(
                 "PROBE_LEN_MIN", value=int(p["PROBE_LEN_MIN"]),
-                min_value=15, max_value=40, key="p_probe_len_min",
+                min_value=15, max_value=40, key=_pkey("p_probe_len_min"),
             )
             p["PROBE_LEN_MAX"] = c6.number_input(
                 "PROBE_LEN_MAX", value=int(p["PROBE_LEN_MAX"]),
-                min_value=15, max_value=40, key="p_probe_len_max",
+                min_value=15, max_value=40, key=_pkey("p_probe_len_max"),
             )
             if p["PROBE_LEN_MIN"] > p["PROBE_LEN_MAX"]:
                 st.warning("PROBE_LEN_MIN should be <= PROBE_LEN_MAX")
@@ -1793,31 +1811,31 @@ def _tab_parameters(mode: str = "design"):
             c7, c8 = st.columns(2)
             p["PROBE_TM_MIN"] = c7.number_input(
                 "PROBE_TM_MIN", value=float(p["PROBE_TM_MIN"]),
-                step=0.5, key="p_probe_tm_min",
+                step=0.5, key=_pkey("p_probe_tm_min"),
             )
             p["PROBE_TM_MAX"] = c8.number_input(
                 "PROBE_TM_MAX", value=float(p["PROBE_TM_MAX"]),
-                step=0.5, key="p_probe_tm_max",
+                step=0.5, key=_pkey("p_probe_tm_max"),
             )
             if p["PROBE_TM_MIN"] >= p["PROBE_TM_MAX"]:
                 st.warning("PROBE_TM_MIN should be less than PROBE_TM_MAX")
 
             p["PROBE_GC_MAX"] = st.number_input(
                 "PROBE_GC_MAX (%)", value=float(p["PROBE_GC_MAX"]),
-                step=1.0, key="p_probe_gc_max",
+                step=1.0, key=_pkey("p_probe_gc_max"),
             )
             p["PROBE_DG_MIN"] = st.number_input(
                 "PROBE_DG_MIN (kcal/mol)", value=float(p["PROBE_DG_MIN"]),
-                step=0.5, key="p_probe_dg_min",
+                step=0.5, key=_pkey("p_probe_dg_min"),
             )
 
             p["PROBE_HOMOPOLYMER_MAX"] = st.number_input(
                 "PROBE_HOMOPOLYMER_MAX", value=int(p["PROBE_HOMOPOLYMER_MAX"]),
-                min_value=1, max_value=10, key="p_probe_hp",
+                min_value=1, max_value=10, key=_pkey("p_probe_hp"),
             )
             p["PROBE_AVOID_5PRIME_G"] = st.checkbox(
                 "PROBE_AVOID_5PRIME_G", value=bool(p["PROBE_AVOID_5PRIME_G"]),
-                key="p_probe_5g",
+                key=_pkey("p_probe_5g"),
                 help="Reject probes that start with G at the 5' end. A G next to the "
                      "reporter dye quenches its fluorescence, even after cleavage.",
             )
@@ -1825,11 +1843,11 @@ def _tab_parameters(mode: str = "design"):
             c9, c10 = st.columns(2)
             p["PROBE_MAX_MISMATCHES"] = c9.number_input(
                 "PROBE_MAX_MISMATCHES", value=int(p["PROBE_MAX_MISMATCHES"]),
-                min_value=0, max_value=10, key="p_probe_mm",
+                min_value=0, max_value=10, key=_pkey("p_probe_mm"),
             )
             p["PROBE_MAX_INDELS"] = c10.number_input(
                 "PROBE_MAX_INDELS", value=int(p["PROBE_MAX_INDELS"]),
-                min_value=0, max_value=10, key="p_probe_indels",
+                min_value=0, max_value=10, key=_pkey("p_probe_indels"),
             )
 
     # --- Input preparation ---
@@ -1837,11 +1855,11 @@ def _tab_parameters(mode: str = "design"):
         c11, c12 = st.columns(2)
         p["AMPLEN_MIN"] = c11.number_input(
             "AMPLEN_MIN", value=int(p["AMPLEN_MIN"]),
-            min_value=30, step=10, key="p_amp_min",
+            min_value=30, step=10, key=_pkey("p_amp_min"),
         )
         p["AMPLEN_MAX"] = c12.number_input(
             "AMPLEN_MAX", value=int(p["AMPLEN_MAX"]),
-            min_value=30, step=10, key="p_amp_max",
+            min_value=30, step=10, key=_pkey("p_amp_max"),
         )
         if p["AMPLEN_MIN"] >= p["AMPLEN_MAX"]:
             st.warning("AMPLEN_MIN should be less than AMPLEN_MAX")
@@ -1849,29 +1867,29 @@ def _tab_parameters(mode: str = "design"):
         c13, c14 = st.columns(2)
         p["OFFLEN_MIN"] = c13.number_input(
             "OFFLEN_MIN", value=int(p["OFFLEN_MIN"]),
-            min_value=30, step=10, key="p_off_min",
+            min_value=30, step=10, key=_pkey("p_off_min"),
         )
         p["OFFLEN_MAX"] = c14.number_input(
             "OFFLEN_MAX", value=int(p["OFFLEN_MAX"]),
-            min_value=30, step=100, key="p_off_max",
+            min_value=30, step=100, key=_pkey("p_off_max"),
         )
 
     # --- Evaluation ---
     with st.expander("Evaluation", expanded=False):
         p["NUM_TOP_SENSITIVITY"] = st.number_input(
             "NUM_TOP_SENSITIVITY", value=int(p["NUM_TOP_SENSITIVITY"]),
-            min_value=10, step=10, key="p_num_top",
+            min_value=10, step=10, key=_pkey("p_num_top"),
         )
         if is_quick:
             c_ev1, c_ev2 = st.columns(2)
             p["QUICK_COV_MIN"] = c_ev1.number_input(
                 "Coverage goal", value=float(p.get("QUICK_COV_MIN", 1.0)),
-                min_value=0.0, max_value=1.0, step=0.05, key="p_quick_cov",
+                min_value=0.0, max_value=1.0, step=0.05, key=_pkey("p_quick_cov"),
                 help="Minimum coverage fraction for early stopping (1.0 = all sequences).",
             )
             p["QUICK_ACT_MIN"] = c_ev2.number_input(
                 "Activity goal", value=float(p.get("QUICK_ACT_MIN", 1.0)),
-                min_value=0.0, max_value=1.0, step=0.05, key="p_quick_act",
+                min_value=0.0, max_value=1.0, step=0.05, key=_pkey("p_quick_act"),
                 help="Minimum activity fraction for early stopping (1.0 = all sequences).",
             )
 
