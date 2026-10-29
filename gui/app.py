@@ -813,8 +813,21 @@ def _render_sidebar():
                 off_targets = cross + host
                 st.markdown(f"**Off-targets:** {', '.join(off_targets) if off_targets else '—'}")
 
-                # Probe
-                if "probe_enabled" in st.session_state or "_probe_enabled_saved" in st.session_state:
+                # Probe. Evaluate has no probe checkbox -- whether a probe is
+                # evaluated follows from the primer input, read the same way the
+                # pipeline command does (an uploaded set takes precedence).
+                if workflow == "evaluate":
+                    pset = st.session_state.get("eval_pset_path", "")
+                    pro = st.session_state.get("eval_pro") or st.session_state.get("_eval_pro_saved", "")
+                    pasted = (pro or st.session_state.get("eval_for")
+                              or st.session_state.get("_eval_for_saved", ""))
+                    if pset:
+                        st.markdown(f"**Probe:** {'On' if _pset_has_probe(pset) else 'Off'}")
+                    elif pasted:
+                        st.markdown(f"**Probe:** {'On' if pro else 'Off'}")
+                    else:
+                        st.markdown("**Probe:** —")
+                elif "probe_enabled" in st.session_state or "_probe_enabled_saved" in st.session_state:
                     probe = st.session_state.get("probe_enabled",
                                                   st.session_state.get("_probe_enabled_saved", False))
                     st.markdown(f"**Probe:** {'On' if probe else 'Off'}")
@@ -2144,6 +2157,7 @@ def _save_run_config(status: str | None = None):
         if st.session_state.get("eval_method") == "Paste sequences":
             config["eval_forward"] = st.session_state.get("eval_for") or st.session_state.get("_eval_for_saved", "")
             config["eval_reverse"] = st.session_state.get("eval_rev") or st.session_state.get("_eval_rev_saved", "")
+            config["eval_probe"] = st.session_state.get("eval_pro") or st.session_state.get("_eval_pro_saved", "")
         else:
             config["eval_pset_path"] = st.session_state.get("eval_pset_path", "")
 
@@ -4409,6 +4423,7 @@ def _config_evaluate():
     host = st.session_state.get("host", [])
     eval_fwd = st.session_state.get("_eval_for_saved", "")
     eval_rev_seq = st.session_state.get("_eval_rev_saved", "")
+    eval_pro_seq = st.session_state.get("_eval_pro_saved", "")
     pset_path = st.session_state.get("eval_pset_path", "")
 
     st.markdown(f"**Target:** {', '.join(targets) if targets else 'none'}")
@@ -4421,6 +4436,8 @@ def _config_evaluate():
     elif eval_fwd and eval_rev_seq:
         st.markdown(f"**Forward:** {eval_fwd}")
         st.markdown(f"**Reverse:** {eval_rev_seq}")
+        if eval_pro_seq:
+            st.markdown(f"**Probe:** {eval_pro_seq}")
 
     st.divider()
 
