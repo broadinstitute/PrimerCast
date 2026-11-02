@@ -144,6 +144,8 @@ from primercast.adapt_cli import (
     _extract_accessions,
     _filter_fasta_by_accessions,
     _deduplicate_fasta,
+    _narrow_to_new_releases,
+    _no_new_releases_result,
     _build_pset_fa,
     _send_email,
     _read_excel_summary,
@@ -4999,8 +5001,6 @@ def _run_monitor():
         progress_lines.append("⏳ &nbsp; **Fetching sequences...**")
         _update(progress_lines)
 
-        _OVERLAP_DAYS = 7
-
         for i, (target_name, rows) in enumerate(target_groups.items()):
             row = {k: v for k, v in rows[0].items()
                    if k not in {"max_collection_date", "max_release_date"}}
@@ -5033,17 +5033,7 @@ def _run_monitor():
 
             # Narrow date window for subsequent fetches
             if not is_first:
-                from datetime import timedelta
-                prev_date_str = prev_acc_files[0].parent.name
-                try:
-                    prev_date = datetime.strptime(prev_date_str, "%Y%m%d")
-                    cutoff = (prev_date - timedelta(days=_OVERLAP_DAYS)).strftime("%Y-%m-%d")
-                    for date_col in ("min_release_date", "min_collection_date"):
-                        orig = str(row.get(date_col, "")).strip()
-                        if not orig or orig < cutoff:
-                            row[date_col] = cutoff
-                except ValueError:
-                    pass
+                _narrow_to_new_releases(row, prev_acc_files[0].parent.name)
 
             # Run gget
             gget_tmp = date_dir / f".gget_tmp_{target_name}"
@@ -5067,8 +5057,12 @@ def _run_monitor():
             meta_files = list(gget_tmp.glob("*_metadata.csv"))
 
             if not fasta_files:
-                fetch_results[target_name] = {"status": "no_output"}
                 shutil.rmtree(gget_tmp, ignore_errors=True)
+                # On a repeat run that is just nothing released since the last
+                # fetch; only a first run matching nothing is a real problem.
+                fetch_results[target_name] = (
+                    {"status": "no_output"} if is_first
+                    else _no_new_releases_result(target_name, prev_acc_files[0], date_dir))
                 continue
 
             shutil.move(str(fasta_files[0]), str(dated_fasta))

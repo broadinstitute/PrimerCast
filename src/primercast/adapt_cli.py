@@ -806,6 +806,53 @@ def _deduplicate_fasta(fasta_path) -> int:
 
 
 
+# Fetch overlap for repeat monitor runs, to avoid missing late-indexed sequences.
+_MONITOR_OVERLAP_DAYS = 7
+
+
+def _narrow_to_new_releases(row: dict, prev_date_str: str) -> str | None:
+    """Limit a repeat monitor fetch to what NCBI released since the last one.
+
+    Moves ``min_release_date`` up to the previous fetch date (``YYYYMMDD``) minus
+    an overlap, unless the row already asks for a later date, and returns the
+    value used (None if ``prev_date_str`` is not a date). Only the release date:
+    sequences are deposited months or years after collection, so also moving
+    ``min_collection_date`` filtered out nearly every new sequence. The user's
+    own collection-date bounds are left as they are.
+    """
+    try:
+        prev_date = datetime.strptime(prev_date_str, "%Y%m%d")
+    except ValueError:
+        return None
+    cutoff = (prev_date - timedelta(days=_MONITOR_OVERLAP_DAYS)).strftime("%Y-%m-%d")
+    orig = str(row.get("min_release_date", "")).strip()
+    # Use whichever is later: spreadsheet value or cutoff
+    if not orig or orig < cutoff:
+        row["min_release_date"] = cutoff
+    return row["min_release_date"]
+
+
+def _no_new_releases_result(target_name: str, prev_acc_file: Path, date_dir: Path) -> dict:
+    """Fetch result for a repeat run where nothing passed gget's filters.
+
+    That is a quiet day -- NCBI released nothing in the window -- not a failure.
+    The previous accession list is carried forward into ``date_dir`` so the next
+    run narrows from today and still recognises sequences already reported.
+    """
+    (date_dir / f"{target_name}_accessions.txt").write_text(prev_acc_file.read_text())
+    return {
+        "target_name": target_name,
+        "status": "success",
+        "fasta_path": None,
+        "new_fasta_path": None,
+        "metadata_path": None,
+        "new_accessions": set(),
+        "total_count": 0,
+        "new_count": 0,
+        "is_first_fetch": False,
+    }
+
+
 def _monitor_fetch(
     data_rows: list[dict],
     work_dir: Path,
@@ -831,8 +878,6 @@ def _monitor_fetch(
 
     results = {}
 
-    _OVERLAP_DAYS = 7  # Fetch overlap to avoid missing late-indexed sequences
-
     for target_name, rows in target_groups.items():
         # Use the first row to build gget command (same TaxID for same pathogen)
         # Strip max-date columns so monitor always fetches up to the latest
@@ -856,22 +901,14 @@ def _monitor_fetch(
 
         is_first = len(prev_acc_files) == 0
 
-        # For subsequent fetches, override min_release_date and
-        # min_collection_date to (prev_fetch_date - overlap) so we only
-        # download recent sequences instead of the entire history.
+        # For subsequent fetches, only download what NCBI has published since
+        # the last one, instead of the entire history.
         if not is_first:
             prev_date_str = prev_acc_files[0].parent.name  # directory name is YYYYMMDD
-            try:
-                prev_date = datetime.strptime(prev_date_str, "%Y%m%d")
-                cutoff = (prev_date - timedelta(days=_OVERLAP_DAYS)).strftime("%Y-%m-%d")
-                for date_col in ("min_release_date", "min_collection_date"):
-                    orig = str(row.get(date_col, "")).strip()
-                    # Use whichever is later: spreadsheet value or cutoff
-                    if not orig or orig < cutoff:
-                        row[date_col] = cutoff
-                print(f"  Narrowing fetch window: min dates → {cutoff} (prev fetch: {prev_date_str})")
-            except ValueError:
-                pass  # Could not parse date from directory name; use original dates
+            cutoff = _narrow_to_new_releases(row, prev_date_str)
+            if cutoff:
+                print(f"  Narrowing fetch window: min_release_date → {cutoff} "
+                      f"(prev fetch: {prev_date_str})")
 
         if dry_run:
             cmd = _build_gget_command(row, str(date_dir / ".gget_tmp"))
@@ -905,9 +942,17 @@ def _monitor_fetch(
         meta_files = list(gget_tmp.glob("*_metadata.csv"))
 
         if not fasta_files:
-            print(f"  Warning: no FASTA output")
-            results[target_name] = {"target_name": target_name, "status": "no_output"}
             shutil.rmtree(gget_tmp, ignore_errors=True)
+            if is_first:
+                # Nothing to compare against yet, so this is the user's query
+                # matching no sequences at all -- worth flagging.
+                print(f"  Warning: no sequences matched the fetch settings")
+                results[target_name] = {"target_name": target_name, "status": "no_output"}
+                continue
+            print(f"  No sequences released since the last fetch "
+                  f"({prev_acc_files[0].parent.name})")
+            results[target_name] = _no_new_releases_result(
+                target_name, prev_acc_files[0], date_dir)
             continue
 
         shutil.move(str(fasta_files[0]), str(dated_fasta))
@@ -1524,8 +1569,19 @@ def cmd_monitor(args):
 
         email_body_parts.append(f"\n== {target_name} ==")
 
+        if status == "no_output":
+            email_body_parts.append(
+                "No sequences matched the fetch settings. Check the TaxID and "
+                "filters (dates, host, location, length).\n"
+            )
+            continue
         if status != "success":
             email_body_parts.append(f"Fetch failed (status: {status})\n")
+            continue
+
+        if result["new_count"] == 0 and result["total_count"] == 0:
+            # Repeat run where NCBI released nothing in the fetch window.
+            email_body_parts.append("No new sequences since the last check.\n")
             continue
 
         new_count = result["new_count"]
