@@ -32,7 +32,7 @@ env:
   # primercast-monitor-sendgrid-key; on hold until its sender is verified.)
   MONITOR_BUCKET: sabeti-adapt-primercast-monitor
   MONITOR_EMAIL_SECRET: primercast-monitor-smtp-key
-  MONITOR_SMTP_HOST: smtp-relay.brevo.com
+  MONITOR_SMTP_HOST: smtp.gmail.com
   MONITOR_SMTP_PORT: "587"
   MONITOR_SMTP_USER: ${{ vars.MONITOR_SMTP_USER }}
 

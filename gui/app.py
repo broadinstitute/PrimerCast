@@ -661,7 +661,7 @@ DEFAULT_PARAMS: dict = {
     "DG_MIN": -6,
     "PRIMER_LEN_MIN": 19,
     "PRIMER_LEN_MAX": 21,
-    "QUICK_N_POSITIONS": 100,
+    "QUICK_N_POSITIONS": 2500,
     "QUICK_N_VARIANTS": 10,
     "QUICK_COV_MIN": 1.0,
     "QUICK_ACT_MIN": 1.0,
@@ -1766,9 +1766,10 @@ def _tab_parameters(mode: str = "design"):
             st.caption("Multi-sequence target detected — using quick design mode.")
             c_q1, c_q2 = st.columns(2)
             p["QUICK_N_POSITIONS"] = c_q1.number_input(
-                "MSA sites to explore", value=int(p["QUICK_N_POSITIONS"]),
-                min_value=10, max_value=1000, step=10, key=_pkey("p_quick_n_pos"),
-                help="Number of top conserved amplicon positions to evaluate across the MSA.",
+                "Maximum MSA sites to explore", value=int(p["QUICK_N_POSITIONS"]),
+                min_value=10, max_value=10000, step=100, key=_pkey("p_quick_n_pos"),
+                help=("Upper limit on the top conserved amplicon positions to evaluate "
+                      "across the MSA. If fewer valid sites exist, all of them are used."),
             )
             p["QUICK_N_VARIANTS"] = c_q2.number_input(
                 "Primer variants per site", value=int(p["QUICK_N_VARIANTS"]),

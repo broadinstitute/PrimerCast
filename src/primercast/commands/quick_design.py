@@ -2149,7 +2149,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
 
     print(f"Quick mode (primers-first + probe): {args.name}")
     print(f"  Thresholds: coverage >= {cov_min}, activity >= {act_min}")
-    print(f"  Positions: {n_positions}, variants/direction: {n_variants}")
+    print(f"  Max positions: {n_positions}, variants/direction: {n_variants}")
     print(f"  Probe: len {probe_params['len_min']}-{probe_params['len_max']}, "
           f"Tm {probe_params['min_tm']}-{probe_params['max_tm']}, "
           f"max_mm {max_mm}, max_indels {max_indel}")
@@ -2182,6 +2182,8 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions, min_interior=min_interior,
     )
+    print(f"  Positions found: {len(scored)} (max {n_positions}"
+          + ("; fewer valid sites than the max, using all)" if len(scored) < n_positions else ")"))
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
     diag.record("Sequences in alignment", len(aligned_seqs), unit="sequences")
     diag.record(
@@ -2593,8 +2595,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
 
     print(f"Quick mode (wobble-optimized): {args.name}")
     print(f"  Thresholds: coverage >= {cov_min}, activity >= {act_min}")
-    print(f"  Positions: {n_positions}, variants/direction: {n_variants}")
-    print(f"  Max pairs: {n_positions} × {n_variants}² = {n_positions * n_variants**2}")
+    print(f"  Max positions: {n_positions}, variants/direction: {n_variants}")
 
     # Step 1: Load MSA, strip gap-dominant columns, and score amplicon positions
     print("Step 1: Scoring amplicon positions across MSA...")
@@ -2624,6 +2625,9 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions,
     )
+    print(f"  Positions found: {len(scored)} (max {n_positions}"
+          + ("; fewer valid sites than the max, using all)" if len(scored) < n_positions else ")"))
+    print(f"  Max pairs: {len(scored)} × {n_variants}² = {len(scored) * n_variants**2}")
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
     diag.record("Sequences in alignment", len(aligned_seqs), unit="sequences")
     diag.record(
