@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import date, datetime, timezone
@@ -38,8 +39,30 @@ def _safe_path_under(base_dir: Path, filename: str) -> Path | None:
     return Path(candidate)
 
 
+def _live_timer(area, start_time: float) -> None:
+    """Show an elapsed-time counter in ``area`` that ticks in the browser.
+
+    Progress views only redraw when a run prints output, so a server-drawn
+    counter freezes during quiet steps. Replace ``area`` to stop it.
+    """
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    with area:
+        st.components.v1.html(f"""
+<div id="t" style="font-family:'Source Sans Pro',sans-serif;font-size:14px;color:#808495"></div>
+<script>
+  const start = Date.now() - {elapsed_ms};
+  const el = document.getElementById("t");
+  function tick() {{
+    const s = Math.floor((Date.now() - start) / 1000);
+    el.textContent = "Elapsed: " + Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }}
+  tick();
+  setInterval(tick, 1000);
+</script>""", height=24)
+
+
 def _build_fetch_command(
-    gget_bin: str, taxid: str, out_dir: str, params: dict,
+    taxid: str, out_dir: str, params: dict,
 ) -> list[str] | None:
     """Build and validate a gget virus command. Returns None if taxid is invalid."""
     safe_taxid = str(taxid).strip()
@@ -53,7 +76,7 @@ def _build_fetch_command(
     _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
     _SAFE_STR = re.compile(r"[\w\s.,\-]+")
 
-    cmd = [gget_bin, "virus", safe_taxid, "--out", real_out]
+    cmd = [*GGET_VIRUS, safe_taxid, "--out", real_out]
 
     nuc = params.get("nuc_completeness", "complete")
     if nuc and nuc in _ALLOWED_NUC:
@@ -108,29 +131,60 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from gui.snakefile_builder import build_params_txt, build_snakefile
 from gui.run_isolation import prepare_run_dir
-from gui import error_report
+from gui import error_report, run_gate
 from primercast.utils.params import parse_params
-from primercast.utils.diagnostics import explain_run, run_warnings
+from primercast.external.gget_virus import GGET_VIRUS
+from primercast.external import pathoplexus
+from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings, step_baselines
 from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
     _load_spreadsheet,
+    _empty_sheet_message,
     _make_target_name,
-    _build_gget_command,
     _extract_accessions,
-    _filter_fasta_by_accessions,
     _deduplicate_fasta,
+    _monitor_fetch,
+    _data_use_notice,
     _build_pset_fa,
     _send_email,
     _read_excel_summary,
     _get_new_seq_table,
     _generate_snakefile,
     _is_empty,
-    _install_cron,
-    _uninstall_cron,
+    _email_config,
+    _smtp_config,
+    _install_dispatch_cron,
+    _rows_to_sheet_csv,
+    _parse_pset_fasta,
+    _sheet_with_primers,
+    MANUAL_SHEET_HEADERS,
 )
+from primercast import monitor_schedule
+from primercast.utils.cpu import available_cores
+
+# Every run offers snakemake all of this instance's cores, and snakemake does
+# not hold the workflow strictly to that budget (see the threads note in
+# Snakefile.template), so run_gate caps how many runs share the box at once.
+CORES = available_cores()
+# Browser sessions with no activity for this long are closed so an open but
+# forgotten tab doesn't keep a Cloud Run instance up. On by default only on
+# Cloud Run (K_SERVICE is set there); 0 disables it.
+IDLE_TIMEOUT_MINUTES = int(os.environ.get(
+    "PRIMERCAST_IDLE_TIMEOUT_MINUTES", "30" if os.environ.get("K_SERVICE") else "0"))
+# Design/evaluate runs are stopped after this long so a stuck run can't hold the
+# instance (a run keeps going on the server even after its browser tab closes).
+RUN_TIME_LIMIT = int(os.environ.get("PRIMERCAST_RUN_TIME_LIMIT", "3600"))
 
 MONITOR_DIR = DATA_DIR / "monitor"
+# Scheduled monitors (see primercast/monitor_schedule.py). On Cloud Run they live in
+# the GCS bucket in PRIMERCAST_MONITOR_BUCKET and a Cloud Run Job runs them daily
+# (terraform/monitor.tf); locally they live here and a daily cron line runs them.
+MONITOR_STORE_DIR = DATA_DIR / "monitor_schedules"
+MONITOR_ON_CLOUD = bool(os.environ.get("PRIMERCAST_MONITOR_BUCKET", "").strip())
+# Cloud Run Job that runs a new schedule's first run (instead of this web instance,
+# which has less time and memory to spare); unset → the first run happens here.
+MONITOR_JOB = os.environ.get("PRIMERCAST_MONITOR_JOB", "").strip()
 
 # Error reports ("Report a problem" button). On Cloud Run, bundles go to the GCS
 # bucket in PRIMERCAST_REPORT_BUCKET (see terraform/error_reports.tf); without it
@@ -139,7 +193,6 @@ REPORT_BUCKET = os.environ.get("PRIMERCAST_REPORT_BUCKET", "").strip()
 REPORT_PREFIX = os.environ.get("PRIMERCAST_REPORT_PREFIX", "").strip() or "local"
 REPORTS_LOCAL_DIR = DATA_DIR / "error_reports"
 MAX_REPORTS_PER_SESSION = 3
-MONITOR_SCHEDULE_PATH = MONITOR_DIR / "schedule.json"
 VIRUS_MAP_DATA_DIR = Path(__file__).parent / "virus_map_data"
 
 # ---------------------------------------------------------------------------
@@ -148,6 +201,18 @@ VIRUS_MAP_DATA_DIR = Path(__file__).parent / "virus_map_data"
 st.set_page_config(
     page_title="PrimerCast",
     layout="wide",
+)
+
+# Streamlit prints "Limit 200MB per file" under every uploader, taken from its
+# own server.maxUploadSize. Locally that is true but irrelevant; on Cloud Run
+# it is simply wrong, since the ingress rejects anything over 32 MiB first.
+# _render_upload_note() states the real limit and what to do about it, so hide
+# Streamlit's line rather than show two different numbers.
+st.markdown(
+    "<style>"
+    "[data-testid='stFileUploaderDropzoneInstructions'] small { display: none; }"
+    "</style>",
+    unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,6 +229,7 @@ def _clear_pipeline_state():
     """Clear all pipeline run state for a fresh workflow."""
     for key in ("pipeline_return_code", "pipeline_log", "pipeline_running",
                 "pipeline_completed_rules", "pipeline_should_start",
+                "pipeline_elapsed", "pipeline_timed_out", "monitor_outcome",
                 "_run_page_fresh"):
         st.session_state.pop(key, None)
 
@@ -183,8 +249,8 @@ def _reset_workflow_state():
                 "monitor_pset_upload",
                 "monitor_primer_name", "monitor_primer_fwd",
                 "monitor_primer_rev", "monitor_primer_pro",
-                "monitor_frequency", "monitor_skip_fetch",
-                "monitor_resume_run"):
+                "monitor_frequency", "monitor_interval_days", "monitor_skip_fetch",
+                "monitor_resume_run", "monitor_schedule", "monitor_first_run"):
         st.session_state.pop(key, None)
     _clear_pipeline_state()
 
@@ -382,11 +448,128 @@ def _decompress_bz2_fastas(directory: Path) -> None:
     """Auto-decompress any .fa.bz2 files that don't have a corresponding .fa."""
     import bz2 as _bz2
     for p in directory.iterdir():
-        if p.name.endswith(".fa.bz2") and p.is_file():
+        if p.name.lower().endswith(".fa.bz2") and p.is_file():
             fa_path = directory / p.name[:-4]  # strip .bz2
             if not fa_path.exists():
                 with open(p, "rb") as fin, open(fa_path, "wb") as fout:
                     fout.write(_bz2.decompress(fin.read()))
+
+
+# Plain-FASTA extensions, lowercase. Every comparison against them goes through
+# _fasta_suffix(), because uploads arrive as .fa, .FA, .Fasta, ... and a
+# case-sensitive check would silently drop the ones that don't match.
+FASTA_EXTENSIONS = (".fa", ".fasta", ".fna")
+
+
+def _fasta_suffix(name: str) -> str | None:
+    """Return ``name``'s plain-FASTA extension, lowercased, else None."""
+    suffix = Path(name).suffix.lower()
+    return suffix if suffix in FASTA_EXTENSIONS else None
+
+
+# Extensions every FASTA uploader accepts. Compressed forms matter more than
+# convenience here: Cloud Run rejects any request body over 32 MiB with a 413
+# before Streamlit sees it, so a genome-scale FASTA can only be uploaded
+# compressed. HUMAN.fa is 63 MB raw but 18 MB as .fa.bz2.
+FASTA_UPLOAD_TYPES = ["fa", "fasta", "fna", "bz2", "gz"]
+
+# Cloud Run rejects any request body over 32 MiB at the ingress, before the
+# container sees it, so this is a hard ceiling we cannot raise from here. The
+# image pins Streamlit's own limit to match (STREAMLIT_SERVER_MAX_UPLOAD_SIZE),
+# which turns a silent 413 into a readable in-browser refusal -- but Streamlit's
+# wording is just "File must be 32.0MB or smaller", which does not tell anyone
+# what to do about it. Hence the note below, shown next to every uploader.
+UPLOAD_SIZE_LIMIT_MB = 32
+
+UPLOAD_SIZE_HINT = (
+    f"Files over {UPLOAD_SIZE_LIMIT_MB} MB must be compressed — upload the "
+    ".gz or .bz2 and it is expanded automatically."
+)
+
+# Ceiling on the off-target set. Counted across cross-reactivity *and* host
+# together, because the Snakefile runs them as one list (OFF_TARGETS = CROSS +
+# HOST) and each entry costs its own bowtie2 index build plus one alignment per
+# primer set -- so it is the combined count that decides how long a run takes.
+MAX_OFFTARGET_FILES = 10
+
+
+def _render_upload_note() -> None:
+    """Explain the upload ceiling and how to get a large genome past it."""
+    st.caption(
+        f":material/info: **Uploads are limited to {UPLOAD_SIZE_LIMIT_MB} MB.** "
+        "For anything larger, compress it first and upload the compressed "
+        "file — it is decompressed here automatically:\n\n"
+        "`gzip -k yourfile.fa` &nbsp;or&nbsp; `bzip2 -k yourfile.fa`\n\n"
+    )
+
+
+def _decompress_upload(name: str, data: bytes) -> tuple[str, bytes] | None:
+    """Map an uploaded FASTA's (name, bytes) to its stem and plain-text bytes.
+
+    Returns ``None`` for an extension we do not accept, so callers can report
+    it. Compressed payloads are expanded here; everything downstream (bowtie2,
+    mafft, the sequence readers) only ever sees plain FASTA.
+    """
+    lowered = name.lower()
+    for suffix, decompress in (
+        (".bz2", lambda b: __import__("bz2").decompress(b)),
+        (".gz", lambda b: __import__("gzip").decompress(b)),
+    ):
+        if lowered.endswith(suffix):
+            inner = name[: -len(suffix)]
+            # Accept both `X.fa.bz2` and a bare `X.bz2`.
+            stem = Path(inner).stem if _fasta_suffix(inner) else inner
+            return stem, decompress(data)
+    if _fasta_suffix(name):
+        return Path(name).stem, data
+    return None
+
+
+def _save_uploaded_fastas(files, saved_key: str = "_fasta_saved_ids") -> bool:
+    """Save uploaded FASTAs into FASTA_DIR, expanding .gz/.bz2 along the way.
+
+    Streamlit hands the same UploadedFile objects back on every rerun, so work
+    is keyed on (name, size) to avoid rewriting a genome on each redraw --
+    which also keeps callers that rerun on a True return from looping.
+    """
+    seen = st.session_state.setdefault(saved_key, set())
+    saved = False
+    for upload in files:
+        file_id = (upload.name, upload.size)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        try:
+            decoded = _decompress_upload(upload.name, upload.getvalue())
+        except (OSError, EOFError, ValueError) as exc:
+            st.error(f"Could not read `{upload.name}` — is it a valid archive? ({exc})")
+            continue
+        if decoded is None:
+            st.error(
+                f"`{upload.name}` is not a FASTA file. Accepted extensions: "
+                + ", ".join(f"`.{ext}`" for ext in FASTA_UPLOAD_TYPES)
+            )
+            continue
+        stem, data = decoded
+        # Always land as lowercase `.fa`. The Snakefile reads targets from
+        # `target_seqs/original/{name}.fa` and only renames `.fasta`/`.fna`
+        # spelled in lowercase, so an uploaded `X.FASTA` would list fine in the
+        # GUI and then fail the run with a missing input.
+        dest = _safe_path_under(FASTA_DIR, f"{stem}.fa")
+        if dest is None:
+            st.error(f"Rejected unsafe file name `{upload.name}`.")
+            continue
+        FASTA_DIR.mkdir(parents=True, exist_ok=True)
+        _save_fasta_bytes(dest, data)
+        # Drop a same-stem leftover under another extension, so lookups cannot
+        # resolve to the stale copy.
+        for other in FASTA_DIR.iterdir():
+            if (other != dest and other.is_file() and other.stem == stem
+                    and _fasta_suffix(other.name)):
+                other.unlink()
+        saved = True
+        st.success(f"Saved **{stem}** ({_format_size(len(data))})")
+    return saved
 
 
 def _available_fasta() -> list[str]:
@@ -396,25 +579,72 @@ def _available_fasta() -> list[str]:
     _decompress_bz2_fastas(FASTA_DIR)
     return sorted({
         p.stem for p in FASTA_DIR.iterdir()
-        if p.suffix in (".fa", ".fasta", ".fna") and p.is_file()
+        if _fasta_suffix(p.name) and p.is_file()
     })
+
+
+def _fasta_path(stem: str) -> Path | None:
+    """Locate the plain FASTA for ``stem``, whatever case its extension uses.
+
+    Uploads are normalized to `.fa`, but files placed in target_seqs/original/
+    by hand can be `.FASTA`, `.Fna` and so on, and must still resolve.
+    """
+    if not FASTA_DIR.exists():
+        return None
+    matches = [
+        p for p in FASTA_DIR.iterdir()
+        if p.is_file() and p.stem == stem and _fasta_suffix(p.name)
+    ]
+    # Keep the historical .fa > .fasta > .fna preference when several exist.
+    matches.sort(key=lambda p: FASTA_EXTENSIONS.index(_fasta_suffix(p.name)))
+    return matches[0] if matches else None
 
 
 def _fasta_info(stem: str) -> dict:
     """Return sequence count and file size for a FASTA file."""
-    path = FASTA_DIR / f"{stem}.fa"
-    if not path.exists():
-        # try other extensions
-        for ext in (".fasta", ".fna"):
-            alt = FASTA_DIR / f"{stem}{ext}"
-            if alt.exists():
-                path = alt
-                break
-    if not path.exists():
-        return {"seqs": 0, "size": 0}
+    path = _fasta_path(stem)
+    if path is None:
+        return {"seqs": 0, "size": 0, "max_len": 0}
+    stat = path.stat()
+    n_seqs, max_len = _fasta_stats(str(path), stat.st_mtime, stat.st_size)
+    return {"seqs": n_seqs, "size": stat.st_size, "max_len": max_len}
+
+
+@st.cache_data(max_entries=512, show_spinner=False)
+def _fasta_stats(path: str, mtime: float, size: int) -> tuple[int, int]:
+    """Sequence count and longest sequence length (cached per file version)."""
+    n_seqs = max_len = cur = 0
     with open(path) as f:
-        n_seqs = sum(1 for line in f if line.startswith(">"))
-    return {"seqs": n_seqs, "size": path.stat().st_size}
+        for line in f:
+            if line.startswith(">"):
+                n_seqs += 1
+                max_len = max(max_len, cur)
+                cur = 0
+            else:
+                cur += len(line.strip())
+    return n_seqs, max(max_len, cur)
+
+
+# Targets beyond these sizes can make design runs very slow.
+LARGE_TARGET_SEQS = 1000
+LARGE_TARGET_LEN = 5000
+
+
+def _large_target_warning(stem: str) -> str:
+    """Runtime warning for a large target FASTA, or "" if it is small enough."""
+    info = _fasta_info(stem)
+    reasons = []
+    if info["seqs"] > LARGE_TARGET_SEQS:
+        reasons.append(f"{info['seqs']:,} sequences (more than {LARGE_TARGET_SEQS:,})")
+    if info["max_len"] > LARGE_TARGET_LEN:
+        reasons.append(f"a sequence of {info['max_len']:,} bp (longer than "
+                       f"{LARGE_TARGET_LEN // 1000} kb)")
+    if not reasons:
+        return ""
+    return (f"**{stem}** has {' and '.join(reasons)}, so runs may take a very long time. "
+            f"Runs on this server stop after {RUN_TIME_LIMIT // 60} minutes; consider "
+            "narrowing the sequences (e.g. by date or location, or a target region) or "
+            "running the pipeline locally.")
 
 
 def _format_size(nbytes: int) -> str:
@@ -433,7 +663,7 @@ DEFAULT_PARAMS: dict = {
     "DG_MIN": -6,
     "PRIMER_LEN_MIN": 19,
     "PRIMER_LEN_MAX": 21,
-    "QUICK_N_POSITIONS": 100,
+    "QUICK_N_POSITIONS": 2500,
     "QUICK_N_VARIANTS": 10,
     "QUICK_COV_MIN": 1.0,
     "QUICK_ACT_MIN": 1.0,
@@ -444,7 +674,7 @@ DEFAULT_PARAMS: dict = {
     "PROBE_GC_MAX": 60,
     "PROBE_DG_MIN": -8,
     "PROBE_HOMOPOLYMER_MAX": 4,
-    "PROBE_AVOID_5PRIME_G": False,
+    "PROBE_AVOID_5PRIME_G": True,
     "PROBE_CONSERVATION_THRESHOLD": 0.8,
     "PROBE_MAX_MISMATCHES": 2,
     "PROBE_MAX_INDELS": 0,
@@ -463,6 +693,44 @@ def _init_params():
     """Initialize session-state params dict from defaults if not set."""
     if "params" not in st.session_state:
         st.session_state.params = dict(DEFAULT_PARAMS)
+
+
+# Every widget on the parameters page is keyed with this prefix, and the page
+# owns the prefix exclusively -- _reset_params_to_defaults() clears by it.
+PARAM_WIDGET_KEY_PREFIX = "p_"
+
+# Bumped by a reset; part of every parameter widget's key. See _pkey().
+PARAM_NONCE_KEY = "_params_nonce"
+
+
+def _pkey(name: str) -> str:
+    """Key for a parameter widget, versioned by the reset counter.
+
+    Dropping a widget's session_state entry resets the value the server holds
+    but not the one the browser shows. st.number_input registers its element id
+    from the key alone (`key_as_main_identity=True`), so the id survives the
+    reset, the already-mounted component is never told to re-sync, and it keeps
+    displaying the edited number -- which it then posts back on the next
+    interaction, undoing the reset for real. Changing the key changes the
+    element id, which remounts the widget and makes it read `value=`.
+    """
+    return f"{name}_{st.session_state.get(PARAM_NONCE_KEY, 0)}"
+
+
+def _reset_params_to_defaults() -> None:
+    """Restore DEFAULT_PARAMS, including what the widgets display.
+
+    Streamlit gives a keyed widget's stored value precedence over its `value=`
+    argument, so resetting st.session_state.params on its own is invisible:
+    each widget redraws from its own key and immediately writes the stale
+    value back into params. So drop the widget state as well, and bump the
+    nonce in their keys so the browser rebuilds the controls (see _pkey).
+    """
+    st.session_state.params = dict(DEFAULT_PARAMS)
+    for key in [k for k in st.session_state
+                if str(k).startswith(PARAM_WIDGET_KEY_PREFIX)]:
+        del st.session_state[key]
+    st.session_state[PARAM_NONCE_KEY] = st.session_state.get(PARAM_NONCE_KEY, 0) + 1
 
 
 def _find_tool(name: str) -> str | None:
@@ -547,8 +815,21 @@ def _render_sidebar():
                 off_targets = cross + host
                 st.markdown(f"**Off-targets:** {', '.join(off_targets) if off_targets else '—'}")
 
-                # Probe
-                if "probe_enabled" in st.session_state or "_probe_enabled_saved" in st.session_state:
+                # Probe. Evaluate has no probe checkbox -- whether a probe is
+                # evaluated follows from the primer input, read the same way the
+                # pipeline command does (an uploaded set takes precedence).
+                if workflow == "evaluate":
+                    pset = st.session_state.get("eval_pset_path", "")
+                    pro = st.session_state.get("eval_pro") or st.session_state.get("_eval_pro_saved", "")
+                    pasted = (pro or st.session_state.get("eval_for")
+                              or st.session_state.get("_eval_for_saved", ""))
+                    if pset:
+                        st.markdown(f"**Probe:** {'On' if _pset_has_probe(pset) else 'Off'}")
+                    elif pasted:
+                        st.markdown(f"**Probe:** {'On' if pro else 'Off'}")
+                    else:
+                        st.markdown("**Probe:** —")
+                elif "probe_enabled" in st.session_state or "_probe_enabled_saved" in st.session_state:
                     probe = st.session_state.get("probe_enabled",
                                                   st.session_state.get("_probe_enabled_saved", False))
                     st.markdown(f"**Probe:** {'On' if probe else 'Off'}")
@@ -561,47 +842,21 @@ def _render_sidebar():
                 else:
                     st.markdown("**Mode:** —")
 
-        # --- Scheduled monitor (always visible) ---
-        active_cron = _get_active_cron_monitor()
-        if active_cron:
+        # --- Monitors scheduled in this session ---
+        created = st.session_state.get("monitor_schedules_created", [])
+        if created:
             st.divider()
-            st.markdown("**Scheduled monitor**")
-            # Read saved schedule details
-            if MONITOR_SCHEDULE_PATH.exists():
-                import json
-                try:
-                    sched_info = json.loads(MONITOR_SCHEDULE_PATH.read_text())
-                    targets = sched_info.get("targets", [])
-                    target_summary = ", ".join(targets) if targets else "N/A"
-                    with st.expander(target_summary):
-                        lines = []
-                        primers = sched_info.get("primer_sets", [])
-                        if primers:
-                            primer_list = "".join(
-                                f"<br>&nbsp;&nbsp;&nbsp;{p}" for p in primers
-                            )
-                            lines.append(f"<b>Primer sets:</b>{primer_list}")
-                        lines.append(f"<b>Frequency:</b> {sched_info.get('frequency', 'N/A')}")
-                        recipients = sched_info.get("recipients", "")
-                        if recipients:
-                            lines.append(f"<b>Email:</b> {recipients}")
-                        st.markdown(
-                            "<div style='font-size:0.85em; line-height:1.4;'>"
-                            + "<br>".join(lines)
-                            + "</div>",
-                            unsafe_allow_html=True,
-                        )
-                        if st.button("Stop monitoring", key="sidebar_stop_cron", use_container_width=True):
-                            _uninstall_cron()
-                            if MONITOR_SCHEDULE_PATH.exists():
-                                MONITOR_SCHEDULE_PATH.unlink()
-                            st.rerun()
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            else:
-                if st.button("Stop monitoring", key="sidebar_stop_cron", use_container_width=True):
-                    _uninstall_cron()
-                    st.rerun()
+            st.markdown("**Scheduled monitors**")
+            for sched in created:
+                with st.expander(", ".join(sched["targets"]) or sched["id"]):
+                    st.markdown(
+                        "<div style='font-size:0.85em; line-height:1.4;'>"
+                        f"<b>Frequency:</b> {monitor_schedule.describe_frequency(sched)}<br>"
+                        f"<b>Email:</b> {', '.join(sched['recipients'])}<br>"
+                        f"<a href='{sched['manage_url']}' target='_blank'>Manage / stop</a>"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
 
 
 
@@ -1318,46 +1573,14 @@ def _tab_files():
     # Upload
     uploaded = st.file_uploader(
         "Upload FASTA file(s)",
-        type=["fa", "fasta", "fna", "bz2"],
+        type=FASTA_UPLOAD_TYPES,
         accept_multiple_files=True,
         key="fasta_upload",
+        help=UPLOAD_SIZE_HINT,
     )
     if uploaded:
-        import bz2 as _bz2
-        already_saved = st.session_state.get("_fasta_saved_ids", set())
-        new_saved = set()
-        for f in uploaded:
-            fid = (f.name, f.size)
-            if fid in already_saved:
-                continue
-            p = Path(f.name)
-            # Handle .fa.bz2 files
-            if p.name.endswith(".fa.bz2"):
-                stem = p.name[:-7]  # strip .fa.bz2
-                dest = _safe_path_under(FASTA_DIR, stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, _bz2.decompress(f.getvalue()))
-            elif p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                st.error(f"Unsupported extension: {p.suffix}")
-                continue
-            else:
-                # Normalize to .fa extension
-                dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, f.getvalue())
-            # Remove any leftover files with other FASTA extensions
-            for ext in (".fasta", ".fna"):
-                old = FASTA_DIR / (p.stem + ext)
-                if old.exists():
-                    old.unlink()
-            st.success(f"Saved {dest.name}")
-            new_saved.add(fid)
-        if new_saved:
-            st.session_state["_fasta_saved_ids"] = already_saved | new_saved
+        _save_uploaded_fastas(uploaded)
+    _render_upload_note()
 
     st.divider()
 
@@ -1376,12 +1599,11 @@ def _tab_files():
         col2.write(f"{info['seqs']} sequences")
         col3.write(_format_size(info["size"]))
         if col4.button("Delete", key=f"del_{stem}"):
-            # Find and delete the file
-            for ext in (".fa", ".fasta", ".fna"):
-                p = FASTA_DIR / f"{stem}{ext}"
-                if p.exists():
-                    p.unlink()
-                    break
+            # Remove every extension the stem resolves under, not just the
+            # first: the listing keys on the stem, so leaving one behind makes
+            # Delete look like it did nothing.
+            while (p := _fasta_path(stem)) is not None:
+                p.unlink()
             st.rerun()
 
 
@@ -1482,8 +1704,13 @@ def _tab_parameters(mode: str = "design"):
     p = st.session_state.params
 
     if st.button("Reset to defaults"):
-        st.session_state.params = dict(DEFAULT_PARAMS)
+        _reset_params_to_defaults()
+        st.session_state["_params_reset_done"] = True
         st.rerun()
+    # Shown after the rerun: with every control already at its default, a
+    # reset is otherwise indistinguishable from the button doing nothing.
+    if st.session_state.pop("_params_reset_done", False):
+        st.success("Parameters reset to defaults.")
 
     if mode == "evaluate":
         # Evaluate only needs amplicon length parameters
@@ -1491,11 +1718,11 @@ def _tab_parameters(mode: str = "design"):
             c11, c12 = st.columns(2)
             p["AMPLEN_MIN"] = c11.number_input(
                 "AMPLEN_MIN", value=int(p["AMPLEN_MIN"]),
-                min_value=30, step=10, key="p_amp_min",
+                min_value=30, step=10, key=_pkey("p_amp_min"),
             )
             p["AMPLEN_MAX"] = c12.number_input(
                 "AMPLEN_MAX", value=int(p["AMPLEN_MAX"]),
-                min_value=30, step=10, key="p_amp_max",
+                min_value=30, step=10, key=_pkey("p_amp_max"),
             )
             if p["AMPLEN_MIN"] >= p["AMPLEN_MAX"]:
                 st.warning("AMPLEN_MIN should be less than AMPLEN_MAX")
@@ -1503,11 +1730,11 @@ def _tab_parameters(mode: str = "design"):
             c13, c14 = st.columns(2)
             p["OFFLEN_MIN"] = c13.number_input(
                 "OFFLEN_MIN", value=int(p["OFFLEN_MIN"]),
-                min_value=30, step=10, key="p_off_min",
+                min_value=30, step=10, key=_pkey("p_off_min"),
             )
             p["OFFLEN_MAX"] = c14.number_input(
                 "OFFLEN_MAX", value=int(p["OFFLEN_MAX"]),
-                min_value=30, step=100, key="p_off_max",
+                min_value=30, step=100, key=_pkey("p_off_max"),
             )
 
         # Show probe cutoffs when a probe sequence is provided
@@ -1519,12 +1746,12 @@ def _tab_parameters(mode: str = "design"):
                 c15, c16 = st.columns(2)
                 p["PROBE_MAX_MISMATCHES"] = c15.number_input(
                     "PROBE_MAX_MISMATCHES", value=int(p["PROBE_MAX_MISMATCHES"]),
-                    min_value=0, max_value=10, key="p_eval_probe_mm",
+                    min_value=0, max_value=10, key=_pkey("p_eval_probe_mm"),
                     help="Maximum mismatches for probe to count as matched",
                 )
                 p["PROBE_MAX_INDELS"] = c16.number_input(
                     "PROBE_MAX_INDELS", value=int(p["PROBE_MAX_INDELS"]),
-                    min_value=0, max_value=5, key="p_eval_probe_indel",
+                    min_value=0, max_value=5, key=_pkey("p_eval_probe_indel"),
                     help="Maximum indels for probe to count as matched",
                 )
         return
@@ -1541,40 +1768,41 @@ def _tab_parameters(mode: str = "design"):
             st.caption("Multi-sequence target detected — using quick design mode.")
             c_q1, c_q2 = st.columns(2)
             p["QUICK_N_POSITIONS"] = c_q1.number_input(
-                "MSA sites to explore", value=int(p["QUICK_N_POSITIONS"]),
-                min_value=10, max_value=1000, step=10, key="p_quick_n_pos",
-                help="Number of top conserved amplicon positions to evaluate across the MSA.",
+                "Maximum MSA sites to explore", value=int(p["QUICK_N_POSITIONS"]),
+                min_value=10, max_value=10000, step=100, key=_pkey("p_quick_n_pos"),
+                help=("Upper limit on the top conserved amplicon positions to evaluate "
+                      "across the MSA. If fewer valid sites exist, all of them are used."),
             )
             p["QUICK_N_VARIANTS"] = c_q2.number_input(
                 "Primer variants per site", value=int(p["QUICK_N_VARIANTS"]),
-                min_value=1, max_value=50, step=1, key="p_quick_n_var",
+                min_value=1, max_value=50, step=1, key=_pkey("p_quick_n_var"),
                 help="Number of wobble-optimized primer variants per position per direction.",
             )
         c1, c2 = st.columns(2)
         p["TM_MIN"] = c1.number_input(
-            "TM_MIN", value=float(p["TM_MIN"]), step=0.5, key="p_tm_min",
+            "TM_MIN", value=float(p["TM_MIN"]), step=0.5, key=_pkey("p_tm_min"),
         )
         p["TM_MAX"] = c2.number_input(
-            "TM_MAX", value=float(p["TM_MAX"]), step=0.5, key="p_tm_max",
+            "TM_MAX", value=float(p["TM_MAX"]), step=0.5, key=_pkey("p_tm_max"),
         )
         if p["TM_MIN"] >= p["TM_MAX"]:
             st.warning("TM_MIN should be less than TM_MAX")
 
         p["GC_MAX"] = st.number_input(
-            "GC_MAX (%)", value=float(p["GC_MAX"]), step=1.0, key="p_gc_max",
+            "GC_MAX (%)", value=float(p["GC_MAX"]), step=1.0, key=_pkey("p_gc_max"),
         )
         p["DG_MIN"] = st.number_input(
-            "DG_MIN (kcal/mol)", value=float(p["DG_MIN"]), step=0.5, key="p_dg_min",
+            "DG_MIN (kcal/mol)", value=float(p["DG_MIN"]), step=0.5, key=_pkey("p_dg_min"),
         )
 
         c3, c4 = st.columns(2)
         p["PRIMER_LEN_MIN"] = c3.number_input(
             "PRIMER_LEN_MIN", value=int(p["PRIMER_LEN_MIN"]),
-            min_value=15, max_value=35, key="p_len_min",
+            min_value=15, max_value=35, key=_pkey("p_len_min"),
         )
         p["PRIMER_LEN_MAX"] = c4.number_input(
             "PRIMER_LEN_MAX", value=int(p["PRIMER_LEN_MAX"]),
-            min_value=15, max_value=35, key="p_len_max",
+            min_value=15, max_value=35, key=_pkey("p_len_max"),
         )
         if p["PRIMER_LEN_MIN"] > p["PRIMER_LEN_MAX"]:
             st.warning("PRIMER_LEN_MIN should be <= PRIMER_LEN_MAX")
@@ -1587,11 +1815,11 @@ def _tab_parameters(mode: str = "design"):
             c5, c6 = st.columns(2)
             p["PROBE_LEN_MIN"] = c5.number_input(
                 "PROBE_LEN_MIN", value=int(p["PROBE_LEN_MIN"]),
-                min_value=15, max_value=40, key="p_probe_len_min",
+                min_value=15, max_value=40, key=_pkey("p_probe_len_min"),
             )
             p["PROBE_LEN_MAX"] = c6.number_input(
                 "PROBE_LEN_MAX", value=int(p["PROBE_LEN_MAX"]),
-                min_value=15, max_value=40, key="p_probe_len_max",
+                min_value=15, max_value=40, key=_pkey("p_probe_len_max"),
             )
             if p["PROBE_LEN_MIN"] > p["PROBE_LEN_MAX"]:
                 st.warning("PROBE_LEN_MIN should be <= PROBE_LEN_MAX")
@@ -1599,41 +1827,43 @@ def _tab_parameters(mode: str = "design"):
             c7, c8 = st.columns(2)
             p["PROBE_TM_MIN"] = c7.number_input(
                 "PROBE_TM_MIN", value=float(p["PROBE_TM_MIN"]),
-                step=0.5, key="p_probe_tm_min",
+                step=0.5, key=_pkey("p_probe_tm_min"),
             )
             p["PROBE_TM_MAX"] = c8.number_input(
                 "PROBE_TM_MAX", value=float(p["PROBE_TM_MAX"]),
-                step=0.5, key="p_probe_tm_max",
+                step=0.5, key=_pkey("p_probe_tm_max"),
             )
             if p["PROBE_TM_MIN"] >= p["PROBE_TM_MAX"]:
                 st.warning("PROBE_TM_MIN should be less than PROBE_TM_MAX")
 
             p["PROBE_GC_MAX"] = st.number_input(
                 "PROBE_GC_MAX (%)", value=float(p["PROBE_GC_MAX"]),
-                step=1.0, key="p_probe_gc_max",
+                step=1.0, key=_pkey("p_probe_gc_max"),
             )
             p["PROBE_DG_MIN"] = st.number_input(
                 "PROBE_DG_MIN (kcal/mol)", value=float(p["PROBE_DG_MIN"]),
-                step=0.5, key="p_probe_dg_min",
+                step=0.5, key=_pkey("p_probe_dg_min"),
             )
 
             p["PROBE_HOMOPOLYMER_MAX"] = st.number_input(
                 "PROBE_HOMOPOLYMER_MAX", value=int(p["PROBE_HOMOPOLYMER_MAX"]),
-                min_value=1, max_value=10, key="p_probe_hp",
+                min_value=1, max_value=10, key=_pkey("p_probe_hp"),
             )
             p["PROBE_AVOID_5PRIME_G"] = st.checkbox(
                 "PROBE_AVOID_5PRIME_G", value=bool(p["PROBE_AVOID_5PRIME_G"]),
-                key="p_probe_5g",
+                key=_pkey("p_probe_5g"),
+                help="Reject probes that start with G at the 5' end. A G next to the "
+                     "reporter dye quenches its fluorescence, even after cleavage.",
             )
 
             c9, c10 = st.columns(2)
             p["PROBE_MAX_MISMATCHES"] = c9.number_input(
                 "PROBE_MAX_MISMATCHES", value=int(p["PROBE_MAX_MISMATCHES"]),
-                min_value=0, max_value=10, key="p_probe_mm",
+                min_value=0, max_value=10, key=_pkey("p_probe_mm"),
             )
             p["PROBE_MAX_INDELS"] = c10.number_input(
                 "PROBE_MAX_INDELS", value=int(p["PROBE_MAX_INDELS"]),
-                min_value=0, max_value=10, key="p_probe_indels",
+                min_value=0, max_value=10, key=_pkey("p_probe_indels"),
             )
 
     # --- Input preparation ---
@@ -1641,11 +1871,11 @@ def _tab_parameters(mode: str = "design"):
         c11, c12 = st.columns(2)
         p["AMPLEN_MIN"] = c11.number_input(
             "AMPLEN_MIN", value=int(p["AMPLEN_MIN"]),
-            min_value=30, step=10, key="p_amp_min",
+            min_value=30, step=10, key=_pkey("p_amp_min"),
         )
         p["AMPLEN_MAX"] = c12.number_input(
             "AMPLEN_MAX", value=int(p["AMPLEN_MAX"]),
-            min_value=30, step=10, key="p_amp_max",
+            min_value=30, step=10, key=_pkey("p_amp_max"),
         )
         if p["AMPLEN_MIN"] >= p["AMPLEN_MAX"]:
             st.warning("AMPLEN_MIN should be less than AMPLEN_MAX")
@@ -1653,29 +1883,29 @@ def _tab_parameters(mode: str = "design"):
         c13, c14 = st.columns(2)
         p["OFFLEN_MIN"] = c13.number_input(
             "OFFLEN_MIN", value=int(p["OFFLEN_MIN"]),
-            min_value=30, step=10, key="p_off_min",
+            min_value=30, step=10, key=_pkey("p_off_min"),
         )
         p["OFFLEN_MAX"] = c14.number_input(
             "OFFLEN_MAX", value=int(p["OFFLEN_MAX"]),
-            min_value=30, step=100, key="p_off_max",
+            min_value=30, step=100, key=_pkey("p_off_max"),
         )
 
     # --- Evaluation ---
     with st.expander("Evaluation", expanded=False):
         p["NUM_TOP_SENSITIVITY"] = st.number_input(
             "NUM_TOP_SENSITIVITY", value=int(p["NUM_TOP_SENSITIVITY"]),
-            min_value=10, step=10, key="p_num_top",
+            min_value=10, step=10, key=_pkey("p_num_top"),
         )
         if is_quick:
             c_ev1, c_ev2 = st.columns(2)
             p["QUICK_COV_MIN"] = c_ev1.number_input(
                 "Coverage goal", value=float(p.get("QUICK_COV_MIN", 1.0)),
-                min_value=0.0, max_value=1.0, step=0.05, key="p_quick_cov",
+                min_value=0.0, max_value=1.0, step=0.05, key=_pkey("p_quick_cov"),
                 help="Minimum coverage fraction for early stopping (1.0 = all sequences).",
             )
             p["QUICK_ACT_MIN"] = c_ev2.number_input(
                 "Activity goal", value=float(p.get("QUICK_ACT_MIN", 1.0)),
-                min_value=0.0, max_value=1.0, step=0.05, key="p_quick_act",
+                min_value=0.0, max_value=1.0, step=0.05, key=_pkey("p_quick_act"),
                 help="Minimum activity fraction for early stopping (1.0 = all sequences).",
             )
 
@@ -1689,11 +1919,14 @@ def _build_command() -> list[str]:
     mode = st.session_state.get("mode", "Singleplex")
     probe = st.session_state.get("probe_enabled",
                                   st.session_state.get("_probe_enabled_saved", False))
-    cores = st.session_state.get("cores", 1)
+    cores = CORES
     dry_run = st.session_state.get("dry_run", False)
 
     snakemake_bin = _find_tool("snakemake") or "snakemake"
-    cmd = [snakemake_bin, "-s", "Snakefile", "--cores", str(cores)]
+    # gpu=1 serializes the evaluate rules on a GPU box; where there is no GPU
+    # the Snakefile prices them at 0 so they overlap freely (see GPU_COST).
+    cmd = [snakemake_bin, "-s", "Snakefile", "--cores", str(cores),
+           "--resources", "gpu=1"]
 
     config_args: list[str] = []
     if mode == "Multiplex":
@@ -1897,7 +2130,7 @@ def _save_run_config(status: str | None = None):
         "host": st.session_state.get("host", []),
         "probe_enabled": st.session_state.get("probe_enabled",
                                               st.session_state.get("_probe_enabled_saved", False)),
-        "cores": st.session_state.get("cores", 1),
+        "cores": CORES,
     }
     if status:
         config["status"] = status
@@ -1927,6 +2160,7 @@ def _save_run_config(status: str | None = None):
         if st.session_state.get("eval_method") == "Paste sequences":
             config["eval_forward"] = st.session_state.get("eval_for") or st.session_state.get("_eval_for_saved", "")
             config["eval_reverse"] = st.session_state.get("eval_rev") or st.session_state.get("_eval_rev_saved", "")
+            config["eval_probe"] = st.session_state.get("eval_pro") or st.session_state.get("_eval_pro_saved", "")
         else:
             config["eval_pset_path"] = st.session_state.get("eval_pset_path", "")
 
@@ -1959,10 +2193,7 @@ def _tab_run():
                   help="Identifier for this run. Results will be saved under this name.")
 
     # Controls
-    c1, c2 = st.columns(2)
-    max_cpu = os.cpu_count() or 1
-    c1.slider("CPU cores", min_value=1, max_value=max_cpu, value=min(4, max_cpu), key="cores")
-    c2.checkbox("Dry run (plan only, no execution)", key="dry_run")
+    st.checkbox("Dry run (plan only, no execution)", key="dry_run")
 
     # Preflight
     errors = _preflight_checks()
@@ -1991,6 +2222,12 @@ def _tab_run():
 
     # Handle Stop
     if stop_clicked:
+        # Stop also cancels a run that is still queued behind another one, so
+        # clear the start flag the queue loop below re-reads on every rerun.
+        st.session_state.pipeline_should_start = False
+        ticket = st.session_state.pop("run_ticket", None)
+        if ticket is not None:
+            run_gate.release(ticket)
         pid = st.session_state.get("pipeline_pid")
         if pid:
             try:
@@ -2011,231 +2248,287 @@ def _tab_run():
         st.session_state.pipeline_return_code = None
         st.session_state.pipeline_log = ""
         st.session_state.pipeline_completed_rules = set()
+        st.session_state.pipeline_elapsed = ""
+        st.session_state.pipeline_timed_out = False
         st.rerun()
 
     # Execute pipeline (triggered after rerun from Run click)
     if st.session_state.get("pipeline_should_start"):
+        # Admission control. One instance's cores and (on Cloud Run) its tmpfs
+        # scratch are shared by every session in this process, so only a couple
+        # of runs may execute at once; the rest queue here. pipeline_should_start
+        # stays set until we are admitted, so each rerun comes back through this
+        # branch -- and try_start doubles as the heartbeat that holds our place.
+        # The Stop button above cancels a queued run.
+        ticket = st.session_state.get("run_ticket")
+        if ticket is None:
+            ticket = run_gate.take_ticket()
+            st.session_state.run_ticket = ticket
+        admitted, ahead = run_gate.try_start(ticket)
+        if not admitted:
+            st.info(
+                ("You're next in line — waiting for a running job to finish."
+                 if ahead == 0 else
+                 f"Waiting for a free slot on this server — {ahead} run"
+                 f"{'s' if ahead > 1 else ''} ahead of you.")
+                + " Press Stop to cancel."
+            )
+            time.sleep(2)
+            st.rerun()
+
         st.session_state.pipeline_should_start = False
 
-        scratch_dir = _write_pipeline_files()
+        # Bound before the try so the finally can always see them.
+        proc = None
+        limit_timer = None
+        try:
+            scratch_dir = _write_pipeline_files()
 
-        # Keep a copy of the run's inputs and a live log next to its outputs
-        # (the scratch dir is deleted afterwards); error reports bundle these.
-        run_out_dir = RUNS_DIR / st.session_state.run_id
-        run_out_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("Snakefile", "params.txt"):
-            if (scratch_dir / name).is_file():
-                shutil.copy2(scratch_dir / name, run_out_dir / name)
-        st.session_state.pipeline_run_id = st.session_state.run_id
-        st.session_state.pipeline_started_at = time.time()
-        _save_run_config(status="running")
-        log_fh = open(run_out_dir / "pipeline.log", "w", buffering=1)
+            # Keep a copy of the run's inputs and a live log next to its outputs
+            # (the scratch dir is deleted afterwards); error reports bundle these.
+            run_out_dir = RUNS_DIR / st.session_state.run_id
+            run_out_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("Snakefile", "params.txt"):
+                if (scratch_dir / name).is_file():
+                    shutil.copy2(scratch_dir / name, run_out_dir / name)
+            st.session_state.pipeline_run_id = st.session_state.run_id
+            st.session_state.pipeline_started_at = time.time()
+            _save_run_config(status="running")
+            log_fh = open(run_out_dir / "pipeline.log", "w", buffering=1)
 
-        # Unlock the (fresh) scratch dir in case of a leftover lock from a crash.
-        snakemake_bin = _find_tool("snakemake") or "snakemake"
-        subprocess.run(
-            [snakemake_bin, "-s", "Snakefile", "--unlock", "--cores", "1"],
-            capture_output=True, cwd=str(scratch_dir),
-        )
+            # Unlock the (fresh) scratch dir in case of a leftover lock from a crash.
+            snakemake_bin = _find_tool("snakemake") or "snakemake"
+            subprocess.run(
+                [snakemake_bin, "-s", "Snakefile", "--unlock", "--cores", "1"],
+                capture_output=True, cwd=str(scratch_dir),
+            )
 
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        # Ensure the conda env bin dir is on PATH (for sam2pairwise, bowtie2, etc.)
-        # Use snakemake's location to find the correct env bin dir, since
-        # CONDA_PREFIX may point to the base env rather than primercast.
-        snakemake_path = _find_tool("snakemake")
-        env_bin = str(Path(sys.executable).parent)
-        extra_dirs = [env_bin]
-        if snakemake_path:
-            extra_dirs.append(str(Path(snakemake_path).parent))
-        for d in extra_dirs:
-            if d and d not in env.get("PATH", ""):
-                env["PATH"] = d + os.pathsep + env.get("PATH", "")
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            # Ensure the conda env bin dir is on PATH (for sam2pairwise, bowtie2, etc.)
+            # Use snakemake's location to find the correct env bin dir, since
+            # CONDA_PREFIX may point to the base env rather than primercast.
+            snakemake_path = _find_tool("snakemake")
+            env_bin = str(Path(sys.executable).parent)
+            extra_dirs = [env_bin]
+            if snakemake_path:
+                extra_dirs.append(str(Path(snakemake_path).parent))
+            for d in extra_dirs:
+                if d and d not in env.get("PATH", ""):
+                    env["PATH"] = d + os.pathsep + env.get("PATH", "")
 
-        cmd = _build_command()
+            cmd = _build_command()
 
-        progress_area = st.empty()
-        status_area = st.empty()
+            progress_area = st.empty()
+            status_area = st.empty()
 
-        all_targets = _get_all_targets()
-        show_targets = len(all_targets) > 1
+            all_targets = _get_all_targets()
+            show_targets = len(all_targets) > 1
 
-        completed_rules: set[str] = set()
-        # Per-target tracking: rule_name -> set of completed targets
-        rule_done_targets: dict[str, set[str]] = {}
-        current_rule = rules[0][0] if rules else ""
-        current_target = ""
-        log = ""
-        start_time = time.time()
+            completed_rules: set[str] = set()
+            # Per-target tracking: rule_name -> set of completed targets
+            rule_done_targets: dict[str, set[str]] = {}
+            current_rule = rules[0][0] if rules else ""
+            current_target = ""
+            log = ""
+            start_time = time.time()
 
-        def _finish_current():
-            """Mark the current rule+target as completed."""
-            nonlocal current_target
-            if current_rule and current_target:
-                rule_done_targets.setdefault(current_rule, set()).add(current_target)
-                current_target = ""
+            def _finish_current():
+                """Mark the current rule+target as completed."""
+                nonlocal current_target
+                if current_rule and current_target:
+                    rule_done_targets.setdefault(current_rule, set()).add(current_target)
+                    current_target = ""
 
-        def _render_rule_line(rule_name, label, is_current=False):
-            done_targets = rule_done_targets.get(rule_name, set())
-            is_per_target = rule_name in _PER_TARGET_RULES and show_targets
+            def _render_rule_line(rule_name, label, is_current=False):
+                done_targets = rule_done_targets.get(rule_name, set())
+                is_per_target = rule_name in _PER_TARGET_RULES and show_targets
 
-            if is_per_target:
-                is_done = done_targets >= set(all_targets)
-            else:
-                is_done = rule_name in completed_rules
-
-            if is_done:
                 if is_per_target:
-                    tstr = ", ".join(sorted(done_targets))
-                    return f"✅ &nbsp; {label} — {tstr}"
-                return f"✅ &nbsp; {label}"
-            elif is_current:
-                if is_per_target:
+                    is_done = done_targets >= set(all_targets)
+                else:
+                    is_done = rule_name in completed_rules
+
+                if is_done:
+                    if is_per_target:
+                        tstr = ", ".join(sorted(done_targets))
+                        return f"✅ &nbsp; {label} — {tstr}"
+                    return f"✅ &nbsp; {label}"
+                elif is_current:
+                    if is_per_target:
+                        parts = []
+                        for t in all_targets:
+                            if t in done_targets:
+                                parts.append(f"{t} ✓")
+                            elif t == current_target:
+                                parts.append(f"**{t}**")
+                            else:
+                                parts.append(f"<span style='color:#ccc'>{t}</span>")
+                        tstr = ", ".join(parts)
+                        return f"⏳ &nbsp; **{label}** — {tstr}"
+                    return f"⏳ &nbsp; **{label}** ..."
+                elif is_per_target and done_targets:
+                    # Not current rule but has some targets done (partially complete)
                     parts = []
                     for t in all_targets:
                         if t in done_targets:
                             parts.append(f"{t} ✓")
-                        elif t == current_target:
-                            parts.append(f"**{t}**")
                         else:
                             parts.append(f"<span style='color:#ccc'>{t}</span>")
                     tstr = ", ".join(parts)
-                    return f"⏳ &nbsp; **{label}** — {tstr}"
-                return f"⏳ &nbsp; **{label}** ..."
-            elif is_per_target and done_targets:
-                # Not current rule but has some targets done (partially complete)
-                parts = []
-                for t in all_targets:
-                    if t in done_targets:
-                        parts.append(f"{t} ✓")
-                    else:
-                        parts.append(f"<span style='color:#ccc'>{t}</span>")
-                tstr = ", ".join(parts)
-                return f"⏳ &nbsp; {label} — {tstr}"
-            else:
-                return f"⚪ &nbsp; {label}"
+                    return f"⏳ &nbsp; {label} — {tstr}"
+                else:
+                    return f"⚪ &nbsp; {label}"
 
-        def _update_progress():
-            lines = []
-            for rule_name, label in rules:
-                is_current = rule_name == current_rule
-                lines.append(_render_rule_line(rule_name, label, is_current))
+            def _update_progress():
+                lines = []
+                for rule_name, label in rules:
+                    is_current = rule_name == current_rule
+                    lines.append(_render_rule_line(rule_name, label, is_current))
+                progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
+
+            _update_progress()
+            _live_timer(status_area, start_time)
+
+            # Own process group, so Stop and the time limit end snakemake's children
+            # without signalling the web server.
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(scratch_dir),
+                env=env,
+                text=True,
+                start_new_session=True,
+            )
+            st.session_state.pipeline_pid = proc.pid
+
+            timed_out = threading.Event()
+
+            def _time_out():
+                timed_out.set()
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+            limit_timer = threading.Timer(RUN_TIME_LIMIT, _time_out)
+            limit_timer.daemon = True
+            limit_timer.start()
+
+            while proc.poll() is None:
+                line = proc.stdout.readline()
+                if line:
+                    log += line
+                    log_fh.write(line)
+                    stripped = line.strip()
+                    if stripped.startswith("rule ") or stripped.startswith("localrule "):
+                        rule_name = stripped.split("rule ")[1].rstrip(":")
+                        # Finish previous rule+target
+                        _finish_current()
+                        if current_rule and current_rule != rule_name:
+                            # Only mark non-per-target rules as completed on transition
+                            if current_rule not in _PER_TARGET_RULES or not show_targets:
+                                completed_rules.add(current_rule)
+                        current_rule = rule_name
+                        current_target = ""
+                        _update_progress()
+                    elif stripped.startswith("wildcards:"):
+                        # Parse target from wildcards line (target=, virus=, on=, or filename=)
+                        wc_target = ""
+                        for wc_name in ("target", "virus", "on"):
+                            m = re.search(rf"{wc_name}=(\S+)", stripped)
+                            if m:
+                                wc_target = m.group(1).rstrip(",")
+                                break
+                        if not wc_target:
+                            # Try filename= (format: "virus.target")
+                            m = re.search(r"filename=(\S+)", stripped)
+                            if m:
+                                parts = m.group(1).rstrip(",").split(".")
+                                if len(parts) >= 2:
+                                    wc_target = parts[-1]
+                        if wc_target:
+                            current_target = wc_target
+                            _update_progress()
+                    elif "Finished job" in stripped:
+                        _finish_current()
+                        _update_progress()
+
+            limit_timer.cancel()
+
+            # Read remaining output
+            remaining = proc.stdout.read()
+            if remaining:
+                log += remaining
+                log_fh.write(remaining)
+            log_fh.close()
+
+            # Mark last rule as complete
+            _finish_current()
+            if current_rule:
+                if current_rule not in _PER_TARGET_RULES or not show_targets:
+                    completed_rules.add(current_rule)
+            # Mark per-target rules with any completed targets as done
+            # (pipeline finished, so all instances have run)
+            for rn, _ in rules:
+                if rn in _PER_TARGET_RULES and rule_done_targets.get(rn):
+                    completed_rules.add(rn)
+
+            rc = proc.returncode
+            st.session_state.pipeline_running = False
+            st.session_state.pipeline_return_code = rc
+
+            # Clean up the scratch dir now that the subprocess is done — it held
+            # only the generated Snakefile/params.txt and .snakemake lock, all of
+            # which are ephemeral. Outputs landed in the shared RUNS_DIR via symlink.
+            scratch_path = st.session_state.pop("pipeline_scratch_dir", None)
+            if scratch_path:
+                import shutil as _shutil
+                _shutil.rmtree(scratch_path, ignore_errors=True)
+            st.session_state.pipeline_log = log
+            st.session_state.pipeline_completed_rules = completed_rules
+            st.session_state.pipeline_rule_done_targets = rule_done_targets
+
             elapsed = int(time.time() - start_time)
             mins, secs = divmod(elapsed, 60)
-            progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
-            status_area.caption(f"Elapsed: {mins}m {secs}s")
+            st.session_state.pipeline_elapsed = f"Completed in {mins}m {secs}s"
+            st.session_state.pipeline_timed_out = timed_out.is_set()
 
-        _update_progress()
-
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=str(scratch_dir),
-            env=env,
-            text=True,
-        )
-        st.session_state.pipeline_pid = proc.pid
-
-        while proc.poll() is None:
-            line = proc.stdout.readline()
-            if line:
-                log += line
-                log_fh.write(line)
-                stripped = line.strip()
-                if stripped.startswith("rule ") or stripped.startswith("localrule "):
-                    rule_name = stripped.split("rule ")[1].rstrip(":")
-                    # Finish previous rule+target
-                    _finish_current()
-                    if current_rule and current_rule != rule_name:
-                        # Only mark non-per-target rules as completed on transition
-                        if current_rule not in _PER_TARGET_RULES or not show_targets:
-                            completed_rules.add(current_rule)
-                    current_rule = rule_name
-                    current_target = ""
-                    _update_progress()
-                elif stripped.startswith("wildcards:"):
-                    # Parse target from wildcards line (target=, virus=, on=, or filename=)
-                    wc_target = ""
-                    for wc_name in ("target", "virus", "on"):
-                        m = re.search(rf"{wc_name}=(\S+)", stripped)
-                        if m:
-                            wc_target = m.group(1).rstrip(",")
-                            break
-                    if not wc_target:
-                        # Try filename= (format: "virus.target")
-                        m = re.search(r"filename=(\S+)", stripped)
-                        if m:
-                            parts = m.group(1).rstrip(",").split(".")
-                            if len(parts) >= 2:
-                                wc_target = parts[-1]
-                    if wc_target:
-                        current_target = wc_target
-                        _update_progress()
-                elif "Finished job" in stripped:
-                    _finish_current()
-                    _update_progress()
-
-        # Read remaining output
-        remaining = proc.stdout.read()
-        if remaining:
-            log += remaining
-            log_fh.write(remaining)
-        log_fh.close()
-
-        # Mark last rule as complete
-        _finish_current()
-        if current_rule:
-            if current_rule not in _PER_TARGET_RULES or not show_targets:
-                completed_rules.add(current_rule)
-        # Mark per-target rules with any completed targets as done
-        # (pipeline finished, so all instances have run)
-        for rn, _ in rules:
-            if rn in _PER_TARGET_RULES and rule_done_targets.get(rn):
-                completed_rules.add(rn)
-
-        rc = proc.returncode
-        st.session_state.pipeline_running = False
-        st.session_state.pipeline_return_code = rc
-
-        # Clean up the scratch dir now that the subprocess is done — it held
-        # only the generated Snakefile/params.txt and .snakemake lock, all of
-        # which are ephemeral. Outputs landed in the shared RUNS_DIR via symlink.
-        scratch_path = st.session_state.pop("pipeline_scratch_dir", None)
-        if scratch_path:
-            import shutil as _shutil
-            _shutil.rmtree(scratch_path, ignore_errors=True)
-        st.session_state.pipeline_log = log
-        st.session_state.pipeline_completed_rules = completed_rules
-        st.session_state.pipeline_rule_done_targets = rule_done_targets
-
-        elapsed = int(time.time() - start_time)
-        mins, secs = divmod(elapsed, 60)
-
-        # Final progress
-        lines = []
-        for rule_name, label in rules:
-            if rule_name in completed_rules:
-                done_targets = rule_done_targets.get(rule_name, set())
-                if rule_name in _PER_TARGET_RULES and show_targets and done_targets:
-                    tstr = ", ".join(sorted(done_targets))
-                    lines.append(f"✅ &nbsp; {label} — {tstr}")
-                else:
-                    lines.append(f"✅ &nbsp; {label}")
-            else:
-                lines.append(f"⚪ &nbsp; {label}")
-        progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
-        status_area.caption(f"Completed in {mins}m {secs}s")
-
-        warnings = _pipeline_warnings()
-        _save_run_config(status=(f"failed (exit code {rc})" if rc != 0
-                                 else "succeeded with warnings" if warnings
-                                 else "succeeded"))
-        _render_pipeline_outcome(rc, warnings)
-        if rc != 0:
-            with st.expander("Show error log"):
-                last_lines = "\n".join(log.splitlines()[-50:])
-                st.code(last_lines, language="text")
+            warnings = _pipeline_warnings()
+            limit_minutes = RUN_TIME_LIMIT // 60
+            _save_run_config(status=(f"stopped at the {limit_minutes}-minute time limit"
+                                     if timed_out.is_set()
+                                     else f"failed (exit code {rc})" if rc != 0
+                                     else "succeeded with warnings" if warnings
+                                     else "succeeded"))
+            # Rerun so the Run/Stop/Back buttons, drawn before the run started, are
+            # redrawn as idle; the branch below then shows the outcome.
+            st.rerun()
+        finally:
+            # Streamlit aborts this script run with StopException when the
+            # browser tab closes or the user navigates away, and the normal
+            # path above ends in st.rerun() (RerunException) -- so control
+            # leaves this block without reaching any trailing cleanup. The
+            # subprocess was started with start_new_session=True, so an
+            # abandoned run would otherwise keep every core it was given and
+            # its tmpfs scratch until the time limit fired, long after its
+            # queue slot had been handed to someone else.
+            if limit_timer is not None:
+                limit_timer.cancel()
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            # A no-op on the normal path, which has already popped this; on an
+            # abandoned run it reclaims the scratch dir, which on Cloud Run is
+            # tmpfs and so counts against the instance's memory.
+            scratch_path = st.session_state.pop("pipeline_scratch_dir", None)
+            if scratch_path:
+                shutil.rmtree(scratch_path, ignore_errors=True)
+            run_gate.release(ticket)
+            st.session_state.pop("run_ticket", None)
 
     # Show previous run result if not currently running
     elif not running and st.session_state.get("pipeline_return_code") is not None:
@@ -2257,7 +2550,13 @@ def _tab_run():
             else:
                 lines.append(f"⚪ &nbsp; {label}")
         st.markdown("<br>".join(lines), unsafe_allow_html=True)
+        if st.session_state.get("pipeline_elapsed"):
+            st.caption(st.session_state.pipeline_elapsed)
 
+        if st.session_state.get("pipeline_timed_out"):
+            st.error(f"**Run stopped after {RUN_TIME_LIMIT // 60} minutes**, the time "
+                     "limit for runs on this server. Try fewer or smaller targets, or run "
+                     "the pipeline locally.")
         _render_pipeline_outcome(rc, _pipeline_warnings())
         if rc != 0:
             log = st.session_state.get("pipeline_log", "")
@@ -2274,25 +2573,58 @@ def _pipeline_diagnoses(run_id: str) -> list:
     return explain_run(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
 
 
+def _format_change(remaining: int, before) -> str:
+    """Change from the previous step of the same unit ("—" when not comparable)."""
+    if not before:
+        return "—"
+    diff = remaining - before
+    return f"{diff:+,} ({diff / before:+.0%})" if diff else "0"
+
+
 def _render_funnel_table(steps: list):
     st.table([
         {
             "Filter": step.get("filter", ""),
             "Remaining": f"{step.get('remaining', 0):,}",
+            "Change": _format_change(step.get("remaining", 0), before),
             "Controlled by": ", ".join(
                 f"{k}={v}" for k, v in (step.get("params") or {}).items()),
         }
-        for step in steps
+        for step, before in zip(steps, step_baselines(steps))
     ])
 
 
+def _render_funnel_stage(funnel):
+    """One stage's funnel table under a heading (expanders can't be nested)."""
+    st.markdown(f"**Filter stage: {funnel.stage_label}"
+                + (f" ({funnel.target})" if funnel.target else "") + "**")
+    _render_funnel_table(funnel.steps)
+
+
+def _render_run_funnels(funnels: list):
+    """Which filters narrowed the candidates, collapsed for successful runs."""
+    if not funnels:
+        return
+    with st.expander("Filter statistics", expanded=False):
+        st.markdown("**Where filters narrowed the candidates**")
+        summaries = [f.summary for f in funnels if f.summary]
+        if summaries:
+            st.markdown("\n".join(f"- {s}" for s in summaries))
+        else:
+            st.caption("No filter removed any candidates.")
+        for funnel in funnels:
+            _render_funnel_stage(funnel)
+
+
 def _render_failure_diagnosis():
-    """Name the filter that stopped the pipeline, with its candidate funnel."""
-    for diagnosis in _pipeline_diagnoses(st.session_state.get("pipeline_run_id", "")):
+    """Name the filter that stopped the pipeline; its funnel is shown expanded."""
+    diagnoses = _pipeline_diagnoses(st.session_state.get("pipeline_run_id", ""))
+    for diagnosis in diagnoses:
         st.error(f"**No candidates left.** {diagnosis.message}")
-        with st.expander(f"Filter stage: {diagnosis.stage_label}"
-                         + (f" ({diagnosis.target})" if diagnosis.target else "")):
-            _render_funnel_table(diagnosis.steps)
+    if diagnoses:
+        with st.expander("Filter statistics", expanded=True):
+            for diagnosis in diagnoses:
+                _render_funnel_stage(diagnosis)
 
 
 def _render_run_warnings(warnings: list):
@@ -2315,6 +2647,14 @@ def _pipeline_warnings() -> list:
     return run_warnings(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
 
 
+def _pipeline_funnels() -> list:
+    """Filter funnels of the pipeline run started from this session."""
+    run_id = st.session_state.get("pipeline_run_id", "")
+    if not run_id:
+        return []
+    return run_funnels(RUNS_DIR / run_id, since=st.session_state.get("pipeline_started_at"))
+
+
 def _render_pipeline_outcome(rc: int, warnings: list):
     """Final status of a pipeline run. A run with warnings is not reported as a success."""
     if rc != 0:
@@ -2325,6 +2665,8 @@ def _render_pipeline_outcome(rc: int, warnings: list):
     else:
         st.success("Pipeline finished successfully!")
     _render_run_warnings(warnings)
+    if rc == 0:
+        _render_run_funnels(_pipeline_funnels())
 
 
 # ---------------------------------------------------------------------------
@@ -2852,6 +3194,19 @@ def _tab_results():
             )
 
     if past_runs:
+        # A keyed selectbox takes its value from session_state and ignores
+        # `index=`, so without this the page keeps showing whichever run was
+        # selected last time -- and the assignment below writes that stale id
+        # back into run_id, which the params.txt download and the error report
+        # also read. Follow the pipeline whenever it finishes a new run; a
+        # manual pick afterwards still sticks, because _results_shown_run has
+        # already caught up by then.
+        latest_run = st.session_state.get("pipeline_run_id", "")
+        if (latest_run and latest_run in past_runs
+                and st.session_state.get("_results_shown_run") != latest_run):
+            st.session_state["results_run_selector"] = latest_run
+            st.session_state["_results_shown_run"] = latest_run
+
         # Default to current run_id if it exists in the list
         default_idx = 0
         if run_id in past_runs:
@@ -2916,6 +3271,9 @@ def _tab_results():
         else:
             st.info("No CSV results for this run yet.")
 
+    if workflow in ("design", "evaluate") and run_dir and run_dir.exists():
+        _render_run_funnels(run_funnels(run_dir))
+
     # --- Evaluate reports (evaluate/monitor workflows only) ---
     if workflow in ("evaluate", "monitor"):
         st.subheader("Evaluation reports")
@@ -2948,8 +3306,17 @@ def _tab_results():
             options=xlsx_labels,
             key="result_xlsx",
         )
+        # Streamlit only resets a stale keyed selection to `index=` from 1.54
+        # on; before that the stored label survives even when it is gone from
+        # options, and a bare next() would raise StopIteration and take the
+        # whole results section down with it. Rescue is when that bites: it
+        # writes `<name>_final.xlsx` and then renames it over `<name>.xlsx`,
+        # so a label the user selected mid-run can vanish under them.
+        xf = next((f for f in xlsx_files if f.stem == selected_label), None)
+        if xf is None:
+            xf = xlsx_files[0]
+            selected_label = xf.stem
         if selected_label:
-            xf = next(f for f in xlsx_files if f.stem == selected_label)
             try:
                 wb = load_workbook(xf, read_only=True)
                 ws = wb["summary"]
@@ -3317,6 +3684,8 @@ def _page_select_target():
             # Extract stem name (everything before the first double-space)
             selected_stem = selected_label.split("  (")[0]
             st.session_state.targets = [selected_stem]
+            if warning := _large_target_warning(selected_stem):
+                st.warning(warning)
         else:
             st.session_state.targets = []
     else:
@@ -3333,36 +3702,15 @@ def _page_select_target():
         st.markdown("**Upload FASTA file**")
         uploaded = st.file_uploader(
             "Upload FASTA file(s)",
-            type=["fa", "fasta", "fna"],
+            type=FASTA_UPLOAD_TYPES,
             accept_multiple_files=True,
             key="fasta_upload",
             label_visibility="collapsed",
+            help=UPLOAD_SIZE_HINT,
         )
-        if uploaded:
-            already_saved = st.session_state.get("_fasta_saved_ids", set())
-            new_saved = set()
-            for f in uploaded:
-                fid = (f.name, f.size)
-                if fid in already_saved:
-                    continue
-                p = Path(f.name)
-                if p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                    st.error(f"Unsupported extension: {p.suffix}")
-                    continue
-                dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, f.getvalue())
-                for ext in (".fasta", ".fna"):
-                    old = FASTA_DIR / (p.stem + ext)
-                    if old.exists():
-                        old.unlink()
-                st.success(f"Saved {dest.name}")
-                new_saved.add(fid)
-            if new_saved:
-                st.session_state["_fasta_saved_ids"] = already_saved | new_saved
-                st.rerun()
+        if uploaded and _save_uploaded_fastas(uploaded):
+            st.rerun()
+        _render_upload_note()
 
     with add_col2:
         st.markdown("**Fetch from NCBI Virus (using gget)**")
@@ -3383,6 +3731,146 @@ def _page_select_target():
 
     if not selected:
         st.caption("Select a target sequence to continue.")
+
+
+def _use_monitor_target(row: dict):
+    """Record a manually set-up monitor target as a one-row mastersheet."""
+    csv_text = _rows_to_sheet_csv(MANUAL_SHEET_HEADERS, [row])
+    headers, data_rows = _load_spreadsheet(csv_text)
+    st.session_state["monitor_spreadsheet_data"] = {
+        "csv_text": csv_text,
+        "base_csv_text": csv_text,
+        "headers": headers,
+        "data_rows": data_rows,
+        "spreadsheet_id": "",
+    }
+    st.toast(f"Target '{row['Target name']}' set — add primer sets on the next page.")
+    st.rerun()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _pathoplexus_values(organism: str, field: str) -> list[str]:
+    """Values ``field`` takes on Pathoplexus, for a picker. Empty if unreachable."""
+    try:
+        # "missing" is a submitter placeholder, not a place or host.
+        return [v for v in pathoplexus.field_values(organism, field) if v != "missing"]
+    except pathoplexus.PathoplexusError:
+        return []
+
+
+def _render_pathoplexus_target_ui(prefix: str):
+    """Monitor target setup for a Pathoplexus organism.
+
+    Only the filters Pathoplexus supports are offered. Location and host are
+    pickers filled from the organism's real values, because LAPIS matches them
+    exactly and case-sensitively -- typed "uganda" or "human" fetch nothing.
+    """
+    names = pathoplexus.ORGANISM_NAMES
+    organism = st.selectbox(
+        "Organism",
+        options=sorted(pathoplexus.ORGANISMS, key=names.get),
+        format_func=lambda o: names[o],
+        index=None,
+        placeholder="Type an organism name to search...",
+        key=f"{prefix}_organism",
+    )
+
+    segment = ""
+    segments = pathoplexus.ORGANISMS.get(organism, ("main",))
+    if organism and segments != ("main",):
+        # Keyed per organism so a stale choice never carries across.
+        segment = st.selectbox(
+            "Serotype" if organism == "dengue" else "Gene segment",
+            options=segments,
+            key=f"{prefix}_segment_{organism}",
+            help="Segments are monitored one per target: a sequence's segments "
+                 "share one accession, so they cannot share a FASTA.",
+        )
+
+    auto_target = f"{organism}_{segment}" if segment else (organism or "")
+    if auto_target != st.session_state.get(f"_prev_auto_{prefix}", ""):
+        st.session_state[f"_prev_auto_{prefix}"] = auto_target
+        st.session_state[f"{prefix}_target_name"] = re.sub(r"[^\w\-]", "_", auto_target)
+
+    target_name = st.text_input(
+        "Target name",
+        placeholder="e.g., ebola-bdbv",
+        key=f"{prefix}_target_name",
+        help="Name for the output FASTA file.",
+    )
+
+    col_len1, col_len2 = st.columns(2)
+    with col_len1:
+        st.number_input("Min sequence length (bp)", min_value=0, value=None, step=100,
+                        key=f"{prefix}_min_seq_length")
+    with col_len2:
+        st.number_input("Max sequence length (bp)", min_value=0, value=None, step=100,
+                        key=f"{prefix}_max_seq_length")
+
+    _date_min = date(1900, 1, 1)
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        st.date_input("Min release date", value=None, min_value=_date_min,
+                      key=f"{prefix}_min_release_date",
+                      help="When the sequence first went public anywhere, including "
+                           "GenBank before Pathoplexus mirrored it.")
+    with col_d2:
+        st.date_input("Max release date", value=date.today(), min_value=_date_min,
+                      disabled=True, key=f"{prefix}_max_release_date")
+
+    def _picker(label, field, placeholder):
+        options = _pathoplexus_values(organism, field) if organism else []
+        if organism and not options:
+            # Pathoplexus unreachable: fall back to typing, exact spelling.
+            return st.text_input(f"{label} (exact, case-sensitive; comma-separated)",
+                                 placeholder=placeholder, key=f"{prefix}_{field}_text")
+        picked = st.multiselect(label, options=options, placeholder="Any",
+                                disabled=not organism, key=f"{prefix}_{field}_{organism}")
+        return ", ".join(picked)
+
+    geo = _picker("Country", "geoLocCountry", "e.g., Uganda")
+    host = _picker("Host", "hostNameScientific", "e.g., Homo sapiens")
+
+    with st.expander("Additional parameters"):
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.date_input("Min collection date", value=None, min_value=_date_min,
+                          key=f"{prefix}_min_collection_date")
+        with col_c2:
+            st.date_input("Max collection date", value=None, min_value=_date_min,
+                          key=f"{prefix}_max_collection_date")
+        st.caption("Partially dated records (just a year or month) are kept when "
+                   "they could fall inside the range.")
+        st.number_input("Max ambiguous characters", min_value=0, value=None, step=1,
+                        key=f"{prefix}_max_ambiguous_chars")
+
+    st.caption(
+        "Some Pathoplexus sequences are [Restricted-Use Data]"
+        "(https://pathoplexus.org/about/terms-of-use/restricted-data). They are "
+        "included and marked in reports; publishing with them means acknowledging "
+        "the submitters.")
+
+    if st.button("Use this target", disabled=not organism or not target_name,
+                 key=f"{prefix}_use_btn"):
+        def _val(key):
+            v = st.session_state.get(f"{prefix}_{key}")
+            if v is None or v == "":
+                return ""
+            return v.strftime("%Y-%m-%d") if isinstance(v, date) else str(v).strip()
+        _use_monitor_target({
+            "Target name": target_name.strip(),
+            "source": "pathoplexus",
+            "pathoplexus_organism": organism,
+            "segment": segment,
+            "geographic_location": geo,
+            "host": host,
+            "min_release_date": _val("min_release_date"),
+            "min_collection_date": _val("min_collection_date"),
+            "max_collection_date": _val("max_collection_date"),
+            "min_seq_length": _val("min_seq_length"),
+            "max_seq_length": _val("max_seq_length"),
+            "max_ambiguous_chars": _val("max_ambiguous_chars"),
+        })
 
 
 def _render_fetch_ui(prefix: str, monitor: bool = False):
@@ -3508,7 +3996,36 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         key=f"{prefix}_max_ambiguous_chars")
         st.checkbox("RefSeq only", key=f"{prefix}_refseq_only")
 
-    if st.button("Fetch sequences", disabled=not taxid or not target_name, key=f"{prefix}_fetch_btn"):
+    if monitor:
+        # Monitoring fetches sequences itself on every run; here we only record
+        # the target as a one-row mastersheet.
+        if st.button("Use this target", disabled=not taxid or not target_name,
+                     key=f"{prefix}_use_btn"):
+            def _val(key):
+                v = st.session_state.get(f"{prefix}_{key}")
+                if v is None or v == "":
+                    return ""
+                return v.strftime("%Y-%m-%d") if isinstance(v, date) else str(v).strip()
+            row = {
+                "Target name": target_name.strip(),
+                "TaxID": taxid.strip(),
+                "subtype_filter": _val("subtype_filter"),
+                "host": _val("host"),
+                "nuc_completeness": _val("nuc_completeness"),
+                "geographic_location": _val("geo_location"),
+                "min_collection_date": _val("min_collection_date"),
+                "max_collection_date": _val("max_collection_date"),
+                "min_release_date": _val("min_release_date"),
+                "min_seq_length": _val("min_seq_length"),
+                "max_seq_length": _val("max_seq_length"),
+                "max_ambiguous_chars": _val("max_ambiguous_chars"),
+                "segment": _val("segment"),
+                "refseq_only": "TRUE" if st.session_state.get(f"{prefix}_refseq_only") else "",
+            }
+            _use_monitor_target(row)
+        return
+
+    if st.button("Fetch sequences",disabled=not taxid or not target_name, key=f"{prefix}_fetch_btn"):
         gget_bin = shutil.which("gget")
         if not gget_bin:
             env_bin = Path(sys.executable).parent
@@ -3588,10 +4105,12 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                 detail = ""
                 start_time = time.time()
                 timeout = 1800
+                _live_timer(status_area, start_time)
 
                 while proc.poll() is None:
                     if time.time() - start_time > timeout:
                         proc.kill()
+                        status_area.empty()
                         st.error("Fetch timed out after 30 minutes.")
                         return False
                     line = proc.stdout.readline()
@@ -3610,10 +4129,9 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         elif "PROCESS COMPLETED" in line:
                             current_step = len(_FETCH_STEPS)
                         _render_progress(current_step, detail, loc_label=loc_label)
-                    elapsed = int(time.time() - start_time)
-                    mins, secs = divmod(elapsed, 60)
-                    status_area.caption(f"Elapsed: {mins}m {secs}s")
 
+                mins, secs = divmod(int(time.time() - start_time), 60)
+                status_area.caption(f"Fetched in {mins}m {secs}s")
                 remaining = proc.stdout.read()
                 if remaining and "PROCESS COMPLETED" in remaining:
                     _render_progress(len(_FETCH_STEPS), loc_label=loc_label)
@@ -3636,7 +4154,7 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                         validated_out_dir = os.path.realpath(str(gget_tmp))
 
                     loc_params = dict(fetch_params, geo_location=geo_loc)
-                    cmd = _build_fetch_command(gget_bin, taxid, validated_out_dir, loc_params)
+                    cmd = _build_fetch_command(taxid, validated_out_dir, loc_params)
                     if not cmd:
                         st.error("TaxID must be numeric.")
                         return
@@ -3704,9 +4222,55 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                 shutil.rmtree(gget_tmp, ignore_errors=True)
 
 
+# The two multiselects on the off-target page. They share one budget, so each
+# one's guard has to look at the other.
+OFFTARGET_SELECT_KEYS = ("cross_select", "host_select")
+
+
+@st.dialog("Off-target limit reached")
+def _offtarget_limit_dialog() -> None:
+    st.warning(
+        f"You can evaluate at most **{MAX_OFFTARGET_FILES}** off-target sequence "
+        "files in one run — cross-reactivity and host sequences count together."
+    )
+    st.caption(
+        "The sequence that went over the limit was not added. Remove one you "
+        "already picked if you want to swap it in."
+    )
+    if st.button("OK", type="primary"):
+        st.rerun()
+
+
+def _enforce_offtarget_limit(changed_key: str) -> None:
+    """Roll back an off-target pick that would push the run past the cap.
+
+    Wired as the multiselects' ``on_change``. Callbacks fire before the script
+    body, which is the only point where this is possible: writing to a widget's
+    own session_state key raises once that widget has been instantiated for the
+    run, and here it has not been yet, so the control redraws without the
+    rejected entry.
+    """
+    others = sum(len(st.session_state.get(key, []))
+                 for key in OFFTARGET_SELECT_KEYS if key != changed_key)
+    allowance = max(0, MAX_OFFTARGET_FILES - others)
+    picked = st.session_state.get(changed_key, [])
+    if len(picked) <= allowance:
+        return
+    # multiselect keeps the order things were picked in, so dropping the tail
+    # removes exactly what the user just added rather than an arbitrary choice.
+    st.session_state[changed_key] = picked[:allowance]
+    st.session_state["_offtarget_limit_hit"] = True
+
+
 def _page_select_offtarget():
     """Page for selecting off-target (cross-reactivity) and host sequences."""
     _render_workflow_progress("select_offtarget")
+
+    # Popped rather than left set: Streamlit closes a dialog by simply not
+    # re-rendering it, so holding the flag would reopen the modal on the next
+    # interaction after an Esc/X dismissal.
+    if st.session_state.pop("_offtarget_limit_hit", False):
+        _offtarget_limit_dialog()
 
     workflow = st.session_state.get("workflow", "design")
     workflow_label = {"design": "Design", "evaluate": "Evaluate", "monitor": "Monitor"}[workflow]
@@ -3715,6 +4279,10 @@ def _page_select_offtarget():
     st.markdown(
         "Optionally specify sequences to check for cross-reactivity or host background. "
         "You can skip this step if not needed."
+    )
+    st.caption(
+        f"Up to **{MAX_OFFTARGET_FILES}** sequence files per run, counting "
+        "cross-reactivity and host together."
     )
 
     st.divider()
@@ -3746,6 +4314,8 @@ def _page_select_offtarget():
             options=cross_labels,
             key="cross_select",
             placeholder="Choose pathogens to avoid...",
+            on_change=_enforce_offtarget_limit,
+            args=("cross_select",),
         )
         st.session_state.cross = [label.split("  (")[0] for label in selected_cross]
     else:
@@ -3760,36 +4330,15 @@ def _page_select_offtarget():
             st.markdown("**Upload FASTA file**")
             uploaded_cross = st.file_uploader(
                 "Upload FASTA",
-                type=["fa", "fasta", "fna"],
+                type=FASTA_UPLOAD_TYPES,
                 accept_multiple_files=True,
                 key="cross_fasta_upload",
                 label_visibility="collapsed",
+                help=UPLOAD_SIZE_HINT,
             )
-            if uploaded_cross:
-                already_saved = st.session_state.get("_fasta_saved_ids", set())
-                new_saved = set()
-                for f in uploaded_cross:
-                    fid = (f.name, f.size)
-                    if fid in already_saved:
-                        continue
-                    p = Path(f.name)
-                    if p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                        st.error(f"Unsupported extension: {p.suffix}")
-                        continue
-                    dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                    if not dest:
-                        st.error(f"Invalid filename: {f.name}")
-                        continue
-                    _save_fasta_bytes(dest, f.getvalue())
-                    for ext in (".fasta", ".fna"):
-                        old = FASTA_DIR / (p.stem + ext)
-                        if old.exists():
-                            old.unlink()
-                    st.success(f"Saved {dest.name}")
-                    new_saved.add(fid)
-                if new_saved:
-                    st.session_state["_fasta_saved_ids"] = already_saved | new_saved
-                    st.rerun()
+            if uploaded_cross and _save_uploaded_fastas(uploaded_cross):
+                st.rerun()
+            _render_upload_note()
 
         with add_cross_col2:
             st.markdown("**Fetch from NCBI Virus (using gget)**")
@@ -3819,6 +4368,8 @@ def _page_select_offtarget():
             options=host_labels,
             key="host_select",
             placeholder="Choose host genome...",
+            on_change=_enforce_offtarget_limit,
+            args=("host_select",),
         )
         st.session_state.host = [label.split("  (")[0] for label in selected_host]
     else:
@@ -3829,38 +4380,30 @@ def _page_select_offtarget():
     with st.expander("Upload host sequences"):
         uploaded_host = st.file_uploader(
             "Upload FASTA",
-            type=["fa", "fasta", "fna"],
+            type=FASTA_UPLOAD_TYPES,
             accept_multiple_files=True,
             key="host_fasta_upload",
             label_visibility="collapsed",
+            help=UPLOAD_SIZE_HINT,
         )
-        if uploaded_host:
-            already_saved = st.session_state.get("_fasta_saved_ids", set())
-            new_saved = set()
-            for f in uploaded_host:
-                fid = (f.name, f.size)
-                if fid in already_saved:
-                    continue
-                p = Path(f.name)
-                if p.suffix.lower() not in (".fa", ".fasta", ".fna"):
-                    st.error(f"Unsupported extension: {p.suffix}")
-                    continue
-                dest = _safe_path_under(FASTA_DIR, p.stem + ".fa")
-                if not dest:
-                    st.error(f"Invalid filename: {f.name}")
-                    continue
-                _save_fasta_bytes(dest, f.getvalue())
-                for ext in (".fasta", ".fna"):
-                    old = FASTA_DIR / (p.stem + ext)
-                    if old.exists():
-                        old.unlink()
-                st.success(f"Saved {dest.name}")
-                new_saved.add(fid)
-            if new_saved:
-                st.session_state["_fasta_saved_ids"] = already_saved | new_saved
-                st.rerun()
+        if uploaded_host and _save_uploaded_fastas(uploaded_host):
+            st.rerun()
+        _render_upload_note()
 
     st.divider()
+
+    # Backstop for selections the on_change guard never saw: a restored session
+    # repopulates `cross`/`host`, which seed the multiselects above directly, so
+    # an over-limit set saved before this cap existed would otherwise sail
+    # through to the run.
+    n_offtarget = len(st.session_state.get("cross", [])) + len(st.session_state.get("host", []))
+    over_limit = n_offtarget > MAX_OFFTARGET_FILES
+    if over_limit:
+        st.error(
+            f"{n_offtarget} off-target sequences selected, but a run allows at "
+            f"most {MAX_OFFTARGET_FILES}. Remove "
+            f"{n_offtarget - MAX_OFFTARGET_FILES} to continue."
+        )
 
     # --- Back / Continue ---
     col_back, col_cont = st.columns(2)
@@ -3869,7 +4412,8 @@ def _page_select_offtarget():
             _navigate("select_target")
             st.rerun()
     with col_cont:
-        if st.button("Continue →", type="primary", use_container_width=True):
+        if st.button("Continue →", type="primary", use_container_width=True,
+                     disabled=over_limit):
             if workflow == "evaluate":
                 _navigate("eval_primer")
             else:
@@ -4012,6 +4556,7 @@ def _config_evaluate():
     host = st.session_state.get("host", [])
     eval_fwd = st.session_state.get("_eval_for_saved", "")
     eval_rev_seq = st.session_state.get("_eval_rev_saved", "")
+    eval_pro_seq = st.session_state.get("_eval_pro_saved", "")
     pset_path = st.session_state.get("eval_pset_path", "")
 
     st.markdown(f"**Target:** {', '.join(targets) if targets else 'none'}")
@@ -4024,6 +4569,8 @@ def _config_evaluate():
     elif eval_fwd and eval_rev_seq:
         st.markdown(f"**Forward:** {eval_fwd}")
         st.markdown(f"**Reverse:** {eval_rev_seq}")
+        if eval_pro_seq:
+            st.markdown(f"**Probe:** {eval_pro_seq}")
 
     st.divider()
 
@@ -4047,15 +4594,23 @@ def _config_evaluate():
             st.rerun()
 
 
+def _row_source_label(row: dict) -> str:
+    """Where a mastersheet row is fetched from, for the target tables."""
+    if str(row.get("source", "")).strip().lower() == "pathoplexus":
+        organism = str(row.get("pathoplexus_organism", "")).strip()
+        return f"Pathoplexus: {pathoplexus.ORGANISM_NAMES.get(organism, organism or '?')}"
+    return f"NCBI TaxID {str(row.get('TaxID', '')).strip() or '?'}"
+
+
 def _page_monitor_target():
-    """Monitor step 1: Select pathogens to monitor via spreadsheet or manual fetch."""
+    """Monitor step 1: set up a target (or load several from a spreadsheet)."""
     _render_workflow_progress("monitor_target")
 
     st.header("Monitor — Select Pathogens")
 
     st.session_state.mode = "Monitor"
 
-    # --- Resume existing run ---
+    # Previous runs, offered in the Resume section below.
     existing_runs = []
     if MONITOR_DIR.exists():
         for d in sorted(MONITOR_DIR.iterdir(), reverse=True):
@@ -4068,128 +4623,153 @@ def _page_monitor_target():
                 if date_dirs:
                     existing_runs.append((d.name, date_dirs))
 
-    if existing_runs:
-        st.subheader("Resume existing run")
-        st.caption("Skip fetching and re-evaluate with sequences from a previous run.")
-        run_options = [r[0] for r in existing_runs]
-        selected_run = st.selectbox(
-            "Run ID", options=run_options, index=None,
-            placeholder="Select a previous run...",
-            key="monitor_resume_run",
+    # --- Set up a target (the main path) ---
+    st.subheader("Set up a target")
+    source = st.radio(
+        "Source",
+        options=["ncbi", "pathoplexus"],
+        format_func={"ncbi": "NCBI Virus", "pathoplexus": "Pathoplexus"}.get,
+        horizontal=True,
+        key="monitor_source",
+    )
+    if source == "pathoplexus":
+        st.caption("Each monitoring run fetches what is new on Pathoplexus for this organism.")
+        _render_pathoplexus_target_ui("monitor_pp")
+    else:
+        st.caption("Each monitoring run fetches what is new on NCBI Virus with these settings.")
+        _render_fetch_ui("monitor_fetch", monitor=True)
+
+    st.divider()
+
+    # --- Several targets: Google Sheets ---
+    with st.expander("Load from Google Sheets"):
+        st.caption("For several targets at once. Start from the [template](https://docs.google.com/spreadsheets/d/1OuH4FDS2ZUJxQDIfG45OO0Gk__iV9yheybjUDSKd2UU/copy).")
+        st.info(
+            '**After copying, set sharing to "Anyone with the link" → Viewer so the app can read it.**'
+        )
+        spreadsheet_url = st.text_input(
+            "Spreadsheet URL",
+            key="monitor_spreadsheet_url",
+            placeholder="https://docs.google.com/spreadsheets/d/...",
         )
 
-        if selected_run:
-            # Find the run and show its details
-            for run_id, date_dirs in existing_runs:
-                if run_id == selected_run:
-                    # Show available dates
-                    date_labels = [dd.name for dd in date_dirs]
-                    st.caption(f"Available dates: {', '.join(date_labels)}")
+        if spreadsheet_url:
+            if st.button("Load spreadsheet", key="monitor_load_sheet"):
+                try:
+                    sid = _extract_spreadsheet_id(spreadsheet_url)
+                    csv_text = _download_spreadsheet_csv(sid)
+                    headers, data_rows = _load_spreadsheet(csv_text)
+                    if not data_rows:
+                        # Not kept: an empty sheet would let Continue through
+                        # with nothing to monitor.
+                        st.session_state.pop("monitor_spreadsheet_data", None)
+                        st.warning(_empty_sheet_message(csv_text))
+                    else:
+                        st.session_state["monitor_spreadsheet_data"] = {
+                            "csv_text": csv_text,
+                            "headers": headers,
+                            "data_rows": data_rows,
+                            "spreadsheet_id": sid,
+                        }
+                        st.success(f"Loaded {len(data_rows)} row(s) from spreadsheet.")
+                except Exception as e:
+                    st.error(f"Failed to load spreadsheet: {e}")
 
-                    # Load mastersheet from latest date dir
-                    latest = date_dirs[0]
-                    mastersheet = latest / "mastersheet.csv"
-                    if mastersheet.exists():
-                        csv_text = mastersheet.read_text()
-                        try:
-                            _, data_rows = _load_spreadsheet(csv_text)
-                            import pandas as pd
-                            seen = {}
-                            for row in data_rows:
-                                t = _make_target_name(row)
-                                if t not in seen:
-                                    seen[t] = {
-                                        "Target": t,
-                                        "TaxID": str(row.get("TaxID", "")).strip(),
-                                        "Host": str(row.get("host", "")).strip(),
-                                        "Geographic location": str(row.get("geographic_location", "")).strip(),
-                                    }
-                            st.dataframe(pd.DataFrame(list(seen.values())),
-                                         use_container_width=True, hide_index=True)
+    if existing_runs:
+        with st.expander("Resume an existing run"):
+            st.caption("Skip fetching and re-evaluate with sequences from a previous run.")
+            run_options = [r[0] for r in existing_runs]
+            selected_run = st.selectbox(
+                "Run ID", options=run_options, index=None,
+                placeholder="Select a previous run...",
+                key="monitor_resume_run",
+            )
 
-                            # Show primer info
-                            primer_rows = []
-                            for row in data_rows:
-                                primer_rows.append({
-                                    "Target": _make_target_name(row),
-                                    "Primer name": row.get("Primer name", ""),
-                                    "Forward": row.get("Forward", "")[:25],
-                                    "Reverse": row.get("Reverse", "")[:25],
-                                    "Probe": "yes" if not _is_empty(row.get("Probe")) else "",
-                                })
-                            with st.expander("Primer sets"):
-                                st.dataframe(pd.DataFrame(primer_rows),
-                                             use_container_width=True, hide_index=True)
-
-                            # Show sequence counts
-                            acc_files = list(latest.glob("*_accessions.txt"))
-                            if acc_files:
-                                counts = []
-                                for af in acc_files:
-                                    target = af.stem.replace("_accessions", "")
-                                    n = len([l for l in af.read_text().strip().split("\n") if l.strip()])
-                                    counts.append(f"{target}: {n} sequences")
-                                st.caption("Sequences: " + ", ".join(counts))
-
-                        except Exception:
-                            st.caption("Could not parse mastersheet.")
-                    break
-
-            if st.button("Continue with skip fetch →", type="primary",
-                         use_container_width=True, key="monitor_resume_cont"):
-                st.session_state["run_id"] = selected_run
-                st.session_state["monitor_skip_fetch"] = True
-                # Load mastersheet data as spreadsheet data
-                latest_dir = None
+            if selected_run:
+                # Find the run and show its details
                 for run_id, date_dirs in existing_runs:
                     if run_id == selected_run:
-                        latest_dir = date_dirs[0]
+                        # Show available dates
+                        date_labels = [dd.name for dd in date_dirs]
+                        st.caption(f"Available dates: {', '.join(date_labels)}")
+
+                        # Load mastersheet from latest date dir
+                        latest = date_dirs[0]
+                        mastersheet = latest / "mastersheet.csv"
+                        if mastersheet.exists():
+                            csv_text = mastersheet.read_text()
+                            try:
+                                _, data_rows = _load_spreadsheet(csv_text)
+                                import pandas as pd
+                                seen = {}
+                                for row in data_rows:
+                                    t = _make_target_name(row)
+                                    if t not in seen:
+                                        seen[t] = {
+                                            "Target": t,
+                                            "Source": _row_source_label(row),
+                                            "Host": str(row.get("host", "")).strip(),
+                                            "Geographic location": str(row.get("geographic_location", "")).strip(),
+                                        }
+                                st.dataframe(pd.DataFrame(list(seen.values())),
+                                             use_container_width=True, hide_index=True)
+
+                                # Show primer info
+                                primer_rows = []
+                                for row in data_rows:
+                                    primer_rows.append({
+                                        "Target": _make_target_name(row),
+                                        "Primer name": row.get("Primer name", ""),
+                                        "Forward": row.get("Forward", "")[:25],
+                                        "Reverse": row.get("Reverse", "")[:25],
+                                        "Probe": "yes" if not _is_empty(row.get("Probe")) else "",
+                                    })
+                                with st.expander("Primer sets"):
+                                    st.dataframe(pd.DataFrame(primer_rows),
+                                                 use_container_width=True, hide_index=True)
+
+                                # Show sequence counts
+                                acc_files = list(latest.glob("*_accessions.txt"))
+                                if acc_files:
+                                    counts = []
+                                    for af in acc_files:
+                                        target = af.stem.replace("_accessions", "")
+                                        n = len([l for l in af.read_text().strip().split("\n") if l.strip()])
+                                        counts.append(f"{target}: {n} sequences")
+                                    st.caption("Sequences: " + ", ".join(counts))
+
+                            except Exception:
+                                st.caption("Could not parse mastersheet.")
                         break
-                if latest_dir:
-                    ms = latest_dir / "mastersheet.csv"
-                    if ms.exists():
-                        csv_text = ms.read_text()
-                        try:
-                            headers, data_rows = _load_spreadsheet(csv_text)
-                            st.session_state["monitor_spreadsheet_data"] = {
-                                "csv_text": csv_text,
-                                "headers": headers,
-                                "data_rows": data_rows,
-                                "spreadsheet_id": selected_run,
-                            }
-                        except Exception:
-                            pass
-                _navigate("monitor_primer")
-                st.rerun()
 
-        st.divider()
+                if st.button("Continue with skip fetch →", type="primary",
+                             use_container_width=True, key="monitor_resume_cont"):
+                    st.session_state["run_id"] = selected_run
+                    st.session_state["monitor_skip_fetch"] = True
+                    # Load mastersheet data as spreadsheet data
+                    latest_dir = None
+                    for run_id, date_dirs in existing_runs:
+                        if run_id == selected_run:
+                            latest_dir = date_dirs[0]
+                            break
+                    if latest_dir:
+                        ms = latest_dir / "mastersheet.csv"
+                        if ms.exists():
+                            csv_text = ms.read_text()
+                            try:
+                                headers, data_rows = _load_spreadsheet(csv_text)
+                                st.session_state["monitor_spreadsheet_data"] = {
+                                    "csv_text": csv_text,
+                                    "headers": headers,
+                                    "data_rows": data_rows,
+                                    "spreadsheet_id": selected_run,
+                                }
+                            except Exception:
+                                pass
+                    _navigate("monitor_primer")
+                    st.rerun()
 
-    # --- Option 1: Load from Google Sheets ---
-    st.subheader("Load from Google Sheets ([template](https://docs.google.com/spreadsheets/d/127GY5lBqUKuri4MgM4XTlKLKto45_Yn9NvYJhF2WIvo/copy))")
-    st.info(
-        '**After copying, set sharing to "Anyone with the link" → Viewer so the app can read it.**'
-    )
-    spreadsheet_url = st.text_input(
-        "Spreadsheet URL",
-        key="monitor_spreadsheet_url",
-        placeholder="https://docs.google.com/spreadsheets/d/...",
-    )
-
-    if spreadsheet_url:
-        if st.button("Load spreadsheet", key="monitor_load_sheet"):
-            try:
-                sid = _extract_spreadsheet_id(spreadsheet_url)
-                csv_text = _download_spreadsheet_csv(sid)
-                headers, data_rows = _load_spreadsheet(csv_text)
-                st.session_state["monitor_spreadsheet_data"] = {
-                    "csv_text": csv_text,
-                    "headers": headers,
-                    "data_rows": data_rows,
-                    "spreadsheet_id": sid,
-                }
-                st.success(f"Loaded {len(data_rows)} row(s) from spreadsheet.")
-            except Exception as e:
-                st.error(f"Failed to load spreadsheet: {e}")
+    st.divider()
 
     # Show loaded data
     sheet_data = st.session_state.get("monitor_spreadsheet_data")
@@ -4206,7 +4786,7 @@ def _page_monitor_target():
             if target_name not in seen_targets:
                 seen_targets[target_name] = {
                     "Target": target_name,
-                    "TaxID": str(row.get("TaxID", "")).strip(),
+                    "Source": _row_source_label(row),
                     "Min release date": str(row.get("min_release_date", "")).strip(),
                     "Max release date": today_str,
                     "Geographic location": str(row.get("geographic_location", "")).strip(),
@@ -4216,16 +4796,6 @@ def _page_monitor_target():
 
         target_names = list(seen_targets.keys())
         st.markdown(f"**Targets to monitor:** {', '.join(target_names)}")
-
-    st.divider()
-
-    # --- Option 2: Manual setup ---
-    st.subheader("Manual setup")
-    st.caption("Set up a single target manually by fetching sequences from NCBI Virus.")
-    with st.expander("Configure manual fetch"):
-        _render_fetch_ui("monitor_fetch", monitor=True)
-
-    st.divider()
 
     # --- Continue ---
     has_sheet = bool(st.session_state.get("monitor_spreadsheet_data"))
@@ -4240,7 +4810,7 @@ def _page_monitor_target():
         st.rerun()
 
     if not has_sheet:
-        st.caption("Load a spreadsheet to continue.")
+        st.caption("Set up a target or load a spreadsheet to continue.")
 
 
 def _page_monitor_primer():
@@ -4257,11 +4827,17 @@ def _page_monitor_primer():
     sheet_data = st.session_state.get("monitor_spreadsheet_data")
 
     # --- From spreadsheet ---
+    # Show the sheet as loaded; primers added below are merged in on Continue.
+    base_rows = []
     if sheet_data:
+        base_rows = [r for r in _load_spreadsheet(
+            sheet_data.get("base_csv_text", sheet_data["csv_text"]))[1]
+            if not _is_empty(r.get("Forward")) or not _is_empty(r.get("Reverse"))]
+    if base_rows:
         st.subheader("Primers from spreadsheet")
         import pandas as pd
         display_rows = []
-        for row in sheet_data["data_rows"]:
+        for row in base_rows:
             fwd = row.get("Forward", "")
             rev = row.get("Reverse", "")
             pro = row.get("Probe", "")
@@ -4284,27 +4860,32 @@ def _page_monitor_primer():
         st.session_state["monitor_manual_primers"] = []
 
     with st.expander("Enter primer sequences"):
-        name = st.text_input("Primer set name", key="monitor_primer_name",
-                             placeholder="e.g. My_primer_1")
-        fwd = st.text_input("Forward primer (5'→3')", key="monitor_primer_fwd",
-                            placeholder="ATCGATCG...")
-        rev = st.text_input("Reverse primer (5'→3')", key="monitor_primer_rev",
-                            placeholder="ATCGATCG...")
-        pro = st.text_input("Probe (5'→3', optional)", key="monitor_primer_pro",
-                            placeholder="ATCGATCG...")
+        st.text_input("Primer set name", key="monitor_primer_name",
+                      placeholder="e.g. My_primer_1")
+        st.text_input("Forward primer (5'→3')", key="monitor_primer_fwd",
+                      placeholder="ATCGATCG...")
+        st.text_input("Reverse primer (5'→3')", key="monitor_primer_rev",
+                      placeholder="ATCGATCG...")
+        st.text_input("Probe (5'→3', optional)", key="monitor_primer_pro",
+                      placeholder="ATCGATCG...")
 
-        if st.button("Add primer set", key="monitor_add_primer"):
-            if name and fwd and rev:
-                st.session_state["monitor_manual_primers"].append({
-                    "name": name, "Forward": fwd, "Reverse": rev, "Probe": pro,
-                })
-                st.session_state["monitor_primer_name"] = ""
-                st.session_state["monitor_primer_fwd"] = ""
-                st.session_state["monitor_primer_rev"] = ""
-                st.session_state["monitor_primer_pro"] = ""
-                st.rerun()
-            else:
-                st.warning("Name, Forward, and Reverse are required.")
+        def _add_primer():
+            # A callback runs before the inputs are drawn, so they can be cleared here.
+            ss = st.session_state
+            name, fwd, rev, pro = (ss.get(f"monitor_primer_{k}", "").strip()
+                                   for k in ("name", "fwd", "rev", "pro"))
+            if not (name and fwd and rev):
+                ss["_monitor_primer_missing"] = True
+                return
+            ss["monitor_manual_primers"].append({
+                "name": name, "Forward": fwd.upper(), "Reverse": rev.upper(), "Probe": pro.upper(),
+            })
+            for k in ("name", "fwd", "rev", "pro"):
+                ss[f"monitor_primer_{k}"] = ""
+
+        st.button("Add primer set", key="monitor_add_primer", on_click=_add_primer)
+        if st.session_state.pop("_monitor_primer_missing", False):
+            st.warning("Name, Forward, and Reverse are required.")
 
     # Show manually added primers
     manual = st.session_state.get("monitor_manual_primers", [])
@@ -4350,8 +4931,37 @@ def _page_monitor_primer():
             st.rerun()
     with col_cont:
         if st.button("Continue →", type="primary", use_container_width=True, key="monitor_primer_cont"):
-            _navigate("monitor_config")
-            st.rerun()
+            if sheet_data and _apply_monitor_primers(sheet_data):
+                _navigate("monitor_config")
+                st.rerun()
+
+
+def _apply_monitor_primers(sheet_data: dict) -> bool:
+    """Merge manually entered / uploaded primer sets into the monitor sheet.
+
+    Rebuilt from the original sheet each time, so going back and changing the
+    primers never duplicates or keeps stale ones. Returns False (with an error
+    shown) when no target has any primer set to evaluate.
+    """
+    primers = list(st.session_state.get("monitor_manual_primers", []))
+    pset_path = st.session_state.get("monitor_pset_path")
+    if pset_path and Path(pset_path).exists():
+        from_fasta = _parse_pset_fasta(Path(pset_path).read_text())
+        if not from_fasta:
+            st.error("No primer sets found in the uploaded FASTA. Name sequences "
+                     "`<set>_for`, `<set>_rev` and optionally `<set>_pro`.")
+            return False
+        primers += from_fasta
+
+    base = sheet_data.setdefault("base_csv_text", sheet_data["csv_text"])
+    csv_text = _sheet_with_primers(base, primers)
+    headers, data_rows = _load_spreadsheet(csv_text)
+    if not any(not _is_empty(r.get("Forward")) and not _is_empty(r.get("Reverse"))
+               for r in data_rows):
+        st.error("Add at least one primer set (forward + reverse) to monitor.")
+        return False
+    sheet_data.update(csv_text=csv_text, headers=headers, data_rows=data_rows)
+    return True
 
 
 def _config_monitor():
@@ -4474,14 +5084,11 @@ def _run_monitor():
     params_path = date_dir / "params.txt"
     params_path.write_text(params_content)
 
-    # Read email config from project params.txt (password deferred to send time)
+    # Read email config from project params.txt / env (password deferred to send time)
     params_source = PROJECT_ROOT / "params.txt"
-    email_sender = ""
-    default_recipients = ""
-    if params_source.exists():
-        p = parse_params(params_source)
-        email_sender = str(p.get("EMAIL_SENDER", "")).strip()
-        default_recipients = str(p.get("EMAIL_RECIPIENTS", "")).strip()
+    p = parse_params(params_source) if params_source.exists() else {}
+    email_sender, _ = _email_config(p)
+    default_recipients = str(p.get("EMAIL_RECIPIENTS", "")).strip()
 
     recipients_str = st.session_state.get("monitor_email_recipients", "").strip()
     if not recipients_str:
@@ -4496,21 +5103,17 @@ def _run_monitor():
         f.write(f"\n## Email configuration\n")
         f.write(f"EMAIL_SENDER = {email_sender}\n")
         f.write(f"EMAIL_RECIPIENTS = {recipients_str}\n")
-    # Note: EMAIL_PASSWORD is read from project params.txt at send time, never copied
+    # Note: EMAIL_PASSWORD is read from params.txt / env at send time, never copied
 
-    cores = st.session_state.get("cores", 1)
+    cores = CORES
     progress_area = st.empty()
     status_area = st.empty()
     start_time = time.time()
 
-    def _elapsed():
-        s = int(time.time() - start_time)
-        m, s = divmod(s, 60)
-        return f"{m}m {s}s"
-
     def _update(lines):
         progress_area.markdown("<br>".join(lines), unsafe_allow_html=True)
-        status_area.caption(f"Elapsed: {_elapsed()}")
+
+    _live_timer(status_area, start_time)
 
     progress_lines = []
     fetch_results: dict[str, dict] = {}
@@ -4550,12 +5153,7 @@ def _run_monitor():
         progress_lines.append("⏳ &nbsp; **Fetching sequences...**")
         _update(progress_lines)
 
-        _OVERLAP_DAYS = 7
-
         for i, (target_name, rows) in enumerate(target_groups.items()):
-            row = {k: v for k, v in rows[0].items()
-                   if k not in {"max_collection_date", "max_release_date"}}
-
             # Target status
             tparts = []
             for j, tn in enumerate(target_names):
@@ -4568,113 +5166,33 @@ def _run_monitor():
             progress_lines[-1] = f"⏳ &nbsp; **Fetching sequences** — {', '.join(tparts)}"
             _update(progress_lines)
 
-            dated_fasta = date_dir / f"{target_name}.fa"
-            dated_meta = date_dir / f"{target_name}_metadata.csv"
-
-            # Find previous accessions for diff
-            prev_acc_files = sorted(
-                [d / f"{target_name}_accessions.txt"
-                 for d in work_dir.iterdir()
-                 if d.is_dir() and d.name != date_str
-                 and (d / f"{target_name}_accessions.txt").exists()],
-                key=lambda p: p.parent.name,
-                reverse=True,
-            )
-            is_first = len(prev_acc_files) == 0
-
-            # Narrow date window for subsequent fetches
-            if not is_first:
-                from datetime import timedelta
-                prev_date_str = prev_acc_files[0].parent.name
-                try:
-                    prev_date = datetime.strptime(prev_date_str, "%Y%m%d")
-                    cutoff = (prev_date - timedelta(days=_OVERLAP_DAYS)).strftime("%Y-%m-%d")
-                    for date_col in ("min_release_date", "min_collection_date"):
-                        orig = str(row.get(date_col, "")).strip()
-                        if not orig or orig < cutoff:
-                            row[date_col] = cutoff
-                except ValueError:
-                    pass
-
-            # Run gget
-            gget_tmp = date_dir / f".gget_tmp_{target_name}"
-            gget_tmp.mkdir(parents=True, exist_ok=True)
-            cmd = _build_gget_command(row, str(gget_tmp))
-
-            if not cmd:
-                fetch_results[target_name] = {"status": "error"}
-                shutil.rmtree(gget_tmp, ignore_errors=True)
-                continue
-
-            try:
-                subprocess.run(cmd, check=True, capture_output=True)
-            except subprocess.CalledProcessError:
-                fetch_results[target_name] = {"status": "error"}
-                shutil.rmtree(gget_tmp, ignore_errors=True)
-                continue
-
-            # Move FASTA output
-            fasta_files = list(gget_tmp.glob("*.fa")) + list(gget_tmp.glob("*.fasta"))
-            meta_files = list(gget_tmp.glob("*_metadata.csv"))
-
-            if not fasta_files:
-                fetch_results[target_name] = {"status": "no_output"}
-                shutil.rmtree(gget_tmp, ignore_errors=True)
-                continue
-
-            shutil.move(str(fasta_files[0]), str(dated_fasta))
-            if meta_files:
-                shutil.move(str(meta_files[0]), str(dated_meta))
-            shutil.rmtree(gget_tmp, ignore_errors=True)
-
-            _deduplicate_fasta(dated_fasta)
-
-            # Diff accessions
-            current_acc = _extract_accessions(dated_fasta)
-            total_count = len(current_acc)
-
-            if not is_first:
-                prev_acc = set(prev_acc_files[0].read_text().strip().split("\n"))
-                new_acc = current_acc - prev_acc
-            else:
-                new_acc = current_acc
-
-            # Write new-only FASTA
-            new_fasta = None
-            if new_acc:
-                new_fasta = date_dir / f"{target_name}_new.fa"
-                _filter_fasta_by_accessions(dated_fasta, new_acc, new_fasta)
-
-            # Save accessions, delete full FASTA
-            acc_file = date_dir / f"{target_name}_accessions.txt"
-            acc_file.write_text("\n".join(sorted(current_acc)) + "\n")
-            dated_fasta.unlink(missing_ok=True)
-
-            fetch_results[target_name] = {
-                "status": "success",
-                "new_fasta_path": new_fasta,
-                "metadata_path": dated_meta if dated_meta.exists() else None,
-                "new_accessions": new_acc,
-                "total_count": total_count,
-                "new_count": len(new_acc),
-                "is_first_fetch": is_first,
-            }
+            # Same fetch as `adapt monitor` and the scheduled job, one target at a
+            # time so the progress line can follow along. A row it cannot fetch
+            # (no TaxID or organism) comes back with no entry.
+            fetch_results.update(_monitor_fetch(rows, work_dir, date_dir, date_str))
+            fetch_results.setdefault(target_name, {"status": "error"})
 
         # Summarize fetch
         total_new = sum(r.get("new_count", 0) for r in fetch_results.values() if r.get("status") == "success")
+        total_revised = sum(r.get("revised_count", 0) for r in fetch_results.values()
+                            if r.get("status") == "success")
         success_targets = [t for t, r in fetch_results.items() if r.get("status") == "success"]
-        progress_lines[-1] = f"✅ &nbsp; Fetch complete — {total_new} new sequence(s) across {len(success_targets)} target(s)"
+        revised_note = f" (+{total_revised} revised)" if total_revised else ""
+        progress_lines[-1] = (f"✅ &nbsp; Fetch complete — {total_new} new sequence(s){revised_note} "
+                              f"across {len(success_targets)} target(s)")
         _update(progress_lines)
 
     # ===================== STEP 2: EVALUATE =====================
+    # Revisions are re-evaluated too: a new version can change the sequence.
     targets_with_new = [
         t for t in target_names
-        if fetch_results.get(t, {}).get("new_count", 0) > 0
+        if fetch_results.get(t, {}).get("new_count", 0)
+        + fetch_results.get(t, {}).get("revised_count", 0) > 0
     ]
 
     all_xlsx: list[Path] = []
     monitor_warnings: list[str] = []
-    email_body_parts = [f"ADAPT Monitor Report — {date_str}\n{'=' * 50}\n"]
+    email_body_parts = [f"PrimerCast Monitor Report — {date_str}\n{'=' * 50}\n"]
 
     if targets_with_new:
         progress_lines.append("⏳ &nbsp; **Evaluating primers...**")
@@ -4697,11 +5215,19 @@ def _run_monitor():
             _update(progress_lines)
 
             email_body_parts.append(f"\n== {target_name} ==")
+            revised_acc = result.get("revised_accessions") or set()
+            headline = f"{result['new_count']} new sequence(s) ({result['total_count']} total)"
+            if revised_acc:
+                headline += f", plus {len(revised_acc)} revised"
+            email_body_parts.append(headline + "\n")
             email_body_parts.append(
-                f"{result['new_count']} new sequence(s) ({result['total_count']} total)\n"
-            )
-            seq_table = _get_new_seq_table(result["new_accessions"], result.get("metadata_path"))
-            email_body_parts.append(seq_table)
+                _get_new_seq_table(result["new_accessions"], result.get("metadata_path")))
+            if revised_acc:
+                email_body_parts.append(
+                    "\nRevised (re-deposited under a new version, re-evaluated below):\n"
+                    + _get_new_seq_table(revised_acc, result.get("metadata_path")))
+            email_body_parts.append(_data_use_notice(
+                result["new_accessions"] | revised_acc, result.get("metadata_path")))
 
             target_fasta = result["new_fasta_path"]
             if not target_fasta:
@@ -4811,18 +5337,21 @@ def _run_monitor():
         _update(progress_lines)
 
     # ===================== STEP 3: EMAIL =====================
+    schedule = st.session_state.get("monitor_schedule")
+    if schedule:
+        email_body_parts.append(
+            f"\n{'-' * 50}\nManage or stop this monitor: {schedule['manage_url']}")
     email_body = "\n".join(email_body_parts)
 
     # Read password at send time only (avoid storing in long-lived variable)
-    _email_password = ""
-    if params_source.exists():
-        _email_password = str(parse_params(params_source).get("EMAIL_PASSWORD", "")).strip()
+    _send_params = parse_params(params_source) if params_source.exists() else {}
+    _, _email_password = _email_config(_send_params)
 
     if email_sender and _email_password and email_recipients and all_xlsx:
         progress_lines.append("⏳ &nbsp; **Sending email report...**")
         _update(progress_lines)
 
-        subject = f"[ADAPT Monitor] {date_str} — {len(target_names)} target(s)"
+        subject = f"[PrimerCast Monitor] {date_str} — {len(target_names)} target(s)"
         ok = _send_email(
             sender=email_sender,
             password=_email_password,
@@ -4830,6 +5359,7 @@ def _run_monitor():
             subject=subject,
             body=email_body,
             attachments=all_xlsx,
+            smtp=_smtp_config(_send_params),
         )
         _email_password = ""  # clear after use
         if ok:
@@ -4844,29 +5374,46 @@ def _run_monitor():
         progress_lines.append("⚪ &nbsp; Email skipped (no reports to send)")
         _update(progress_lines)
 
-    # Done
+    # Persist this first run's accession lists so the scheduled runs only
+    # report sequences that are new since today.
+    notes = []
+    if schedule and not skip_fetch:
+        try:
+            monitor_schedule.upload_run_dir(_monitor_store(), schedule["id"], date_dir)
+        except Exception as e:
+            notes.append(f"Could not save this run for the scheduled monitor: {e}")
+
+    # Done; _tab_run_monitor reruns and shows this saved outcome.
     elapsed = int(time.time() - start_time)
     mins, secs = divmod(elapsed, 60)
-    status_area.caption(f"Completed in {mins}m {secs}s")
+    if all_xlsx:
+        kind, message = "success", f"Monitor complete — {len(all_xlsx)} report(s) generated."
+    elif not targets_with_new:
+        kind, message = "info", "No new sequences found. Nothing to evaluate."
+    else:
+        kind, message = "warning", "Fetch succeeded but evaluation produced no reports."
+    st.session_state.monitor_outcome = {
+        "lines": progress_lines,
+        "elapsed": f"Completed in {mins}m {secs}s",
+        "notes": notes,
+        "kind": kind,
+        "message": message,
+        "detail": f"{len(all_xlsx)} report(s) generated. " if all_xlsx else "",
+    }
 
     st.session_state.pipeline_running = False
     st.session_state.pipeline_return_code = 0
     st.session_state.monitor_results_dir = str(date_dir)
     st.session_state.monitor_warnings = monitor_warnings
 
-    if all_xlsx and monitor_warnings:
-        _render_monitor_warnings(monitor_warnings, f"{len(all_xlsx)} report(s) generated. ")
-    elif all_xlsx:
-        st.success(f"Monitor complete — {len(all_xlsx)} report(s) generated.")
-    elif total_new == 0:
-        st.info("No new sequences found. Nothing to evaluate.")
-    else:
-        st.warning("Fetch succeeded but evaluation produced no reports.")
-
 
 def _tab_run_monitor():
     """Run page for monitor workflow."""
     st.header("Run Monitor")
+    if MONITOR_JOB:
+        st.session_state.pipeline_return_code = None
+        _render_first_run_submitted()
+        return
 
     # Run ID for identifying this run later
     sheet_data = st.session_state.get("monitor_spreadsheet_data")
@@ -4880,10 +5427,6 @@ def _tab_run_monitor():
         key="monitor_run_id",
         help="A short identifier for this run. Used to organize output directories.",
     )
-
-    c1, _ = st.columns(2)
-    max_cpu = os.cpu_count() or 1
-    c1.slider("CPU cores", min_value=1, max_value=max_cpu, value=min(4, max_cpu), key="cores")
 
     # Preflight
     errors = _monitor_preflight_checks()
@@ -4908,15 +5451,32 @@ def _tab_run_monitor():
 
     if st.session_state.get("pipeline_should_start"):
         st.session_state.pipeline_should_start = False
-        _run_monitor()
+        st.session_state.monitor_outcome = None
+        try:
+            _run_monitor()
+        except Exception as e:
+            st.session_state.pipeline_running = False
+            st.session_state.pipeline_return_code = 1
+            st.session_state.monitor_outcome = {"error": f"{type(e).__name__}: {e}"}
+        # Rerun so the buttons drawn before the run are redrawn as idle.
+        st.rerun()
 
     elif not running and st.session_state.get("pipeline_return_code") is not None:
         rc = st.session_state.pipeline_return_code
         monitor_warnings = st.session_state.get("monitor_warnings", [])
+        outcome = st.session_state.get("monitor_outcome") or {}
+        if outcome.get("lines"):
+            st.markdown("<br>".join(outcome["lines"]), unsafe_allow_html=True)
+        if outcome.get("elapsed"):
+            st.caption(outcome["elapsed"])
+        for note in outcome.get("notes", []):
+            st.warning(note)
         if rc != 0:
-            st.error("Monitor failed.")
+            st.error("Monitor failed." + (f" {outcome['error']}" if outcome.get("error") else ""))
         elif monitor_warnings:
-            _render_monitor_warnings(monitor_warnings)
+            _render_monitor_warnings(monitor_warnings, outcome.get("detail", ""))
+        elif outcome.get("message"):
+            getattr(st, outcome["kind"])(outcome["message"])
         else:
             st.success("Monitor completed successfully!")
 
@@ -5055,23 +5615,46 @@ def _render_report_button(run_id: str, context: str):
         _report_dialog(run_id, context)
 
 
+def _render_params_download(run_id: str, context: str):
+    """Download the params.txt a run used (offered whether or not it succeeded)."""
+    if st.session_state.get("workflow", "design") == "monitor":
+        schedule = st.session_state.get("monitor_schedule") or {}
+        text = schedule.get("params_txt", "")
+        file_name = f"params_monitor_{schedule.get('id', '')}.txt"
+    else:
+        path = RUNS_DIR / run_id / "params.txt" if run_id else None
+        text = path.read_text() if path and path.is_file() else ""
+        file_name = f"params_{run_id}.txt"
+    if not text:
+        return
+    st.download_button(
+        ":material/download: Download parameters (params.txt)",
+        data=text,
+        file_name=file_name,
+        mime="text/plain",
+        key=f"dl_params_{context}",
+    )
+
+
 def _page_run():
     """Run pipeline page."""
     _render_workflow_progress("run")
 
     workflow = st.session_state.get("workflow", "design")
 
-    # Back button (only when pipeline is not running)
-    if not st.session_state.get("pipeline_running"):
-        if workflow == "monitor":
-            back_label = "← Back to Report"
-            back_target = "monitor_report"
-        else:
-            back_label = "← Back to Configuration"
-            back_target = f"{workflow}_config"
-        if st.button(back_label, key="run_back"):
-            _navigate(back_target)
-            st.rerun()
+    # Back button, disabled while the pipeline runs. It is always rendered: hiding
+    # it would shift the page up when Run is clicked, leaving a faded stale copy
+    # of the Run/Stop buttons on screen until the progress display replaced it.
+    if workflow == "monitor":
+        back_label = "← Back to Report"
+        back_target = "monitor_report"
+    else:
+        back_label = "← Back to Configuration"
+        back_target = f"{workflow}_config"
+    if st.button(back_label, key="run_back",
+                 disabled=bool(st.session_state.get("pipeline_running"))):
+        _navigate(back_target)
+        st.rerun()
 
     if workflow == "monitor":
         _tab_run_monitor()
@@ -5085,6 +5668,7 @@ def _page_run():
         if st.button("View Results →", type="primary", use_container_width=True):
             _navigate("results")
             st.rerun()
+        _render_params_download(st.session_state.get("pipeline_run_id", ""), "run_page")
         if workflow != "monitor":
             _render_report_button(st.session_state.get("pipeline_run_id", ""), "run_page")
 
@@ -5096,23 +5680,10 @@ def _page_results():
         _navigate("run")
         st.rerun()
     _tab_results()
+    st.divider()
+    _render_params_download(st.session_state.get("run_id", ""), "results_page")
     if st.session_state.get("workflow", "design") != "monitor":
-        st.divider()
         _render_report_button(st.session_state.get("run_id", ""), "results_page")
-
-
-def _get_active_cron_monitor() -> str | None:
-    """Check if an adapt-monitor cron job is currently active. Returns the cron line or None."""
-    try:
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        if result.returncode != 0:
-            return None
-        for line in result.stdout.strip().split("\n"):
-            if "adapt-monitor" in line:
-                return line
-    except FileNotFoundError:
-        pass
-    return None
 
 
 def _page_monitor_report():
@@ -5125,12 +5696,9 @@ def _page_monitor_report():
     st.subheader("Email")
 
     params_path = PROJECT_ROOT / "params.txt"
-    email_configured = False
-    if params_path.exists():
-        params = parse_params(params_path)
-        email_sender = str(params.get("EMAIL_SENDER", "")).strip()
-        email_password = str(params.get("EMAIL_PASSWORD", "")).strip()
-        email_configured = bool(email_sender and email_password)
+    params = parse_params(params_path) if params_path.exists() else {}
+    email_sender, email_password = _email_config(params)
+    email_configured = bool(email_sender and email_password)
 
     if email_configured:
         st.markdown(f"Sender: `{email_sender}`")
@@ -5138,7 +5706,8 @@ def _page_monitor_report():
     else:
         st.warning(
             "Admin email not configured. Set `EMAIL_SENDER` and `EMAIL_PASSWORD` "
-            "in `params.txt` to enable email reports."
+            "in `params.txt` (or `PRIMERCAST_EMAIL_SENDER` / `PRIMERCAST_EMAIL_PASSWORD`) "
+            "to enable email reports."
         )
         default_recipients = ""
 
@@ -5156,11 +5725,9 @@ def _page_monitor_report():
     # --- Schedule ---
     st.subheader("Schedule")
 
-    frequency_options = {
-        "Biweekly (1st & 15th)": "biweekly",
-        "Monthly (1st)": "monthly",
-        "Quarterly (Jan, Apr, Jul, Oct)": "quarterly",
-    }
+    frequency_options = {label: freq for freq, label
+                         in monitor_schedule.FREQUENCY_LABELS.items()}
+    frequency_options["Custom (every N days)"] = "custom"
     selected_label = st.radio(
         "Report frequency",
         options=list(frequency_options.keys()),
@@ -5168,6 +5735,28 @@ def _page_monitor_report():
         key="monitor_frequency",
     )
     frequency = frequency_options[selected_label]
+    interval_days = None
+    if frequency == "custom":
+        interval_days = int(st.number_input(
+            "Run every N days",
+            min_value=monitor_schedule.MIN_INTERVAL_DAYS,
+            max_value=monitor_schedule.MAX_INTERVAL_DAYS,
+            value=30,
+            step=1,
+            key="monitor_interval_days",
+            help="Counted from today: with 10, the monitor runs now, then every 10 days.",
+        ))
+    if MONITOR_JOB:
+        st.caption(
+            "The monitor runs once now on our servers, then on each scheduled date. "
+            "Reports are emailed, and each email includes a private link for viewing "
+            "or stopping the schedule."
+        )
+    else:
+        st.caption(
+            "The monitor runs once now, then on each scheduled date. Every report email "
+            "includes a private link for viewing or stopping the schedule."
+        )
 
     st.divider()
 
@@ -5180,45 +5769,193 @@ def _page_monitor_report():
     with col_cont:
         if st.button("Continue →", type="primary", use_container_width=True,
                       key="report_cont", disabled=not email_configured):
-            # Install cron job
-            recipients = st.session_state.get("monitor_email_recipients", "").strip()
-            try:
-                _install_cron(
-                    work_dir=PROJECT_ROOT / "monitor",
-                    params_file=PROJECT_ROOT / "params.txt",
-                    schedule_email=recipients,
-                    frequency=frequency,
-                )
-                # Save schedule details for display
-                import json
-                sheet_data = st.session_state.get("monitor_spreadsheet_data")
-                targets = []
-                if sheet_data:
-                    seen = set()
-                    for row in sheet_data["data_rows"]:
-                        t = _make_target_name(row)
-                        if t not in seen:
-                            targets.append(t)
-                            seen.add(t)
-                primer_names = []
-                if sheet_data:
-                    for row in sheet_data["data_rows"]:
-                        pn = row.get("Primer name", "").strip()
-                        if pn and pn not in primer_names:
-                            primer_names.append(pn)
-                MONITOR_DIR.mkdir(parents=True, exist_ok=True)
-                MONITOR_SCHEDULE_PATH.write_text(json.dumps({
-                    "targets": targets,
-                    "primer_sets": primer_names,
-                    "frequency": selected_label,
-                    "recipients": recipients,
-                }, indent=2))
-                st.session_state["_monitor_cron_installed"] = True
-            except SystemExit:
-                st.error("Failed to install cron job. Is 'adapt' in PATH?")
-            st.session_state._run_page_fresh = True
-            _navigate("run")
+            if _create_monitor_schedule(frequency, interval_days) and (
+                    not MONITOR_JOB or _start_first_run_job()):
+                st.session_state._run_page_fresh = True
+                _navigate("run")
+                st.rerun()
+
+
+def _public_base_url() -> str:
+    """Base URL for links back to this app (manage links in schedule emails)."""
+    url = os.environ.get("PRIMERCAST_PUBLIC_URL", "").strip()
+    if url:
+        return url
+    host = st.context.headers.get("Host") or "localhost:8501"
+    scheme = "http" if host.startswith(("localhost", "127.0.0.1")) else "https"
+    return f"{scheme}://{host}"
+
+
+@st.cache_resource
+def _monitor_store():
+    return monitor_schedule.get_store(MONITOR_STORE_DIR)
+
+
+def _create_monitor_schedule(frequency: str, interval_days: int | None = None) -> bool:
+    """Save a schedule for the current monitor setup; False (with an error shown) if not."""
+    recipients = monitor_schedule.clean_recipients(
+        st.session_state.get("monitor_email_recipients", ""))
+    if not recipients:
+        st.error("Enter at least one valid recipient email.")
+        return False
+
+    sheet_data = st.session_state.get("monitor_spreadsheet_data") or {}
+    data_rows = sheet_data.get("data_rows", [])
+    targets = list(dict.fromkeys(_make_target_name(row) for row in data_rows))
+    primer_names = list(dict.fromkeys(
+        pn for row in data_rows if (pn := row.get("Primer name", "").strip())))
+
+    # Keep the live sheet URL when it is the sheet that was loaded, so later edits
+    # are picked up; otherwise (resumed run, or primers added in the app) the
+    # saved snapshot is used.
+    url = st.session_state.get("monitor_spreadsheet_url", "").strip()
+    added_primers = sheet_data.get("csv_text") != sheet_data.get("base_csv_text",
+                                                                 sheet_data.get("csv_text"))
+    try:
+        if (not url or added_primers
+                or _extract_spreadsheet_id(url) != sheet_data.get("spreadsheet_id")):
+            url = ""
+    except Exception:
+        url = ""
+
+    _init_params()
+    schedule = monitor_schedule.new_schedule(
+        targets=targets,
+        primer_sets=primer_names,
+        frequency=frequency,
+        interval_days=interval_days,
+        recipients=recipients,
+        params_txt=build_params_txt(st.session_state.params),
+        csv_text=sheet_data.get("csv_text", ""),
+        spreadsheet_url=url,
+        query_ids=st.session_state.get("monitor_query_ids", []),
+    )
+    created = st.session_state.setdefault("monitor_schedules_created", [])
+    previous = st.session_state.get("monitor_schedule")
+    try:
+        if previous:
+            # Back → Continue again: update this workflow's schedule, don't add another.
+            schedule.update({k: previous[k] for k in ("id", "token", "created")})
+            schedule["manage_url"] = monitor_schedule.manage_url(_public_base_url(), schedule)
+            monitor_schedule.save_schedule(_monitor_store(), schedule)
+            created[:] = [s for s in created if s["id"] != schedule["id"]]
+        else:
+            schedule["manage_url"] = monitor_schedule.manage_url(_public_base_url(), schedule)
+            monitor_schedule.create_schedule(_monitor_store(), schedule)
+    except monitor_schedule.ScheduleLimitError as e:
+        st.error(f"{e} Please try again later or contact us.")
+        return False
+    except Exception as e:
+        st.error(f"Could not save the monitor schedule: {e}")
+        return False
+
+    if not MONITOR_ON_CLOUD and not _install_dispatch_cron(MONITOR_STORE_DIR):
+        st.toast("Schedule saved, but the daily cron job could not be installed. Run "
+                 f"`adapt monitor-dispatch --store-dir {MONITOR_STORE_DIR}` daily yourself.",
+                 icon="⚠️")
+
+    st.session_state["monitor_schedule"] = schedule
+    created.append(schedule)
+    return True
+
+
+def _start_first_run_job() -> bool:
+    """Start the new schedule's first run on the monitor job; False (error shown) if not."""
+    schedule = st.session_state["monitor_schedule"]
+    try:
+        execution = monitor_schedule.start_job_run(MONITOR_JOB, schedule["id"])
+    except Exception as e:
+        st.error(f"The schedule was saved, but its first run could not be started: {e}. "
+                 "It will still run on the next scheduled date.")
+        return False
+    st.session_state["monitor_first_run"] = execution.rsplit("/", 1)[-1] or "started"
+    return True
+
+
+def _render_first_run_submitted():
+    """Run page when the first run executes on the monitor job."""
+    schedule = st.session_state.get("monitor_schedule")
+    first_run = st.session_state.get("monitor_first_run")
+    if not schedule or not first_run:
+        st.info("Set up the monitor on the previous pages; its first run starts when "
+                "you click Continue on the Report page.")
+        return
+    st.success("**First run started.** It runs on our servers, so you can close this page.")
+    st.markdown(
+        f"The report will be emailed to **{', '.join(schedule['recipients'])}** when the "
+        f"run finishes. This can take from a few minutes to several hours for large "
+        f"targets.  \n"
+        f"Later reports arrive on each scheduled date."
+    )
+    st.markdown(f"**Manage link** (keep it private; it is also in every email):  \n"
+                f"{schedule['manage_url']}")
+    st.caption("The manage page shows each run's status and lets you download its "
+               f"reports or stop the schedule. (Job execution: {first_run})")
+
+
+def _page_monitor_manage(ref: str):
+    """Manage page for a scheduled monitor, reached via its private link."""
+    st.header("Scheduled monitor")
+    try:
+        schedule = monitor_schedule.find_by_ref(_monitor_store(), ref)
+    except Exception as e:
+        st.error(f"Could not load the schedule: {e}")
+        return
+    if schedule is None:
+        st.error("This monitor link is invalid or the schedule no longer exists.")
+        return
+
+    active = schedule["status"] == "active"
+    st.markdown(
+        f"**Status:** {'Active' if active else 'Stopped on ' + str(schedule['stopped_at'])}  \n"
+        f"**Targets:** {', '.join(schedule['targets']) or '—'}  \n"
+        f"**Primer sets:** {', '.join(schedule['primer_sets']) or '—'}  \n"
+        f"**Frequency:** {monitor_schedule.describe_frequency(schedule)}  \n"
+        f"**Recipients:** {', '.join(schedule['recipients'])}  \n"
+        f"**Created:** {schedule['created']}"
+    )
+    if schedule.get("spreadsheet_url"):
+        st.markdown(f"**Spreadsheet:** {schedule['spreadsheet_url']}")
+    if schedule.get("history"):
+        st.subheader("Recent runs")
+        st.dataframe(list(reversed(schedule["history"])), hide_index=True,
+                     use_container_width=True)
+    elif active:
+        st.info("No runs recorded yet. The first run may still be in progress; "
+                "refresh this page later.")
+    _render_latest_reports(schedule["id"])
+
+    if active:
+        if st.button("Stop monitoring", type="primary"):
+            monitor_schedule.stop_schedule(_monitor_store(), schedule)
+            st.toast("Monitoring stopped. No further reports will be sent.")
             st.rerun()
+    else:
+        st.info(f"Stored data for this monitor is deleted "
+                f"{monitor_schedule.DEFAULT_PURGE_AFTER_DAYS} days after it was stopped.")
+
+
+def _render_latest_reports(schedule_id: str):
+    """Download buttons for the Excel reports of a schedule's most recent run."""
+    store = _monitor_store()
+    try:
+        day, keys = monitor_schedule.latest_reports(store, schedule_id)
+    except Exception as e:
+        st.warning(f"Could not list reports: {e}")
+        return
+    if not keys:
+        return
+    st.subheader(f"Latest reports ({datetime.strptime(day, '%Y%m%d'):%Y-%m-%d})")
+    for key in keys:
+        name = key.rsplit("/", 1)[-1]
+        try:
+            data = store.read_bytes(key)
+        except Exception as e:
+            st.warning(f"Could not load {name}: {e}")
+            continue
+        st.download_button(
+            name, data, file_name=name, key=f"report_{key}",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 _SCROLL_JS = """
@@ -5239,6 +5976,65 @@ setTimeout(function() {
 """
 
 
+# Runs in the app page itself (injected once from a component iframe). Streamlit's
+# "Running..." icon counts as activity, so long runs and fetches never time out.
+# Leaving the page is what closes the websocket; Streamlit would just reconnect
+# a socket closed in place. The goodbye page is a blob URL because Streamlit
+# serves static .html files as text/plain.
+_IDLE_JS = """
+(function () {
+  if (window.__pcIdle) return;
+  window.__pcIdle = true;
+  const LIMIT = __LIMIT__ * 1000, WARN = Math.min(120000, LIMIT / 2);
+  let last = Date.now(), banner = null;
+  function hideWarning() { if (banner) { banner.remove(); banner = null; } }
+  function bump() { last = Date.now(); hideWarning(); }
+  ["mousemove", "mousedown", "keydown", "scroll", "wheel", "touchstart"].forEach(
+    (e) => document.addEventListener(e, bump, { capture: true, passive: true }));
+  function showWarning(secs) {
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:1000000;" +
+        "background:#fff3cd;color:#664d03;padding:10px 16px;text-align:center;" +
+        "font-family:sans-serif;border-bottom:1px solid #ffe69c";
+      document.body.appendChild(banner);
+    }
+    banner.textContent = "No activity for a while: this session will close in " + secs +
+      " s to free server resources. Move the mouse or press a key to stay.";
+  }
+  function closeSession() {
+    const back = location.href.replace(/"/g, "%22").replace(/</g, "%3C");
+    const html = '<!doctype html><meta charset="utf-8"><title>PrimerCast: session closed</title>' +
+      '<body style="font-family:sans-serif;max-width:560px;margin:15vh auto;padding:0 16px">' +
+      "<h2>Session closed</h2><p>This PrimerCast session was closed after " + __LIMIT_MIN__ +
+      " minutes of inactivity to free server resources. Settings and results shown on " +
+      "the page were not kept.</p>" +
+      '<p><a href="' + back + '" style="font-size:1.1em">Reconnect</a></p></body>';
+    location.replace(URL.createObjectURL(new Blob([html], { type: "text/html" })));
+  }
+  setInterval(function () {
+    if (document.querySelector('[data-testid="stStatusWidgetRunningIcon"]')) { bump(); return; }
+    const idle = Date.now() - last;
+    if (idle >= LIMIT) closeSession();
+    else if (idle >= LIMIT - WARN) showWarning(Math.ceil((LIMIT - idle) / 1000));
+  }, 1000);
+})();
+"""
+
+
+def _idle_timeout():
+    """Close this browser session after IDLE_TIMEOUT_MINUTES without activity."""
+    if IDLE_TIMEOUT_MINUTES <= 0:
+        return
+    js = (_IDLE_JS.replace("__LIMIT_MIN__", str(IDLE_TIMEOUT_MINUTES))
+          .replace("__LIMIT__", str(IDLE_TIMEOUT_MINUTES * 60)))
+    st.components.v1.html(
+        "<script>const p = window.parent; if (!p.__pcIdle) {"
+        " const s = p.document.createElement('script');"
+        f" s.textContent = {json.dumps(js)}; p.document.head.appendChild(s); }}</script>",
+        height=0)
+
+
 def _scroll_to_top():
     """Inject JS to scroll to the top of the page if navigation just happened."""
     if st.session_state.pop("_need_scroll_top", False):
@@ -5247,9 +6043,29 @@ def _scroll_to_top():
 
 def main():
     _render_sidebar()
+    _idle_timeout()
+
+    monitor_ref = st.query_params.get("monitor")
+    if monitor_ref:
+        _page_monitor_manage(monitor_ref)
+        return
 
     page = _current_page()
 
+    # The setup pages can take a moment to build (e.g. counting the sequences in
+    # every target FASTA on a fresh server). The spinner only shows if a page
+    # takes longer than half a second. Run / monitor report are left out: their
+    # long steps show their own progress.
+    if page in ("run", "monitor_report"):
+        _render_page(page)
+    else:
+        with st.spinner("Loading..."):
+            _render_page(page)
+
+    _scroll_to_top()
+
+
+def _render_page(page: str):
     if page == "home":
         _page_home()
     elif page == "virus_map":
@@ -5284,8 +6100,6 @@ def main():
         _page_monitor_report()
     else:
         _page_home()
-
-    _scroll_to_top()
 
 
 if __name__ == "__main__":

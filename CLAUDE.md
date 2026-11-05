@@ -10,8 +10,8 @@ This is a Python package for ML-guided qPCR primer design. Key directories:
   - `models/` - PyTorch ML model architectures
   - `external/` - Wrappers for external tools (ViennaRNA, bowtie2, MAFFT)
   - `utils/` - Shared utilities (sequence ops, encoding, params)
-  - `data/` - Pre-trained ML models (bundled as package data)
-- `workflows/` - Snakemake workflow templates
+  - `data/` - Pre-trained ML models and `Snakefile.template` (bundled as package data)
+- `workflows/` - Example Snakefile and `params.txt.template`
 - `training/` - Historical model training code (not production)
 - `tests/` - pytest test suite
 
@@ -65,6 +65,11 @@ Off-target steps use `fatal=False` (`prepare-input` and `evaluate` are only fata
 empty step: it still writes a report (0 coverage, targets listed as unmapped), and
 `run_warnings(run_dir)` surfaces zero on-target coverage plus rescue re-evaluations
 (`<eval>.rescue.json`) as warnings in the GUI and CLI.
+After any successful run, `run_funnels(run_dir)` gives every on-target funnel with a
+summary of the filters that removed the most candidates (shown in the GUI and `adapt`
+CLI). Pass `unit=` to `record()` for steps counting something other than the stage's
+unit (counts are only compared within a unit), and `summarize=False` for top-N cuts.
+Off-target `prepare-input` funnels set `offtarget=True` and are left out.
 
 ### Adding New Subcommands
 1. Create module in `src/primercast/commands/`
@@ -122,6 +127,16 @@ lock. Results are written to local disk, which is **ephemeral** on Cloud Run (lo
 redeploy / scale events) in this iteration; `PRIMERCAST_DATA_DIR` is the seam for adding
 GCS persistence later.
 
+Scheduled monitors do not depend on the web service being up (it scales to zero). The GUI
+saves each schedule to a store (`src/primercast/monitor_schedule.py`): the GCS bucket in
+`PRIMERCAST_MONITOR_BUCKET` on Cloud Run, `DATA_DIR/monitor_schedules/` locally. A daily
+`adapt monitor-dispatch` (Cloud Run Job + Cloud Scheduler, `terraform/monitor.tf`; a cron
+line locally) runs every due schedule and persists its accession history, which is what
+makes monitoring incremental. On Cloud Run a new schedule's first run is also a job
+execution (`monitor-dispatch --schedule-id <id>`, started by the GUI); locally it runs in
+the GUI. No accounts: each schedule has a private manage link
+`/?monitor=<id>.<token>`.
+
 ## Snakemake Workflows
 
 Workflows are in `workflows/`. They use the `primercast` CLI internally:
@@ -145,6 +160,23 @@ snakemake -s Snakefile.example --dry-run
   GUI's "Report a problem" bundles (`gui/error_report.py`; set by terraform for prod and
   by CI for staging). Unset (local dev) → bundles are saved under `DATA_DIR/error_reports/`
   and offered as a download.
+- `PRIMERCAST_MONITOR_BUCKET` / `PRIMERCAST_MONITOR_PREFIX`: GCS bucket + prefix for scheduled
+  monitors (set by terraform for prod/jobs, CI for staging). Unset → local store.
+- `PRIMERCAST_MONITOR_JOB`: full name of the Cloud Run Job (`projects/<p>/locations/<r>/jobs/<name>`)
+  that runs a new schedule's first run (set by terraform/CI). Unset → the GUI runs it in-process.
+- `PRIMERCAST_IDLE_TIMEOUT_MINUTES`: close a browser session after this many idle minutes (default 30
+  on Cloud Run, off locally; 0 disables).
+- `PRIMERCAST_RUN_TIME_LIMIT`: seconds before a GUI design/evaluate run is stopped (default 3600).
+- `PRIMERCAST_MONITOR_TZ`: time zone for scheduled run dates (default `America/New_York`).
+- `PRIMERCAST_MONITOR_MAX_SCHEDULES`: cap on active scheduled monitors (default 100).
+- `PRIMERCAST_EMAIL_SENDER` / `PRIMERCAST_EMAIL_PASSWORD`: From address + SMTP password/key for
+  monitor reports when not in `params.txt` (key from Secret Manager on Cloud Run).
+- `PRIMERCAST_SMTP_HOST` / `PRIMERCAST_SMTP_PORT` / `PRIMERCAST_SMTP_USER`: SMTP server, port
+  (465 = TLS, else STARTTLS) and login (empty = sender). Defaults to Gmail; Cloud Run uses
+  the Brevo relay (`smtp-relay.brevo.com:587`, set by terraform/CI; key in the
+  `primercast-monitor-smtp-key` secret). Emails sent via SendGrid (on hold) turn off click
+  tracking.
+- `PRIMERCAST_PUBLIC_URL`: base URL for manage links in emails (falls back to the request host).
 - `PRIMERCAST_FONT_PATH`: Custom font directory for training plots (optional)
 - `PRIMERCAST_TOOLPATH`: Custom tool installation path for training scripts (optional)
 - `RNASTRUCTURE_DATAPATH`: Path to RNAstructure data tables (optional)

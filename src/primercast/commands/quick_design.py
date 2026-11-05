@@ -87,6 +87,7 @@ MAX_BATCHES = 5
 TOP_PAIRS = 2500  # top primer pairs to evaluate (after Tm/GC/dG filtering)
 N_POSITIONS = 2500  # amplicon positions to score
 N_VARIANTS = 5     # primer variants per direction (consensus + wobble)
+PROBE_INTERIOR_MARGIN = 5  # bp beyond PROBE_LEN_MAX required between primers (probe mode)
 
 _WOBBLE_W = WOBBLE_W_PRIMER
 _COMPLEMENT = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G'}
@@ -340,7 +341,7 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
                              min_amp_len, max_amp_len,
                              min_gc=0.35, max_gc=0.65,
                              min_primer_score=0.80,
-                             top_n=5000, min_gap=10, out_csv=None):
+                             top_n=5000, min_gap=10, min_interior=0, out_csv=None):
     """Score amplicon positions across a gap-pre-filtered MSA.
 
     Enumerates all (fwd_start, fwd_len, rev_start, rev_len) combinations
@@ -365,6 +366,8 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
         min_primer_score: prune positions below this score (performance)
         top_n: return at most this many pairs (0 = unlimited)
         min_gap: minimum distance between returned fwd_starts
+        min_interior: minimum gap between the primers (fwd end to rev start),
+            e.g. to leave room for a probe
         out_csv: optional path to save per-column scores
 
     Returns:
@@ -462,6 +465,7 @@ def score_amplicon_positions(aligned_seqs, primer_len_min, primer_len_max,
             for rev_len, (_, rev_scores, rev_gc) in primer_data.items():
                 # amplicon = rev_start + rev_len - fwd_start
                 rev_lo = fwd_start + min_amp_len - rev_len
+                rev_lo = max(rev_lo, fwd_start + fwd_len + min_interior)
                 rev_hi = fwd_start + max_amp_len - rev_len + 1
                 rev_lo = max(0, rev_lo)
                 rev_hi = min(len(rev_scores), rev_hi)
@@ -907,7 +911,7 @@ def _align_batch(fasta_path, index_prefix, n_targets, threads, tmpdir, batch_idx
         "-x", str(index_prefix),
         "-U", str(fasta_path),
         "-f",
-        "-p", str(threads),
+        "-p", str(threads), "--reorder",
         "-k", str(k),
         "--mp", "2,2", "--np", "2",
         "--rdg", "4,4", "--rfg", "4,4",
@@ -1034,12 +1038,14 @@ def _record_batch_funnel(diag, funnel, primer_params):
         min(funnel["aligned_f"], funnel["aligned_r"]),
         breakdown={"forward": funnel["aligned_f"], "reverse": funnel["aligned_r"]},
         hint="bowtie2 found no binding site for the primers in the target sequences.",
+        unit="primers",
     )
     diag.record(
         "Primer coverage (binds >= 80% of sequences in its region)",
         min(funnel["covered_f"], funnel["covered_r"]),
         breakdown={"forward": funnel["covered_f"], "reverse": funnel["covered_r"]},
         hint="The target sequences may be too divergent for a single primer pair.",
+        unit="primers",
     )
     diag.record(
         "Primer pairing (orientation / amplicon length)", funnel["pairs"],
@@ -1058,6 +1064,7 @@ def _probe_filter_params(probe_params):
         "PROBE_GC_MAX": probe_params["max_gc"],
         "PROBE_HOMOPOLYMER_MAX": probe_params["homopolymer_max"],
         "PROBE_DG_MIN": probe_params["min_dg"],
+        "PROBE_AVOID_5PRIME_G": probe_params["avoid_5prime_g"],
     }
 
 
@@ -2142,7 +2149,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
 
     print(f"Quick mode (primers-first + probe): {args.name}")
     print(f"  Thresholds: coverage >= {cov_min}, activity >= {act_min}")
-    print(f"  Positions: {n_positions}, variants/direction: {n_variants}")
+    print(f"  Max positions: {n_positions}, variants/direction: {n_variants}")
     print(f"  Probe: len {probe_params['len_min']}-{probe_params['len_max']}, "
           f"Tm {probe_params['min_tm']}-{probe_params['max_tm']}, "
           f"max_mm {max_mm}, max_indels {max_indel}")
@@ -2167,23 +2174,29 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     print(f"  MSA: {len(aligned_seqs)} seqs, {n_raw_cols} columns -> "
           f"{n_kept} after removing {n_raw_cols - n_kept} gap-dominant columns")
 
+    # Leave room between the primers for the longest allowed probe
+    min_interior = probe_params["len_max"] + PROBE_INTERIOR_MARGIN
     scored, consensus_aligned, kept_cols = score_amplicon_positions(
         aligned_seqs, primer_params["min_pri_len"], primer_params["max_pri_len"],
         min_amp_len, max_amp_len,
         min_gc=min_gc, max_gc=max_gc_frac,
-        top_n=n_positions,
+        top_n=n_positions, min_interior=min_interior,
     )
+    print(f"  Positions found: {len(scored)} (max {n_positions}"
+          + ("; fewer valid sites than the max, using all)" if len(scored) < n_positions else ")"))
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
-    diag.record("Sequences in alignment", len(aligned_seqs))
+    diag.record("Sequences in alignment", len(aligned_seqs), unit="sequences")
     diag.record(
         "Amplicon positions (conservation / GC)", len(scored),
         params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
                 "PRIMER_LEN_MAX": primer_params["max_pri_len"],
                 "AMPLEN_MIN": min_amp_len, "AMPLEN_MAX": max_amp_len,
-                "GC_MAX": primer_params["max_gc"]},
+                "GC_MAX": primer_params["max_gc"],
+                "PROBE_LEN_MAX": probe_params["len_max"]},
         hint=("Both primer sites need >= 80% wobble-aware conservation across the "
-              "alignment, after dropping columns that are > 50% gaps. The alignment may "
-              "be too divergent or shorter than AMPLEN_MIN."),
+              "alignment, after dropping columns that are > 50% gaps, with at least "
+              f"PROBE_LEN_MAX + {PROBE_INTERIOR_MARGIN} bp between them for the probe. "
+              "The alignment may be too divergent or shorter than AMPLEN_MIN."),
     )
     if not scored:
         print("ERROR: No valid amplicon positions found in MSA.")
@@ -2211,7 +2224,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     if len(primers) > top_pairs:
         primers = primers[:top_pairs]
     diag.record("Top pairs by position score", len(primers),
-                params={"QUICK_TOP_PAIRS": top_pairs})
+                params={"QUICK_TOP_PAIRS": top_pairs}, summarize=False)
     print(f"  Selected top {len(primers)} pairs")
 
     # Step 3: Group into batches
@@ -2239,6 +2252,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
     name_to_seq = {}
     funnel = _new_batch_funnel()
     pname_to_msa_pos = {}  # pname_f -> (fwd_start_msa, rev_start_msa, fwd_len, rev_len)
+    rev_to_msa_pos = {}  # pname_r -> (rev_start_msa, rev_len); evaluated pairs can mix positions
 
     try:
         for batch_idx, (batch_primers, min_fwd, max_rev) in enumerate(batches):
@@ -2280,6 +2294,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                     p['fwd_start_msa'], p['rev_start_msa'],
                     len(p['fwd_seq']), len(p['rev_seq']),
                 )
+                rev_to_msa_pos[pname_r] = (p['rev_start_msa'], len(p['rev_seq']))
 
             print("  Aligning...", end=" ", flush=True)
             mapped_path = _align_batch(
@@ -2382,6 +2397,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 "Probe candidates (Tm / GC / homopolymer / dG)", len(probes),
                 params=_probe_filter_params(probe_params),
                 hint="Probes are designed from the alignment; it may be too divergent.",
+                unit="probes",
             )
 
             if not probes:
@@ -2393,10 +2409,37 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 _score_probes_by_coverage(probes, aligned_seqs, max_mm, max_indel,
                                          seq_ids=all_seq_ids)
 
-                # Select top probes at distinct positions
+                # Select probes per primer pair from the candidates inside its
+                # amplicon (between the primers). Selecting the globally best
+                # probes first and only then checking containment leaves short
+                # amplicons with nothing, even when they hold many good candidates.
                 top_n_probes = int(params.get("PROBE_TOP_N", 50))
-                selected_probes = _select_top_probes(probes, top_n=top_n_probes, min_distance=30)
-                print(f"  Selected {len(selected_probes)} probes at distinct positions:")
+                per_pair = max(1, min(top_n_probes, 5))
+                selected_probes = []
+                name_to_idx = {}
+                pair_to_probe_idx = {}
+
+                for _, row in combined.iterrows():
+                    pname_f = row['pname_f']
+                    if pname_f not in pname_to_msa_pos or row['pname_r'] not in rev_to_msa_pos:
+                        continue
+                    fwd_start, _, fwd_len, _ = pname_to_msa_pos[pname_f]
+                    rev_start, _ = rev_to_msa_pos[row['pname_r']]
+                    amp_start = fwd_start + fwd_len
+                    amp_end = rev_start
+
+                    inside = [p for p in probes
+                              if p['msa_start'] >= amp_start and p['msa_end'] <= amp_end]
+                    probe_idxs = set()
+                    for p in _select_top_probes(inside, top_n=per_pair, min_distance=5):
+                        if p['name'] not in name_to_idx:
+                            name_to_idx[p['name']] = len(selected_probes)
+                            selected_probes.append(p)
+                        probe_idxs.add(name_to_idx[p['name']])
+                    if probe_idxs:
+                        pair_to_probe_idx[(pname_f, row['pname_r'])] = probe_idxs
+
+                print(f"  Selected {len(selected_probes)} probes inside primer-pair amplicons:")
                 for i, p in enumerate(selected_probes[:10]):
                     print(f"    Probe {i+1}: {p['name']} ({p['seq'][:20]}...) "
                           f"MSA {p['msa_start']}-{p['msa_end']}, "
@@ -2405,33 +2448,14 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 selected_names = {p['name'] for p in selected_probes}
                 probe_features = {k: v for k, v in probe_features.items()
                                   if k in selected_names}
-
-                # Assign probes to primer pairs by amplicon containment
                 probes_by_probe_idx = {i: [p] for i, p in enumerate(selected_probes)}
-                pair_to_probe_idx = {}
-
-                for _, row in combined.iterrows():
-                    pname_f = row['pname_f']
-                    if pname_f not in pname_to_msa_pos:
-                        continue
-                    fwd_start, rev_start, fwd_len, rev_len = pname_to_msa_pos[pname_f]
-                    amp_start = fwd_start + fwd_len
-                    amp_end = rev_start
-
-                    pair_key = (pname_f, row['pname_r'])
-                    probe_idxs = set()
-                    for pi, p in enumerate(selected_probes):
-                        if p['msa_start'] >= amp_start and p['msa_end'] <= amp_end:
-                            probe_idxs.add(pi)
-                    if probe_idxs:
-                        pair_to_probe_idx[pair_key] = probe_idxs
 
                 n_with_probes = sum(1 for _ in pair_to_probe_idx)
                 print(f"  {n_with_probes}/{len(combined)} pairs have probes in amplicon")
                 diag.record(
                     "Probe inside amplicon", n_with_probes,
-                    params={"PROBE_TOP_N": top_n_probes},
-                    hint="None of the top-scoring probes lies between a primer pair.",
+                    hint="No probe candidate fits between the primers of any pair; "
+                         "the amplicons may be too short for the probe length.",
                 )
 
                 # Check probe-primer dimers
@@ -2464,8 +2488,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 else:
                     eval_full_pos = pd.DataFrame()
 
-                # Greedy probe assignment: walk pairs by score, assign best unclaimed probe
-                claimed_probes = set()
+                # Assign the best compatible probe independently for each pair.
                 pair_assigned_probe = {}  # pair_key -> probe dict
 
                 for _, row in combined.iterrows():
@@ -2476,13 +2499,12 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                     valid_probes = []
                     for pi in position_probes:
                         p = selected_probes[pi]
-                        if p['name'] in dimer_probes and p['name'] not in claimed_probes:
+                        if p['name'] in dimer_probes:
                             valid_probes.append(p)
                     if valid_probes:
                         # Pick probe with highest coverage
                         best = max(valid_probes, key=lambda p: p['coverage'])
                         pair_assigned_probe[pair_key] = best
-                        claimed_probes.add(best['name'])
 
                 # Compute per-pair coverage
                 cov_target_map = {}
@@ -2524,7 +2546,7 @@ def _run_primers_first(args, params, primer_params, cov_min, act_min, min_pairs,
                 combined['probe_seq'] = combined.index.map(assigned_probe_seq_map)
 
                 n_assigned = sum(1 for v in assigned_probe_name_map.values() if v)
-                print(f"  Greedy probe assignment: {n_assigned}/{len(combined)} pairs got a probe")
+                print(f"  Probe assignment: {n_assigned}/{len(combined)} pairs got a probe")
                 for idx, row in combined.iterrows():
                     if assigned_probe_name_map.get(idx):
                         print(f"    {row['pname_f']},{row['pname_r']} → "
@@ -2573,8 +2595,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
 
     print(f"Quick mode (wobble-optimized): {args.name}")
     print(f"  Thresholds: coverage >= {cov_min}, activity >= {act_min}")
-    print(f"  Positions: {n_positions}, variants/direction: {n_variants}")
-    print(f"  Max pairs: {n_positions} × {n_variants}² = {n_positions * n_variants**2}")
+    print(f"  Max positions: {n_positions}, variants/direction: {n_variants}")
 
     # Step 1: Load MSA, strip gap-dominant columns, and score amplicon positions
     print("Step 1: Scoring amplicon positions across MSA...")
@@ -2604,8 +2625,11 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
         min_gc=min_gc, max_gc=max_gc_frac,
         top_n=n_positions,
     )
+    print(f"  Positions found: {len(scored)} (max {n_positions}"
+          + ("; fewer valid sites than the max, using all)" if len(scored) < n_positions else ")"))
+    print(f"  Max pairs: {len(scored)} × {n_variants}² = {len(scored) * n_variants**2}")
     diag = StageDiagnostics("quick_design", target=args.name, unit="primer pairs")
-    diag.record("Sequences in alignment", len(aligned_seqs))
+    diag.record("Sequences in alignment", len(aligned_seqs), unit="sequences")
     diag.record(
         "Amplicon positions (conservation / GC)", len(scored),
         params={"PRIMER_LEN_MIN": primer_params["min_pri_len"],
@@ -2643,7 +2667,7 @@ def _run_multi_region(args, params, primer_params, cov_min, act_min, min_pairs, 
     if len(primers) > top_pairs:
         primers = primers[:top_pairs]
     diag.record("Top pairs by position score", len(primers),
-                params={"QUICK_TOP_PAIRS": top_pairs})
+                params={"QUICK_TOP_PAIRS": top_pairs}, summarize=False)
     n_unique_pos = len(set(p['pos_idx'] for p in primers))
     print(f"  Selected top {len(primers)} pairs ({n_unique_pos} positions)")
 

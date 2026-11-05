@@ -61,6 +61,31 @@ def test_resolve_input_files_picks_named_targets_only(target_seqs, tmp_path):
     ]
 
 
+def test_resolve_input_files_matches_extensions_case_insensitively(target_seqs):
+    """A hand-placed `.FA`/`.ALN` is still that target's input."""
+    (target_seqs / "original" / "virusC.FA").write_text(">c\nACGT\n")
+    (target_seqs / "msa" / "virusC.ALN").write_text(">c\nACGT\n")
+
+    arcnames = sorted(a for _, a in resolve_input_files(["virusC"], target_seqs))
+    assert arcnames == ["inputs/msa/virusC.ALN", "inputs/original/virusC.FA"]
+
+
+def test_resolve_input_files_collects_every_extension_of_a_stem(target_seqs):
+    (target_seqs / "original" / "virusA.fna").write_text(">a\nACGT\n")
+
+    arcnames = [a for _, a in resolve_input_files(["virusA"], target_seqs)]
+    # .fa before .fna, whatever order the filesystem lists them in.
+    assert arcnames == [
+        "inputs/original/virusA.fa",
+        "inputs/original/virusA.fna",
+        "inputs/msa/virusA.aln",
+    ]
+
+
+def test_resolve_input_files_tolerates_missing_directories(tmp_path):
+    assert resolve_input_files(["virusA"], tmp_path / "no_such_target_seqs") == []
+
+
 def test_resolve_input_files_extra_must_be_inside_allowed_dir(target_seqs, tmp_path):
     allowed = tmp_path / "evaluate"
     allowed.mkdir()
