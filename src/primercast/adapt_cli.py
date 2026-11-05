@@ -17,6 +17,7 @@ from email.message import EmailMessage
 from importlib.resources import files
 from pathlib import Path
 
+from primercast.external import pathoplexus
 from primercast.external.gget_virus import GGET_VIRUS
 from primercast.utils.cpu import available_cores
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings
@@ -281,7 +282,8 @@ _TRUE_FALSE_FLAGS = {
 # Columns that are metadata only (not passed to gget)
 _METADATA_COLUMNS = {"Pathogen", "Pathogen_abb", "Gene Segment", "Target name",
                       "Primer name", "query_id", "expected_count", "latest_count",
-                      "diff", "Forward", "Reverse", "Probe", "subtype_filter"}
+                      "diff", "Forward", "Reverse", "Probe", "subtype_filter",
+                      "source", "pathoplexus_organism"}
 
 # Max-date columns to strip when monitoring (monitor always fetches up to the latest)
 _MAX_DATE_COLUMNS = {"max_collection_date", "max_release_date"}
@@ -356,7 +358,9 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
         print("Error: spreadsheet must have at least 4 rows.", file=sys.stderr)
         sys.exit(1)
 
-    headers = rows[1]
+    # Stripped: the published template shipped " subtype_filter" with a leading
+    # space, which then matched no known column and reached gget as a bad flag.
+    headers = [h.strip() for h in rows[1]]
 
     # Find TaxID column — gget arguments start here
     try:
@@ -395,7 +399,8 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
             else:
                 row_dict[col] = ""
 
-        if _is_empty(row_dict.get("TaxID")):
+        # A row needs something to fetch: an NCBI TaxID or a Pathoplexus organism.
+        if _is_empty(row_dict.get("TaxID")) and _is_empty(row_dict.get("pathoplexus_organism")):
             continue
 
         data_rows.append(row_dict)
@@ -847,9 +852,96 @@ def _no_new_releases_result(target_name: str, prev_acc_file: Path, date_dir: Pat
         "new_fasta_path": None,
         "metadata_path": None,
         "new_accessions": set(),
+        "revised_accessions": set(),
         "total_count": 0,
         "new_count": 0,
+        "revised_count": 0,
         "is_first_fetch": False,
+    }
+
+
+def _fetch_source(row: dict) -> str:
+    """Which database a target row is fetched from. Defaults to NCBI."""
+    source = str(row.get("source", "")).strip().lower() or "ncbi"
+    if source not in ("ncbi", "pathoplexus"):
+        raise ValueError(f"unknown source {source!r} (expected 'ncbi' or 'pathoplexus')")
+    return source
+
+
+def _pathoplexus_fetch(
+    row: dict, target_name: str, date_dir: Path, prev_acc: set[str], is_first: bool
+) -> dict:
+    """Fetch one target from Pathoplexus, in the shape ``_monitor_fetch`` returns.
+
+    Pathoplexus does its own diffing -- it pulls the matching accessions first
+    and downloads only the unseen ones -- so unlike the gget path there is never
+    a full FASTA to filter down.
+    """
+    organism = str(row.get("pathoplexus_organism", "")).strip()
+    if not organism:
+        print("  Skipping (no pathoplexus_organism)")
+        return {"target_name": target_name, "status": "error"}
+
+    # Spreadsheets use "Gene Segment"; the GUI's manual setup writes "segment".
+    segment = str(row.get("Gene Segment") or row.get("segment") or "").strip()
+    if segment.lower() in ("", "non-segmented", "main"):
+        segment = None
+
+    filters = {k: v for k, v in row.items() if k not in _METADATA_COLUMNS and k != "TaxID"}
+    try:
+        result = pathoplexus.fetch(
+            organism, filters, date_dir / ".pathoplexus_tmp",
+            known_accessions=prev_acc, segment=segment)
+    except pathoplexus.PathoplexusError as e:
+        print(f"  Error: {e}")
+        return {"target_name": target_name, "status": "error"}
+
+    current = result["all_accessions"]
+    new_acc, revised_acc = result["new_accessions"], result["revised_accessions"]
+    print(f"  {len(current)} sequence(s) match on Pathoplexus ({organism}"
+          f"{'/' + segment if segment else ''})")
+
+    if not current:
+        shutil.rmtree(date_dir / ".pathoplexus_tmp", ignore_errors=True)
+        if is_first:
+            print("  Warning: no sequences matched the fetch settings")
+            return {"target_name": target_name, "status": "no_output"}
+
+    # Keep the accession history even when nothing is new, so the next run still
+    # recognises everything already reported.
+    acc_file = date_dir / f"{target_name}_accessions.txt"
+    acc_file.write_text("\n".join(sorted(current)) + "\n" if current else "")
+
+    new_fasta = dated_meta = None
+    if result["fasta_path"]:
+        new_fasta = date_dir / f"{target_name}_new.fa"
+        shutil.move(str(result["fasta_path"]), str(new_fasta))
+        n_deduped = _deduplicate_fasta(new_fasta)
+        if n_deduped:
+            print(f"  Removed {n_deduped} duplicate sequence(s)")
+    if result["metadata_path"]:
+        dated_meta = date_dir / f"{target_name}_metadata.csv"
+        shutil.move(str(result["metadata_path"]), str(dated_meta))
+    shutil.rmtree(date_dir / ".pathoplexus_tmp", ignore_errors=True)
+
+    if is_first:
+        print(f"  First fetch — all {len(new_acc)} sequences are new")
+    else:
+        print(f"  New sequences: {len(new_acc)}, revised: {len(revised_acc)}")
+
+    return {
+        "target_name": target_name,
+        "status": "success",
+        "source": "pathoplexus",
+        "fasta_path": new_fasta,
+        "new_fasta_path": new_fasta,
+        "metadata_path": dated_meta,
+        "new_accessions": new_acc,
+        "revised_accessions": revised_acc,
+        "total_count": len(current),
+        "new_count": len(new_acc),
+        "revised_count": len(revised_acc),
+        "is_first_fetch": is_first,
     }
 
 
@@ -900,6 +992,25 @@ def _monitor_fetch(
         )
 
         is_first = len(prev_acc_files) == 0
+        prev_acc = (set() if is_first
+                    else set(prev_acc_files[0].read_text().split()))
+
+        try:
+            source = _fetch_source(row)
+        except ValueError as e:
+            print(f"  Error: {e}")
+            results[target_name] = {"target_name": target_name, "status": "error"}
+            continue
+
+        if source == "pathoplexus":
+            if dry_run:
+                print(f"  Would fetch from Pathoplexus: "
+                      f"{row.get('pathoplexus_organism', '(no organism)')}")
+                results[target_name] = {"target_name": target_name, "status": "dry-run"}
+                continue
+            results[target_name] = _pathoplexus_fetch(
+                row, target_name, date_dir, prev_acc, is_first)
+            continue
 
         # For subsequent fetches, only download what NCBI has published since
         # the last one, instead of the entire history.
@@ -970,20 +1081,22 @@ def _monitor_fetch(
         total_count = len(current_acc)
         print(f"  Fetched {total_count} unique sequences → {dated_fasta.name}")
 
+        # A re-deposited sequence comes back under a bumped version, so split
+        # those out rather than announcing them as discoveries.
+        new_acc, revised_acc = pathoplexus.classify(current_acc, prev_acc)
         if not is_first:
-            prev_acc = set(prev_acc_files[0].read_text().strip().split("\n"))
-            new_acc = current_acc - prev_acc
             print(f"  Previous: {prev_acc_files[0].parent.name} ({len(prev_acc)} accessions)")
-            print(f"  New sequences: {len(new_acc)}")
+            print(f"  New sequences: {len(new_acc)}, revised: {len(revised_acc)}")
         else:
-            new_acc = current_acc
             print(f"  First fetch — all {total_count} sequences are new")
 
-        # Write new-only FASTA
+        # Write new-only FASTA. Revisions go in too: a revision can change the
+        # sequence, so it has to be re-evaluated like anything else.
         new_fasta = None
-        if new_acc:
+        if new_acc or revised_acc:
             new_fasta = date_dir / f"{target_name}_new.fa"
-            n_written = _filter_fasta_by_accessions(dated_fasta, new_acc, new_fasta)
+            n_written = _filter_fasta_by_accessions(
+                dated_fasta, new_acc | revised_acc, new_fasta)
             print(f"  New sequences FASTA: {new_fasta.name} ({n_written} seqs)")
 
         # Save accession list for future comparison, then delete full FASTA
@@ -995,12 +1108,15 @@ def _monitor_fetch(
         results[target_name] = {
             "target_name": target_name,
             "status": "success",
+            "source": "ncbi",
             "fasta_path": new_fasta,
             "new_fasta_path": new_fasta,
             "metadata_path": dated_meta if dated_meta.exists() else None,
             "new_accessions": new_acc,
+            "revised_accessions": revised_acc,
             "total_count": total_count,
             "new_count": len(new_acc),
+            "revised_count": len(revised_acc),
             "is_first_fetch": is_first,
         }
 
@@ -1040,6 +1156,7 @@ def _build_pset_fa(rows: list[dict], output_path: Path) -> list[str]:
 # must precede TaxID: everything from TaxID onwards becomes a gget argument.
 MANUAL_SHEET_HEADERS = [
     "Target name", "Primer name", "Forward", "Reverse", "Probe", "subtype_filter",
+    "source", "pathoplexus_organism",
     "TaxID", "host", "nuc_completeness", "geographic_location",
     "min_collection_date", "max_collection_date", "min_release_date",
     "min_seq_length", "max_seq_length", "max_ambiguous_chars", "segment", "refseq_only",
@@ -1148,23 +1265,66 @@ def _get_new_seq_table(
     if meta.empty:
         return f"{len(new_accessions)} new sequences (not found in metadata).\n"
 
-    # Select display columns
-    cols = ["accession", "Length", "Geographic Region", "Release date"]
+    # Select display columns. The last three only exist for Pathoplexus, where
+    # the restricted-data terms require the accession to be shown with a direct
+    # link to its source page and the terms kept alongside it.
+    cols = ["accession", "Length", "Geographic Region", "Release date",
+            "dataUseTerms", "dataUseTermsRestrictedUntil", "Pathoplexus URL"]
     available = [c for c in cols if c in meta.columns]
     display = meta[available].fillna("—")
 
-    lines = [f"{len(new_accessions)} new sequence(s):\n"]
+    # Width from content, so URLs are not truncated into dead links.
+    widths = {c: max(len(c), *(len(str(v)) for v in display[c])) for c in available}
 
-    # Header
-    header = "  ".join(f"{c:<20}" for c in available)
+    lines = [f"{len(new_accessions)} new sequence(s):\n"]
+    header = "  ".join(f"{c:<{widths[c]}}" for c in available)
     lines.append(header)
     lines.append("-" * len(header))
 
     for _, row in display.iterrows():
-        line = "  ".join(f"{str(row[c]):<20}" for c in available)
-        lines.append(line)
+        lines.append("  ".join(f"{str(row[c]):<{widths[c]}}" for c in available))
 
     return "\n".join(lines) + "\n"
+
+
+def _data_use_notice(accessions: set[str], metadata_path: Path | None) -> str:
+    """Terms notice for any restricted records in this batch.
+
+    Pathoplexus restricted data may be used by anyone who accepts its terms, but
+    passing it on means stating those terms wherever the data is shown. Returns
+    an empty string when nothing in the batch is restricted.
+    """
+    if not accessions or not metadata_path or not metadata_path.exists():
+        return ""
+
+    import pandas as pd
+    meta = pd.read_csv(metadata_path)
+    if "dataUseTerms" not in meta.columns:
+        return ""
+
+    restricted = meta[meta["accession"].isin(accessions)
+                      & (meta["dataUseTerms"] == "RESTRICTED")]
+    if restricted.empty:
+        return ""
+
+    urls = sorted(set(restricted["dataUseTermsUrl"].dropna()))
+    until = sorted(set(restricted["dataUseTermsRestrictedUntil"].dropna()))
+    notice = [
+        f"\nNOTE: {len(restricted)} of these sequences are Pathoplexus "
+        "Restricted-Use Data.",
+        "Using them means accepting the Data Use Terms: acknowledge the "
+        "submitters by",
+        "accession (or a SeqSet), link back to Pathoplexus, and keep the terms "
+        "with the data",
+        "if you pass it on.",
+    ]
+    if until:
+        # Each record has its own expiry; a batch can span dozens, so give the
+        # span rather than listing them.
+        span = until[0] if len(until) == 1 else f"between {until[0]} and {until[-1]}"
+        notice.append(f"Becomes Open Data {'on ' + span if len(until) == 1 else span}.")
+    notice.extend(f"Terms: {u}" for u in urls)
+    return "\n".join(notice) + "\n"
 
 
 def _read_excel_summary(xlsx_path: Path) -> str:
@@ -1587,17 +1747,28 @@ def cmd_monitor(args):
         new_count = result["new_count"]
         total_count = result["total_count"]
         new_acc = result["new_accessions"]
+        revised_acc = result.get("revised_accessions") or set()
         metadata_path = result.get("metadata_path")
 
-        email_body_parts.append(
-            f"{new_count} new sequence(s) detected ({total_count} total)\n"
-        )
+        headline = f"{new_count} new sequence(s) detected ({total_count} total)"
+        if revised_acc:
+            headline += f", plus {len(revised_acc)} revised"
+        email_body_parts.append(headline + "\n")
 
-        # New sequence table
-        seq_table = _get_new_seq_table(new_acc, metadata_path)
-        email_body_parts.append(seq_table)
+        email_body_parts.append(_get_new_seq_table(new_acc, metadata_path))
 
-        if new_count == 0:
+        # Revisions are kept apart from discoveries. Pathoplexus re-ingests its
+        # whole archive from time to time, which bumps hundreds of versions at
+        # once; folded into the headline that is indistinguishable from an
+        # outbreak. They are still re-evaluated below.
+        if revised_acc:
+            email_body_parts.append(
+                "\nRevised (re-deposited under a new version, re-evaluated below):\n"
+                + _get_new_seq_table(revised_acc, metadata_path))
+
+        email_body_parts.append(_data_use_notice(new_acc | revised_acc, metadata_path))
+
+        if new_count == 0 and not revised_acc:
             continue
 
         # Determine target FASTA for evaluate

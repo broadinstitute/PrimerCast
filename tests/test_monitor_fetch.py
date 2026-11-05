@@ -144,9 +144,10 @@ def test_new_sequences_are_found_on_a_repeat_run(tmp_path, fake_gget):
 
 # --- GUI copy ----------------------------------------------------------------
 
-def test_gui_fetch_uses_the_shared_helpers():
-    """The GUI runs its own copy of the fetch loop; keep it on the same rules."""
+def test_gui_fetch_uses_the_shared_fetch():
+    """The GUI used to run its own copy of the fetch loop, which drifted twice
+    (the collection-date bug, then no Pathoplexus). It must call the shared one."""
     source = (Path(__file__).resolve().parent.parent / "gui" / "app.py").read_text()
-    assert "_narrow_to_new_releases(row," in source
-    assert "_no_new_releases_result(" in source
-    assert '("min_release_date", "min_collection_date")' not in source
+    assert "_monitor_fetch(rows, work_dir, date_dir, date_str)" in source
+    assert "_build_gget_command(" not in source
+    assert "subprocess.run(cmd, check=True, capture_output=True)" not in source

@@ -134,18 +134,17 @@ from gui.run_isolation import prepare_run_dir
 from gui import error_report, run_gate
 from primercast.utils.params import parse_params
 from primercast.external.gget_virus import GGET_VIRUS
+from primercast.external import pathoplexus
 from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings, step_baselines
 from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
     _load_spreadsheet,
     _make_target_name,
-    _build_gget_command,
     _extract_accessions,
-    _filter_fasta_by_accessions,
     _deduplicate_fasta,
-    _narrow_to_new_releases,
-    _no_new_releases_result,
+    _monitor_fetch,
+    _data_use_notice,
     _build_pset_fa,
     _send_email,
     _read_excel_summary,
@@ -3733,6 +3732,146 @@ def _page_select_target():
         st.caption("Select a target sequence to continue.")
 
 
+def _use_monitor_target(row: dict):
+    """Record a manually set-up monitor target as a one-row mastersheet."""
+    csv_text = _rows_to_sheet_csv(MANUAL_SHEET_HEADERS, [row])
+    headers, data_rows = _load_spreadsheet(csv_text)
+    st.session_state["monitor_spreadsheet_data"] = {
+        "csv_text": csv_text,
+        "base_csv_text": csv_text,
+        "headers": headers,
+        "data_rows": data_rows,
+        "spreadsheet_id": "",
+    }
+    st.toast(f"Target '{row['Target name']}' set — add primer sets on the next page.")
+    st.rerun()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _pathoplexus_values(organism: str, field: str) -> list[str]:
+    """Values ``field`` takes on Pathoplexus, for a picker. Empty if unreachable."""
+    try:
+        # "missing" is a submitter placeholder, not a place or host.
+        return [v for v in pathoplexus.field_values(organism, field) if v != "missing"]
+    except pathoplexus.PathoplexusError:
+        return []
+
+
+def _render_pathoplexus_target_ui(prefix: str):
+    """Monitor target setup for a Pathoplexus organism.
+
+    Only the filters Pathoplexus supports are offered. Location and host are
+    pickers filled from the organism's real values, because LAPIS matches them
+    exactly and case-sensitively -- typed "uganda" or "human" fetch nothing.
+    """
+    names = pathoplexus.ORGANISM_NAMES
+    organism = st.selectbox(
+        "Organism",
+        options=sorted(pathoplexus.ORGANISMS, key=names.get),
+        format_func=lambda o: names[o],
+        index=None,
+        placeholder="Type an organism name to search...",
+        key=f"{prefix}_organism",
+    )
+
+    segment = ""
+    segments = pathoplexus.ORGANISMS.get(organism, ("main",))
+    if organism and segments != ("main",):
+        # Keyed per organism so a stale choice never carries across.
+        segment = st.selectbox(
+            "Serotype" if organism == "dengue" else "Gene segment",
+            options=segments,
+            key=f"{prefix}_segment_{organism}",
+            help="Segments are monitored one per target: a sequence's segments "
+                 "share one accession, so they cannot share a FASTA.",
+        )
+
+    auto_target = f"{organism}_{segment}" if segment else (organism or "")
+    if auto_target != st.session_state.get(f"_prev_auto_{prefix}", ""):
+        st.session_state[f"_prev_auto_{prefix}"] = auto_target
+        st.session_state[f"{prefix}_target_name"] = re.sub(r"[^\w\-]", "_", auto_target)
+
+    target_name = st.text_input(
+        "Target name",
+        placeholder="e.g., ebola-bdbv",
+        key=f"{prefix}_target_name",
+        help="Name for the output FASTA file.",
+    )
+
+    col_len1, col_len2 = st.columns(2)
+    with col_len1:
+        st.number_input("Min sequence length (bp)", min_value=0, value=None, step=100,
+                        key=f"{prefix}_min_seq_length")
+    with col_len2:
+        st.number_input("Max sequence length (bp)", min_value=0, value=None, step=100,
+                        key=f"{prefix}_max_seq_length")
+
+    _date_min = date(1900, 1, 1)
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        st.date_input("Min release date", value=None, min_value=_date_min,
+                      key=f"{prefix}_min_release_date",
+                      help="When the sequence first went public anywhere, including "
+                           "GenBank before Pathoplexus mirrored it.")
+    with col_d2:
+        st.date_input("Max release date", value=date.today(), min_value=_date_min,
+                      disabled=True, key=f"{prefix}_max_release_date")
+
+    def _picker(label, field, placeholder):
+        options = _pathoplexus_values(organism, field) if organism else []
+        if organism and not options:
+            # Pathoplexus unreachable: fall back to typing, exact spelling.
+            return st.text_input(f"{label} (exact, case-sensitive; comma-separated)",
+                                 placeholder=placeholder, key=f"{prefix}_{field}_text")
+        picked = st.multiselect(label, options=options, placeholder="Any",
+                                disabled=not organism, key=f"{prefix}_{field}_{organism}")
+        return ", ".join(picked)
+
+    geo = _picker("Country", "geoLocCountry", "e.g., Uganda")
+    host = _picker("Host", "hostNameScientific", "e.g., Homo sapiens")
+
+    with st.expander("Additional parameters"):
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.date_input("Min collection date", value=None, min_value=_date_min,
+                          key=f"{prefix}_min_collection_date")
+        with col_c2:
+            st.date_input("Max collection date", value=None, min_value=_date_min,
+                          key=f"{prefix}_max_collection_date")
+        st.caption("Partially dated records (just a year or month) are kept when "
+                   "they could fall inside the range.")
+        st.number_input("Max ambiguous characters", min_value=0, value=None, step=1,
+                        key=f"{prefix}_max_ambiguous_chars")
+
+    st.caption(
+        "Some Pathoplexus sequences are [Restricted-Use Data]"
+        "(https://pathoplexus.org/about/terms-of-use/restricted-data). They are "
+        "included and marked in reports; publishing with them means acknowledging "
+        "the submitters.")
+
+    if st.button("Use this target", disabled=not organism or not target_name,
+                 key=f"{prefix}_use_btn"):
+        def _val(key):
+            v = st.session_state.get(f"{prefix}_{key}")
+            if v is None or v == "":
+                return ""
+            return v.strftime("%Y-%m-%d") if isinstance(v, date) else str(v).strip()
+        _use_monitor_target({
+            "Target name": target_name.strip(),
+            "source": "pathoplexus",
+            "pathoplexus_organism": organism,
+            "segment": segment,
+            "geographic_location": geo,
+            "host": host,
+            "min_release_date": _val("min_release_date"),
+            "min_collection_date": _val("min_collection_date"),
+            "max_collection_date": _val("max_collection_date"),
+            "min_seq_length": _val("min_seq_length"),
+            "max_seq_length": _val("max_seq_length"),
+            "max_ambiguous_chars": _val("max_ambiguous_chars"),
+        })
+
+
 def _render_fetch_ui(prefix: str, monitor: bool = False):
     """Render fetch-from-NCBI UI. prefix is used to namespace session state keys."""
     _OTHER_OPTION = "Other (enter TaxID manually)"
@@ -3882,17 +4021,7 @@ def _render_fetch_ui(prefix: str, monitor: bool = False):
                 "segment": _val("segment"),
                 "refseq_only": "TRUE" if st.session_state.get(f"{prefix}_refseq_only") else "",
             }
-            csv_text = _rows_to_sheet_csv(MANUAL_SHEET_HEADERS, [row])
-            headers, data_rows = _load_spreadsheet(csv_text)
-            st.session_state["monitor_spreadsheet_data"] = {
-                "csv_text": csv_text,
-                "base_csv_text": csv_text,
-                "headers": headers,
-                "data_rows": data_rows,
-                "spreadsheet_id": "",
-            }
-            st.toast(f"Target '{target_name.strip()}' set — add primer sets on the next page.")
-            st.rerun()
+            _use_monitor_target(row)
         return
 
     if st.button("Fetch sequences",disabled=not taxid or not target_name, key=f"{prefix}_fetch_btn"):
@@ -4464,15 +4593,23 @@ def _config_evaluate():
             st.rerun()
 
 
+def _row_source_label(row: dict) -> str:
+    """Where a mastersheet row is fetched from, for the target tables."""
+    if str(row.get("source", "")).strip().lower() == "pathoplexus":
+        organism = str(row.get("pathoplexus_organism", "")).strip()
+        return f"Pathoplexus: {pathoplexus.ORGANISM_NAMES.get(organism, organism or '?')}"
+    return f"NCBI TaxID {str(row.get('TaxID', '')).strip() or '?'}"
+
+
 def _page_monitor_target():
-    """Monitor step 1: Select pathogens to monitor via spreadsheet or manual fetch."""
+    """Monitor step 1: set up a target (or load several from a spreadsheet)."""
     _render_workflow_progress("monitor_target")
 
     st.header("Monitor — Select Pathogens")
 
     st.session_state.mode = "Monitor"
 
-    # --- Resume existing run ---
+    # Previous runs, offered in the Resume section below.
     existing_runs = []
     if MONITOR_DIR.exists():
         for d in sorted(MONITOR_DIR.iterdir(), reverse=True):
@@ -4485,128 +4622,147 @@ def _page_monitor_target():
                 if date_dirs:
                     existing_runs.append((d.name, date_dirs))
 
-    if existing_runs:
-        st.subheader("Resume existing run")
-        st.caption("Skip fetching and re-evaluate with sequences from a previous run.")
-        run_options = [r[0] for r in existing_runs]
-        selected_run = st.selectbox(
-            "Run ID", options=run_options, index=None,
-            placeholder="Select a previous run...",
-            key="monitor_resume_run",
+    # --- Set up a target (the main path) ---
+    st.subheader("Set up a target")
+    source = st.radio(
+        "Source",
+        options=["ncbi", "pathoplexus"],
+        format_func={"ncbi": "NCBI Virus", "pathoplexus": "Pathoplexus"}.get,
+        horizontal=True,
+        key="monitor_source",
+    )
+    if source == "pathoplexus":
+        st.caption("Each monitoring run fetches what is new on Pathoplexus for this organism.")
+        _render_pathoplexus_target_ui("monitor_pp")
+    else:
+        st.caption("Each monitoring run fetches what is new on NCBI Virus with these settings.")
+        _render_fetch_ui("monitor_fetch", monitor=True)
+
+    st.divider()
+
+    # --- Several targets: Google Sheets ---
+    with st.expander("Load from Google Sheets"):
+        st.caption("For several targets at once. Start from the [template](https://docs.google.com/spreadsheets/d/1OuH4FDS2ZUJxQDIfG45OO0Gk__iV9yheybjUDSKd2UU/copy).")
+        st.info(
+            '**After copying, set sharing to "Anyone with the link" → Viewer so the app can read it.**'
+        )
+        spreadsheet_url = st.text_input(
+            "Spreadsheet URL",
+            key="monitor_spreadsheet_url",
+            placeholder="https://docs.google.com/spreadsheets/d/...",
         )
 
-        if selected_run:
-            # Find the run and show its details
-            for run_id, date_dirs in existing_runs:
-                if run_id == selected_run:
-                    # Show available dates
-                    date_labels = [dd.name for dd in date_dirs]
-                    st.caption(f"Available dates: {', '.join(date_labels)}")
+        if spreadsheet_url:
+            if st.button("Load spreadsheet", key="monitor_load_sheet"):
+                try:
+                    sid = _extract_spreadsheet_id(spreadsheet_url)
+                    csv_text = _download_spreadsheet_csv(sid)
+                    headers, data_rows = _load_spreadsheet(csv_text)
+                    st.session_state["monitor_spreadsheet_data"] = {
+                        "csv_text": csv_text,
+                        "headers": headers,
+                        "data_rows": data_rows,
+                        "spreadsheet_id": sid,
+                    }
+                    st.success(f"Loaded {len(data_rows)} row(s) from spreadsheet.")
+                except Exception as e:
+                    st.error(f"Failed to load spreadsheet: {e}")
 
-                    # Load mastersheet from latest date dir
-                    latest = date_dirs[0]
-                    mastersheet = latest / "mastersheet.csv"
-                    if mastersheet.exists():
-                        csv_text = mastersheet.read_text()
-                        try:
-                            _, data_rows = _load_spreadsheet(csv_text)
-                            import pandas as pd
-                            seen = {}
-                            for row in data_rows:
-                                t = _make_target_name(row)
-                                if t not in seen:
-                                    seen[t] = {
-                                        "Target": t,
-                                        "TaxID": str(row.get("TaxID", "")).strip(),
-                                        "Host": str(row.get("host", "")).strip(),
-                                        "Geographic location": str(row.get("geographic_location", "")).strip(),
-                                    }
-                            st.dataframe(pd.DataFrame(list(seen.values())),
-                                         use_container_width=True, hide_index=True)
+    if existing_runs:
+        with st.expander("Resume an existing run"):
+            st.caption("Skip fetching and re-evaluate with sequences from a previous run.")
+            run_options = [r[0] for r in existing_runs]
+            selected_run = st.selectbox(
+                "Run ID", options=run_options, index=None,
+                placeholder="Select a previous run...",
+                key="monitor_resume_run",
+            )
 
-                            # Show primer info
-                            primer_rows = []
-                            for row in data_rows:
-                                primer_rows.append({
-                                    "Target": _make_target_name(row),
-                                    "Primer name": row.get("Primer name", ""),
-                                    "Forward": row.get("Forward", "")[:25],
-                                    "Reverse": row.get("Reverse", "")[:25],
-                                    "Probe": "yes" if not _is_empty(row.get("Probe")) else "",
-                                })
-                            with st.expander("Primer sets"):
-                                st.dataframe(pd.DataFrame(primer_rows),
-                                             use_container_width=True, hide_index=True)
-
-                            # Show sequence counts
-                            acc_files = list(latest.glob("*_accessions.txt"))
-                            if acc_files:
-                                counts = []
-                                for af in acc_files:
-                                    target = af.stem.replace("_accessions", "")
-                                    n = len([l for l in af.read_text().strip().split("\n") if l.strip()])
-                                    counts.append(f"{target}: {n} sequences")
-                                st.caption("Sequences: " + ", ".join(counts))
-
-                        except Exception:
-                            st.caption("Could not parse mastersheet.")
-                    break
-
-            if st.button("Continue with skip fetch →", type="primary",
-                         use_container_width=True, key="monitor_resume_cont"):
-                st.session_state["run_id"] = selected_run
-                st.session_state["monitor_skip_fetch"] = True
-                # Load mastersheet data as spreadsheet data
-                latest_dir = None
+            if selected_run:
+                # Find the run and show its details
                 for run_id, date_dirs in existing_runs:
                     if run_id == selected_run:
-                        latest_dir = date_dirs[0]
+                        # Show available dates
+                        date_labels = [dd.name for dd in date_dirs]
+                        st.caption(f"Available dates: {', '.join(date_labels)}")
+
+                        # Load mastersheet from latest date dir
+                        latest = date_dirs[0]
+                        mastersheet = latest / "mastersheet.csv"
+                        if mastersheet.exists():
+                            csv_text = mastersheet.read_text()
+                            try:
+                                _, data_rows = _load_spreadsheet(csv_text)
+                                import pandas as pd
+                                seen = {}
+                                for row in data_rows:
+                                    t = _make_target_name(row)
+                                    if t not in seen:
+                                        seen[t] = {
+                                            "Target": t,
+                                            "Source": _row_source_label(row),
+                                            "Host": str(row.get("host", "")).strip(),
+                                            "Geographic location": str(row.get("geographic_location", "")).strip(),
+                                        }
+                                st.dataframe(pd.DataFrame(list(seen.values())),
+                                             use_container_width=True, hide_index=True)
+
+                                # Show primer info
+                                primer_rows = []
+                                for row in data_rows:
+                                    primer_rows.append({
+                                        "Target": _make_target_name(row),
+                                        "Primer name": row.get("Primer name", ""),
+                                        "Forward": row.get("Forward", "")[:25],
+                                        "Reverse": row.get("Reverse", "")[:25],
+                                        "Probe": "yes" if not _is_empty(row.get("Probe")) else "",
+                                    })
+                                with st.expander("Primer sets"):
+                                    st.dataframe(pd.DataFrame(primer_rows),
+                                                 use_container_width=True, hide_index=True)
+
+                                # Show sequence counts
+                                acc_files = list(latest.glob("*_accessions.txt"))
+                                if acc_files:
+                                    counts = []
+                                    for af in acc_files:
+                                        target = af.stem.replace("_accessions", "")
+                                        n = len([l for l in af.read_text().strip().split("\n") if l.strip()])
+                                        counts.append(f"{target}: {n} sequences")
+                                    st.caption("Sequences: " + ", ".join(counts))
+
+                            except Exception:
+                                st.caption("Could not parse mastersheet.")
                         break
-                if latest_dir:
-                    ms = latest_dir / "mastersheet.csv"
-                    if ms.exists():
-                        csv_text = ms.read_text()
-                        try:
-                            headers, data_rows = _load_spreadsheet(csv_text)
-                            st.session_state["monitor_spreadsheet_data"] = {
-                                "csv_text": csv_text,
-                                "headers": headers,
-                                "data_rows": data_rows,
-                                "spreadsheet_id": selected_run,
-                            }
-                        except Exception:
-                            pass
-                _navigate("monitor_primer")
-                st.rerun()
 
-        st.divider()
+                if st.button("Continue with skip fetch →", type="primary",
+                             use_container_width=True, key="monitor_resume_cont"):
+                    st.session_state["run_id"] = selected_run
+                    st.session_state["monitor_skip_fetch"] = True
+                    # Load mastersheet data as spreadsheet data
+                    latest_dir = None
+                    for run_id, date_dirs in existing_runs:
+                        if run_id == selected_run:
+                            latest_dir = date_dirs[0]
+                            break
+                    if latest_dir:
+                        ms = latest_dir / "mastersheet.csv"
+                        if ms.exists():
+                            csv_text = ms.read_text()
+                            try:
+                                headers, data_rows = _load_spreadsheet(csv_text)
+                                st.session_state["monitor_spreadsheet_data"] = {
+                                    "csv_text": csv_text,
+                                    "headers": headers,
+                                    "data_rows": data_rows,
+                                    "spreadsheet_id": selected_run,
+                                }
+                            except Exception:
+                                pass
+                    _navigate("monitor_primer")
+                    st.rerun()
 
-    # --- Option 1: Load from Google Sheets ---
-    st.subheader("Load from Google Sheets ([template](https://docs.google.com/spreadsheets/d/127GY5lBqUKuri4MgM4XTlKLKto45_Yn9NvYJhF2WIvo/copy))")
-    st.info(
-        '**After copying, set sharing to "Anyone with the link" → Viewer so the app can read it.**'
-    )
-    spreadsheet_url = st.text_input(
-        "Spreadsheet URL",
-        key="monitor_spreadsheet_url",
-        placeholder="https://docs.google.com/spreadsheets/d/...",
-    )
-
-    if spreadsheet_url:
-        if st.button("Load spreadsheet", key="monitor_load_sheet"):
-            try:
-                sid = _extract_spreadsheet_id(spreadsheet_url)
-                csv_text = _download_spreadsheet_csv(sid)
-                headers, data_rows = _load_spreadsheet(csv_text)
-                st.session_state["monitor_spreadsheet_data"] = {
-                    "csv_text": csv_text,
-                    "headers": headers,
-                    "data_rows": data_rows,
-                    "spreadsheet_id": sid,
-                }
-                st.success(f"Loaded {len(data_rows)} row(s) from spreadsheet.")
-            except Exception as e:
-                st.error(f"Failed to load spreadsheet: {e}")
+    st.divider()
 
     # Show loaded data
     sheet_data = st.session_state.get("monitor_spreadsheet_data")
@@ -4623,7 +4779,7 @@ def _page_monitor_target():
             if target_name not in seen_targets:
                 seen_targets[target_name] = {
                     "Target": target_name,
-                    "TaxID": str(row.get("TaxID", "")).strip(),
+                    "Source": _row_source_label(row),
                     "Min release date": str(row.get("min_release_date", "")).strip(),
                     "Max release date": today_str,
                     "Geographic location": str(row.get("geographic_location", "")).strip(),
@@ -4633,17 +4789,6 @@ def _page_monitor_target():
 
         target_names = list(seen_targets.keys())
         st.markdown(f"**Targets to monitor:** {', '.join(target_names)}")
-
-    st.divider()
-
-    # --- Option 2: Manual setup ---
-    st.subheader("Manual setup")
-    st.caption("Set up a single target manually. Each monitoring run fetches its "
-               "sequences from NCBI Virus with these settings.")
-    with st.expander("Configure manual fetch"):
-        _render_fetch_ui("monitor_fetch", monitor=True)
-
-    st.divider()
 
     # --- Continue ---
     has_sheet = bool(st.session_state.get("monitor_spreadsheet_data"))
@@ -4658,7 +4803,7 @@ def _page_monitor_target():
         st.rerun()
 
     if not has_sheet:
-        st.caption("Load a spreadsheet or set up a target manually to continue.")
+        st.caption("Set up a target or load a spreadsheet to continue.")
 
 
 def _page_monitor_primer():
@@ -5002,9 +5147,6 @@ def _run_monitor():
         _update(progress_lines)
 
         for i, (target_name, rows) in enumerate(target_groups.items()):
-            row = {k: v for k, v in rows[0].items()
-                   if k not in {"max_collection_date", "max_release_date"}}
-
             # Target status
             tparts = []
             for j, tn in enumerate(target_names):
@@ -5017,102 +5159,28 @@ def _run_monitor():
             progress_lines[-1] = f"⏳ &nbsp; **Fetching sequences** — {', '.join(tparts)}"
             _update(progress_lines)
 
-            dated_fasta = date_dir / f"{target_name}.fa"
-            dated_meta = date_dir / f"{target_name}_metadata.csv"
-
-            # Find previous accessions for diff
-            prev_acc_files = sorted(
-                [d / f"{target_name}_accessions.txt"
-                 for d in work_dir.iterdir()
-                 if d.is_dir() and d.name != date_str
-                 and (d / f"{target_name}_accessions.txt").exists()],
-                key=lambda p: p.parent.name,
-                reverse=True,
-            )
-            is_first = len(prev_acc_files) == 0
-
-            # Narrow date window for subsequent fetches
-            if not is_first:
-                _narrow_to_new_releases(row, prev_acc_files[0].parent.name)
-
-            # Run gget
-            gget_tmp = date_dir / f".gget_tmp_{target_name}"
-            gget_tmp.mkdir(parents=True, exist_ok=True)
-            cmd = _build_gget_command(row, str(gget_tmp))
-
-            if not cmd:
-                fetch_results[target_name] = {"status": "error"}
-                shutil.rmtree(gget_tmp, ignore_errors=True)
-                continue
-
-            try:
-                subprocess.run(cmd, check=True, capture_output=True)
-            except subprocess.CalledProcessError:
-                fetch_results[target_name] = {"status": "error"}
-                shutil.rmtree(gget_tmp, ignore_errors=True)
-                continue
-
-            # Move FASTA output
-            fasta_files = list(gget_tmp.glob("*.fa")) + list(gget_tmp.glob("*.fasta"))
-            meta_files = list(gget_tmp.glob("*_metadata.csv"))
-
-            if not fasta_files:
-                shutil.rmtree(gget_tmp, ignore_errors=True)
-                # On a repeat run that is just nothing released since the last
-                # fetch; only a first run matching nothing is a real problem.
-                fetch_results[target_name] = (
-                    {"status": "no_output"} if is_first
-                    else _no_new_releases_result(target_name, prev_acc_files[0], date_dir))
-                continue
-
-            shutil.move(str(fasta_files[0]), str(dated_fasta))
-            if meta_files:
-                shutil.move(str(meta_files[0]), str(dated_meta))
-            shutil.rmtree(gget_tmp, ignore_errors=True)
-
-            _deduplicate_fasta(dated_fasta)
-
-            # Diff accessions
-            current_acc = _extract_accessions(dated_fasta)
-            total_count = len(current_acc)
-
-            if not is_first:
-                prev_acc = set(prev_acc_files[0].read_text().strip().split("\n"))
-                new_acc = current_acc - prev_acc
-            else:
-                new_acc = current_acc
-
-            # Write new-only FASTA
-            new_fasta = None
-            if new_acc:
-                new_fasta = date_dir / f"{target_name}_new.fa"
-                _filter_fasta_by_accessions(dated_fasta, new_acc, new_fasta)
-
-            # Save accessions, delete full FASTA
-            acc_file = date_dir / f"{target_name}_accessions.txt"
-            acc_file.write_text("\n".join(sorted(current_acc)) + "\n")
-            dated_fasta.unlink(missing_ok=True)
-
-            fetch_results[target_name] = {
-                "status": "success",
-                "new_fasta_path": new_fasta,
-                "metadata_path": dated_meta if dated_meta.exists() else None,
-                "new_accessions": new_acc,
-                "total_count": total_count,
-                "new_count": len(new_acc),
-                "is_first_fetch": is_first,
-            }
+            # Same fetch as `adapt monitor` and the scheduled job, one target at a
+            # time so the progress line can follow along. A row it cannot fetch
+            # (no TaxID or organism) comes back with no entry.
+            fetch_results.update(_monitor_fetch(rows, work_dir, date_dir, date_str))
+            fetch_results.setdefault(target_name, {"status": "error"})
 
         # Summarize fetch
         total_new = sum(r.get("new_count", 0) for r in fetch_results.values() if r.get("status") == "success")
+        total_revised = sum(r.get("revised_count", 0) for r in fetch_results.values()
+                            if r.get("status") == "success")
         success_targets = [t for t, r in fetch_results.items() if r.get("status") == "success"]
-        progress_lines[-1] = f"✅ &nbsp; Fetch complete — {total_new} new sequence(s) across {len(success_targets)} target(s)"
+        revised_note = f" (+{total_revised} revised)" if total_revised else ""
+        progress_lines[-1] = (f"✅ &nbsp; Fetch complete — {total_new} new sequence(s){revised_note} "
+                              f"across {len(success_targets)} target(s)")
         _update(progress_lines)
 
     # ===================== STEP 2: EVALUATE =====================
+    # Revisions are re-evaluated too: a new version can change the sequence.
     targets_with_new = [
         t for t in target_names
-        if fetch_results.get(t, {}).get("new_count", 0) > 0
+        if fetch_results.get(t, {}).get("new_count", 0)
+        + fetch_results.get(t, {}).get("revised_count", 0) > 0
     ]
 
     all_xlsx: list[Path] = []
@@ -5140,11 +5208,19 @@ def _run_monitor():
             _update(progress_lines)
 
             email_body_parts.append(f"\n== {target_name} ==")
+            revised_acc = result.get("revised_accessions") or set()
+            headline = f"{result['new_count']} new sequence(s) ({result['total_count']} total)"
+            if revised_acc:
+                headline += f", plus {len(revised_acc)} revised"
+            email_body_parts.append(headline + "\n")
             email_body_parts.append(
-                f"{result['new_count']} new sequence(s) ({result['total_count']} total)\n"
-            )
-            seq_table = _get_new_seq_table(result["new_accessions"], result.get("metadata_path"))
-            email_body_parts.append(seq_table)
+                _get_new_seq_table(result["new_accessions"], result.get("metadata_path")))
+            if revised_acc:
+                email_body_parts.append(
+                    "\nRevised (re-deposited under a new version, re-evaluated below):\n"
+                    + _get_new_seq_table(revised_acc, result.get("metadata_path")))
+            email_body_parts.append(_data_use_notice(
+                result["new_accessions"] | revised_acc, result.get("metadata_path")))
 
             target_fasta = result["new_fasta_path"]
             if not target_fasta:
@@ -5305,7 +5381,7 @@ def _run_monitor():
     mins, secs = divmod(elapsed, 60)
     if all_xlsx:
         kind, message = "success", f"Monitor complete — {len(all_xlsx)} report(s) generated."
-    elif total_new == 0:
+    elif not targets_with_new:
         kind, message = "info", "No new sequences found. Nothing to evaluate."
     else:
         kind, message = "warning", "Fetch succeeded but evaluation produced no reports."
