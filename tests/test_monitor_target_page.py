@@ -101,3 +101,25 @@ def test_picker_falls_back_to_typing_when_pathoplexus_is_down(monkeypatch):
     _choose_pathoplexus(at, "marburg")
 
     assert at.text_input(key="monitor_pp_geoLocCountry_text")
+
+
+def test_sheet_of_only_example_rows_explains_itself(monkeypatch):
+    """Loading used to report "Loaded 0 row(s)" and leave Continue enabled."""
+    from streamlit.testing.v1 import AppTest
+    from primercast import adapt_cli
+
+    sheet = adapt_cli._rows_to_sheet_csv(
+        ["Note", "Target name", "TaxID"], [{"Note": "example", "Target name": "t", "TaxID": "1"}])
+    monkeypatch.setattr(adapt_cli, "_download_spreadsheet_csv", lambda sid: sheet)
+    import gui.app
+    monkeypatch.setattr(gui.app, "_download_spreadsheet_csv", lambda sid: sheet)
+
+    at = AppTest.from_function(_target_page, default_timeout=60).run()
+    at.text_input(key="monitor_spreadsheet_url").set_value(
+        "https://docs.google.com/spreadsheets/d/abc123/edit").run()
+    at.button(key="monitor_load_sheet").click().run()
+
+    assert not at.exception
+    assert any("marked 'example' in column A" in w.value for w in at.warning)
+    assert "monitor_spreadsheet_data" not in at.session_state
+    assert at.button(key="monitor_target_cont").disabled

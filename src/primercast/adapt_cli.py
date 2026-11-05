@@ -342,6 +342,27 @@ def _parse_boolean(value) -> str | None:
     return None
 
 
+def _is_example_row(row: list[str]) -> bool:
+    """Whether column A marks a sheet row as a template example, which is skipped."""
+    return bool(row) and row[0].strip().lower() in ("example", "examples", "examples/definition")
+
+
+def _empty_sheet_message(csv_text: str) -> str:
+    """Why a mastersheet gave no rows to monitor, with what to change.
+
+    The usual cause is filling in one of the template's example rows: they are
+    skipped, and the sheet then loads nothing with no hint as to why.
+    """
+    rows = list(csv.reader(io.StringIO(csv_text)))[3:]
+    n_examples = sum(1 for r in rows if _is_example_row(r))
+    if n_examples:
+        return (f"No rows to monitor. All {n_examples} filled-in row(s) are marked "
+                "'example' in column A, and example rows are skipped. Clear that cell "
+                "on the rows you want to monitor (or add them as new rows below).")
+    return ("No rows to monitor. Each row needs a TaxID (NCBI) or a "
+            "pathoplexus_organism (Pathoplexus).")
+
+
 def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
     """Parse the mastersheet CSV and return (headers, data_rows).
 
@@ -381,7 +402,7 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
             continue
 
         # Skip example/template rows
-        if row[0].strip().lower() in ("example", "examples", "examples/definition"):
+        if _is_example_row(row):
             continue
 
         row_dict = {}
@@ -1681,7 +1702,8 @@ def cmd_monitor(args):
             data_rows = [r for r in data_rows if str(r.get("query_id", "")).strip() in query_ids]
 
         if not data_rows:
-            print("No rows to process.")
+            print(_empty_sheet_message(csv_text) if not args.query_ids
+                  else "No rows match the given query IDs.")
             return
 
         # Resolve run ID: explicit > derived from spreadsheet name

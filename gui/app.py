@@ -140,6 +140,7 @@ from primercast.adapt_cli import (
     _extract_spreadsheet_id,
     _download_spreadsheet_csv,
     _load_spreadsheet,
+    _empty_sheet_message,
     _make_target_name,
     _extract_accessions,
     _deduplicate_fasta,
@@ -4658,13 +4659,19 @@ def _page_monitor_target():
                     sid = _extract_spreadsheet_id(spreadsheet_url)
                     csv_text = _download_spreadsheet_csv(sid)
                     headers, data_rows = _load_spreadsheet(csv_text)
-                    st.session_state["monitor_spreadsheet_data"] = {
-                        "csv_text": csv_text,
-                        "headers": headers,
-                        "data_rows": data_rows,
-                        "spreadsheet_id": sid,
-                    }
-                    st.success(f"Loaded {len(data_rows)} row(s) from spreadsheet.")
+                    if not data_rows:
+                        # Not kept: an empty sheet would let Continue through
+                        # with nothing to monitor.
+                        st.session_state.pop("monitor_spreadsheet_data", None)
+                        st.warning(_empty_sheet_message(csv_text))
+                    else:
+                        st.session_state["monitor_spreadsheet_data"] = {
+                            "csv_text": csv_text,
+                            "headers": headers,
+                            "data_rows": data_rows,
+                            "spreadsheet_id": sid,
+                        }
+                        st.success(f"Loaded {len(data_rows)} row(s) from spreadsheet.")
                 except Exception as e:
                     st.error(f"Failed to load spreadsheet: {e}")
 

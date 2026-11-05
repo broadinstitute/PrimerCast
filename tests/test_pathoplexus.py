@@ -500,3 +500,23 @@ def test_header_whitespace_is_stripped():
 def test_ncbi_count_filters_are_rejected_too(col):
     with pytest.raises(pp.PathoplexusError, match=col):
         pp.build_filters({col: "3"}, "ebola-zaire")
+
+
+# --- empty sheet hint ---------------------------------------------------------
+
+def _sheet(*col_a):
+    headers = ["Note", "Target name", "TaxID"]
+    return adapt_cli._rows_to_sheet_csv(
+        headers, [{"Note": a, "Target name": f"t{i}", "TaxID": "1"} for i, a in enumerate(col_a)])
+
+
+def test_filled_in_example_rows_get_a_hint():
+    """A user filled in the template's example row; it loaded nothing."""
+    msg = adapt_cli._empty_sheet_message(_sheet("example", "example"))
+    assert "marked 'example' in column A" in msg
+    assert "2 filled-in row(s)" in msg
+
+
+def test_sheet_with_no_targets_says_what_a_row_needs():
+    csv_text = adapt_cli._rows_to_sheet_csv(["Note", "Target name", "TaxID"], [{"Target name": "t"}])
+    assert "TaxID" in adapt_cli._empty_sheet_message(csv_text)
