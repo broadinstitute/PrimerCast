@@ -1144,6 +1144,21 @@ def _monitor_fetch(
     return results
 
 
+def _forget_unevaluated(date_dir: Path, target_name: str) -> None:
+    """Drop today's accession list for a target whose evaluation failed.
+
+    That list is what the next run diffs against, so keeping it would mark
+    sequences that were never evaluated as already seen -- they would never be
+    evaluated at all. Without it, the next run diffs against the previous list
+    (or none) and picks them up again.
+    """
+    (date_dir / f"{target_name}_accessions.txt").unlink(missing_ok=True)
+
+
+EVALUATE_FAILED_NOTE = ("Evaluate failed, so there is no report for this target. Its new "
+                        "sequences will be evaluated again on the next run.\n")
+
+
 def _build_pset_fa(rows: list[dict], output_path: Path) -> list[str]:
     """Build pset FASTA from spreadsheet rows with Forward/Reverse/Probe.
 
@@ -1744,6 +1759,7 @@ def cmd_monitor(args):
 
     all_xlsx: list[Path] = []
     n_warnings = 0
+    problems: list[str] = []  # targets that failed, for the exit code and summary
 
     for target_name, rows in target_groups.items():
         result = fetch_results.get(target_name, {})
@@ -1756,9 +1772,11 @@ def cmd_monitor(args):
                 "No sequences matched the fetch settings. Check the TaxID and "
                 "filters (dates, host, location, length).\n"
             )
+            problems.append(f"{target_name} (no sequences matched)")
             continue
         if status != "success":
             email_body_parts.append(f"Fetch failed (status: {status})\n")
+            problems.append(f"{target_name} (fetch failed)")
             continue
 
         if result["new_count"] == 0 and result["total_count"] == 0:
@@ -1844,7 +1862,10 @@ def cmd_monitor(args):
                 summary_text = _read_excel_summary(xlsx)
                 email_body_parts.append(summary_text)
         else:
-            email_body_parts.append("Evaluate failed.\n")
+            email_body_parts.append(EVALUATE_FAILED_NOTE)
+            problems.append(f"{target_name} (evaluate failed)")
+            if not args.skip_fetch:  # --skip-fetch reuses an earlier run's history
+                _forget_unevaluated(date_dir, target_name)
         if eval_warnings:
             n_warnings += len(eval_warnings)
             email_body_parts.append("\nWarnings:")
@@ -1875,8 +1896,14 @@ def cmd_monitor(args):
     if n_warnings:
         print(f"\nMonitor finished with {n_warnings} warning(s); review them "
               f"before using the results.")
-    else:
+    elif not problems:
         print("\nMonitor complete.")
+
+    if problems:
+        from primercast.monitor_schedule import PARTIAL_EXIT_CODE
+        # The dispatcher reads this line into the schedule's history.
+        print(f"\nTargets with problems: {', '.join(problems)}")
+        sys.exit(PARTIAL_EXIT_CODE)
 
 
 def cmd_monitor_dispatch(args):

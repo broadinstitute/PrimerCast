@@ -1,7 +1,7 @@
 """Tests for scheduled monitors (primercast.monitor_schedule)."""
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -292,7 +292,7 @@ class TestRunSchedule:
         scratch.mkdir()
         captured = {}
 
-        def fake_run(cmd, capture_output, text):
+        def fake_run(cmd):
             captured["cmd"] = cmd
             # Pretend `adapt monitor` produced today's run directory.
             from datetime import datetime
@@ -300,9 +300,9 @@ class TestRunSchedule:
             out.mkdir(parents=True)
             (out / "SC2_accessions.txt").write_text("A1\nA2\n")
             assert (scratch / s["id"] / "20260101" / "SC2_accessions.txt").exists()
-            return type("P", (), {"returncode": 0, "stdout": "done\n", "stderr": ""})()
+            return 0, "done\n"
 
-        with patch.object(ms.subprocess, "run", fake_run):
+        with patch.object(ms, "_run_streaming", fake_run):
             result = ms.run_schedule(store, s, scratch, cores=2)
 
         assert result.ok
@@ -320,14 +320,81 @@ class TestRunSchedule:
         s = _schedule(store, spreadsheet_url="https://docs.google.com/spreadsheets/d/abc/edit")
         captured = {}
 
-        def fake_run(cmd, capture_output, text):
+        def fake_run(cmd):
             captured["cmd"] = cmd
-            return type("P", (), {"returncode": 1, "stdout": "", "stderr": "err"})()
+            return 1, "err\n"
 
-        with patch.object(ms.subprocess, "run", fake_run):
+        with patch.object(ms, "_run_streaming", fake_run):
             result = ms.run_schedule(store, s, tmp_path, cores=1)
         assert not result.ok
         assert "--url" in captured["cmd"] and "--csv" not in captured["cmd"]
+
+
+    def test_run_past_midnight_still_uploads(self, store, tmp_path):
+        """A Nov 5 run that ended on Nov 6 looked for 20261106, found nothing,
+        and uploaded nothing -- losing the accession history -- yet reported ok."""
+        from datetime import datetime as real_dt
+        s = _schedule(store)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        clock = iter([real_dt(2026, 11, 5, 18, 23), real_dt(2026, 11, 6, 0, 3)])
+
+        class Clock(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return next(clock)
+
+        def fake_run(cmd):
+            out = scratch / s["id"] / "20261105"          # stamped at start
+            out.mkdir(parents=True)
+            (out / "T_accessions.txt").write_text("A1\n")
+            return 0, "done\n"
+
+        with patch.object(ms, "datetime", Clock), patch.object(ms, "_run_streaming", fake_run):
+            assert ms.run_schedule(store, s, scratch, cores=1).ok
+
+        uploaded = store.list(f"runs/{s['id']}/20261105/")
+        assert any(k.endswith("T_accessions.txt") for k in uploaded)
+        assert any(k.endswith("monitor.log") for k in uploaded)
+
+
+    def test_some_targets_failing_is_partial(self, store, tmp_path):
+        s = _schedule(store)
+
+        def fake_run(cmd):
+            return ms.PARTIAL_EXIT_CODE, "...\nTargets with problems: SC2 (evaluate failed)\n"
+
+        with patch.object(ms, "_run_streaming", fake_run):
+            result = ms.run_schedule(store, s, tmp_path, cores=1)
+        assert result.ok and result.partial
+        assert result.detail == "SC2 (evaluate failed)"
+
+
+class TestPartialRecord:
+    def test_partial_is_recorded_and_not_retried(self, store):
+        """Retrying would re-send the email and, for a failed evaluation, burn the
+        same hours again; the next scheduled run picks those sequences up."""
+        s = _schedule(store)
+        day = date(2026, 2, 5)
+        result = ms.DispatchResult(s["id"], True, "SC2 (evaluate failed)", partial=True)
+        ms._record(store, s["id"], day, result)
+
+        saved = ms.load_schedule(store, s["id"])
+        assert saved["last_status"] == "partial"
+        assert saved["history"][-1] == {"date": "2026-02-05", "status": "partial",
+                                        "detail": "SC2 (evaluate failed)"}
+        assert saved["last_run"] == "2026-02-05"
+        assert not ms.is_due(saved, day + timedelta(days=1))
+
+
+def test_run_streaming_echoes_and_returns_everything(capsys):
+    """Output is echoed as it arrives, stderr merged, and also returned for the log."""
+    import sys
+    code, log = ms._run_streaming([sys.executable, "-c",
+        "import sys; print('one'); print('two', file=sys.stderr); print('three'); sys.exit(3)"])
+    assert code == 3
+    assert log.splitlines() == ["one", "two", "three"]
+    assert capsys.readouterr().out.splitlines() == ["one", "two", "three"]
 
 
 def test_get_store_selects_backend(tmp_path, monkeypatch):

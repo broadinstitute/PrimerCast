@@ -85,13 +85,8 @@ def run(args):
     start_time = time.time()
     nlines = 0
 
-    # Load reference sequences and build GC prefix sums
-    tarseqs = {s.id: str(s.seq) for s in SeqIO.parse(args.reference, "fasta")}
-    gc_prefix = {}
-    for sid, seq in tarseqs.items():
-        arr = np.frombuffer(seq.upper().encode(), dtype='uint8')
-        gc = (arr == ord('G')) | (arr == ord('C'))
-        gc_prefix[sid] = np.concatenate([[0], np.cumsum(gc)])
+    # Reference sequences, uppercased once for the amplicon GC counts below.
+    tarseqs = {s.id: str(s.seq).upper() for s in SeqIO.parse(args.reference, "fasta")}
 
     # Primer feature table
     feats = pd.read_csv(args.pri_features, index_col=0)
@@ -302,11 +297,14 @@ def run(args):
                 starts_by_r[r_id].append(st_f)
                 amplens_by_r[r_id].add(al)
 
-                pfx = gc_prefix.get(t_f)
-                if pfx is not None:
-                    amp_start = st_f - 1
-                    amp_end = min(int(v_starts[j]) + int(v_lens[j]), len(pfx) - 1)
-                    gc_count = int(pfx[amp_end] - pfx[amp_start])
+                seq = tarseqs.get(t_f)
+                if seq is not None:
+                    # Counted on the amplicon itself. Per-target GC prefix sums
+                    # cost 8 bytes per base of every target -- 5.8 GB for 24k
+                    # SARS-CoV-2 genomes, which got this step killed on an 8 GiB
+                    # monitor job.
+                    amp = seq[st_f - 1:int(v_starts[j]) + int(v_lens[j])]
+                    gc_count = amp.count('G') + amp.count('C')
                     tms_by_r[r_id].append(_gc_tm(gc_count, al))
 
         if not targets_by_r:

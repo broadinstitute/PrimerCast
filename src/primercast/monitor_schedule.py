@@ -52,6 +52,11 @@ MAX_INTERVAL_DAYS = 365
 MAX_HISTORY = 24
 # Daily attempts per scheduled date before a failing run waits for the next date.
 MAX_ATTEMPTS = 3
+# `adapt monitor` exit code for "finished, but some targets failed" (a fetch
+# error, a failed evaluation). Recorded as "partial" and not retried: the run's
+# email went out, and a target whose evaluation failed keeps its sequences
+# unseen, so the next scheduled run evaluates them anyway.
+PARTIAL_EXIT_CODE = 4
 DEFAULT_MAX_ACTIVE = int(os.environ.get("PRIMERCAST_MONITOR_MAX_SCHEDULES", "100"))
 DEFAULT_PURGE_AFTER_DAYS = 90
 MAX_RECIPIENTS = 10
@@ -391,6 +396,7 @@ class DispatchResult:
     schedule_id: str
     ok: bool
     detail: str = ""
+    partial: bool = False  # ran, but some targets failed (see PARTIAL_EXIT_CODE)
 
 
 def _adapt_command() -> list[str]:
@@ -427,20 +433,46 @@ def run_schedule(store, schedule: dict, scratch: Path, cores: int) -> DispatchRe
     if schedule.get("query_ids"):
         cmd += ["--query-ids", *schedule["query_ids"]]
 
+    # The date `adapt monitor` stamps its run directory with, taken as it starts.
+    # Reading it afterwards broke runs that went past midnight: they looked for
+    # the next day's directory, uploaded nothing -- not even the accession lists
+    # the next run diffs against -- and still reported success.
+    started = datetime.now().strftime("%Y%m%d")
     print(f"[{sid}] {' '.join(cmd[:2])} ...", flush=True)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    log = proc.stdout + ("\n--- stderr ---\n" + proc.stderr if proc.stderr else "")
-    print(log, flush=True)
+    returncode, log = _run_streaming(cmd)
 
-    # Same date stamp `adapt monitor` gives its run directory.
-    date_dir = work_dir / datetime.now().strftime("%Y%m%d")
+    date_dir = work_dir / started
     if date_dir.is_dir():
         (date_dir / "monitor.log").write_text(log)
         upload_run_dir(store, sid, date_dir)
+    else:
+        print(f"[{sid}] no run directory {date_dir.name} to upload", flush=True)
 
-    if proc.returncode != 0:
-        return DispatchResult(sid, False, f"adapt monitor exited with {proc.returncode}")
+    if returncode == PARTIAL_EXIT_CODE:
+        problems = [ln for ln in log.splitlines() if ln.startswith("Targets with problems:")]
+        detail = problems[-1].split(":", 1)[1].strip() if problems else "some targets failed"
+        return DispatchResult(sid, True, detail, partial=True)
+    if returncode != 0:
+        return DispatchResult(sid, False, f"adapt monitor exited with {returncode}")
     return DispatchResult(sid, True)
+
+
+def _run_streaming(cmd: list[str]) -> tuple[int, str]:
+    """Run ``cmd``, echoing its output line by line; returns (exit code, output).
+
+    Echoed as it goes rather than all at the end: a run can take hours, and one
+    multi-megabyte burst at exit lost most of its lines in Cloud Logging. stderr
+    is merged in so the log reads in the order things happened.
+    """
+    # Unbuffered, or the child's piped output still arrives in large chunks.
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    lines = []
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, bufsize=1, env=env) as proc:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            lines.append(line)
+    return proc.returncode, "".join(lines)
 
 
 def _record(store, schedule_id: str, day: date, result: DispatchResult) -> None:
@@ -448,7 +480,7 @@ def _record(store, schedule_id: str, day: date, result: DispatchResult) -> None:
     schedule = load_schedule(store, schedule_id)
     if schedule is None:
         return
-    status = "ok" if result.ok else "failed"
+    status = "partial" if result.partial else "ok" if result.ok else "failed"
     schedule["last_status"] = status
     schedule["history"] = (schedule.get("history", []) + [
         {"date": day.isoformat(), "status": status, "detail": result.detail}
@@ -511,8 +543,8 @@ def dispatch(
                 result = runner(store, schedule, Path(scratch), cores)
             except Exception as e:  # one bad schedule must not block the rest
                 result = DispatchResult(schedule["id"], False, f"{type(e).__name__}: {e}")
-        print(f"[{result.schedule_id}] {'ok' if result.ok else 'FAILED'} {result.detail}",
-              flush=True)
+        label = "PARTIAL" if result.partial else "ok" if result.ok else "FAILED"
+        print(f"[{result.schedule_id}] {label} {result.detail}", flush=True)
         _record(store, schedule["id"], day, result)
         results.append(result)
 

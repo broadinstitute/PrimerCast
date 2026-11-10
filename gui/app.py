@@ -145,6 +145,8 @@ from primercast.adapt_cli import (
     _extract_accessions,
     _deduplicate_fasta,
     _monitor_fetch,
+    _forget_unevaluated,
+    EVALUATE_FAILED_NOTE,
     _data_use_notice,
     _build_pset_fa,
     _send_email,
@@ -5304,7 +5306,9 @@ def _run_monitor():
             )
 
             if proc.returncode != 0:
-                email_body_parts.append("Evaluate failed.\n")
+                email_body_parts.append(EVALUATE_FAILED_NOTE)
+                if not skip_fetch:  # skip-fetch reuses an earlier run's history
+                    _forget_unevaluated(date_dir, target_name)
                 continue
 
             eval_warnings = [w.message for w in run_warnings(eval_dir)]
