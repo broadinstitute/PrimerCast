@@ -142,3 +142,6 @@ schematic.png
 
 # Vendored / external source
 src/gget-virfetch-main/
+
+# Local scheduled-monitor store (gui/app.py, adapt monitor-dispatch)
+monitor_schedules/

@@ -1,8 +1,9 @@
-"""adapt - User-facing CLI for running the ADAPT PCR primer design pipeline."""
+"""adapt - User-facing CLI for running the PrimerCast PCR primer design pipeline."""
 
 import argparse
 import csv
 import io
+import json
 import os
 import re
 import shutil
@@ -13,15 +14,18 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 from email.message import EmailMessage
+from importlib.resources import files
 from pathlib import Path
 
-from primercast.utils.diagnostics import explain_run, run_warnings
+from primercast.external import pathoplexus
+from primercast.external.gget_virus import GGET_VIRUS
+from primercast.utils.cpu import available_cores
+from primercast.utils.diagnostics import explain_run, run_funnels, run_warnings
 from primercast.utils.params import parse_params, parse_list_param
 
 
-# Resolve template path relative to package location
-# Package is at src/primercast/, template is at workflows/
-TEMPLATE_PATH = Path(__file__).resolve().parent.parent.parent / "workflows" / "Snakefile.template"
+# Bundled as package data so it is found however the package is installed.
+TEMPLATE_PATH = files("primercast.data").joinpath("Snakefile.template")
 
 
 def _setup_run_dir(run_id: str, params_file: Path, targets: list[str]) -> Path:
@@ -117,7 +121,10 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
 
     Returns the process exit code.
     """
-    cmd = ["snakemake", "-s", "Snakefile", "--cores", str(cores)]
+    # gpu=1 serializes the evaluate rules on a GPU box; where there is no GPU
+    # the Snakefile prices them at 0 so they overlap freely (see GPU_COST).
+    cmd = ["snakemake", "-s", "Snakefile", "--cores", str(cores),
+           "--resources", "gpu=1"]
 
     if config_args:
         cmd += ["--config"] + config_args
@@ -134,9 +141,11 @@ def _run_snakemake(run_dir: Path, config_args: list[str], cores: int, dry_run: b
         n_warnings = _print_run_warnings(run_dir, since=started_at)
         if result.returncode != 0:
             _print_failure_explanation(run_dir)
-        elif n_warnings:
-            print(f"\nPipeline finished with {n_warnings} warning(s); review them "
-                  f"before using the results.", file=sys.stderr)
+        else:
+            _print_funnel_summary(run_dir, since=started_at)
+            if n_warnings:
+                print(f"\nPipeline finished with {n_warnings} warning(s); review them "
+                      f"before using the results.", file=sys.stderr)
     return result.returncode
 
 
@@ -148,6 +157,15 @@ def _print_run_warnings(run_dir: Path, since: float | None = None) -> int:
         for w in warnings:
             print(f"  - {w.message}", file=sys.stderr)
     return len(warnings)
+
+
+def _print_funnel_summary(run_dir: Path, since: float | None = None) -> None:
+    """Name the filters that removed the most candidates in a finished run."""
+    summaries = [f.summary for f in run_funnels(run_dir, since=since) if f.summary]
+    if summaries:
+        print("\nWhere filters narrowed the candidates:", file=sys.stderr)
+        for summary in summaries:
+            print(f"  - {summary}", file=sys.stderr)
 
 
 def _print_failure_explanation(run_dir: Path) -> None:
@@ -264,7 +282,8 @@ _TRUE_FALSE_FLAGS = {
 # Columns that are metadata only (not passed to gget)
 _METADATA_COLUMNS = {"Pathogen", "Pathogen_abb", "Gene Segment", "Target name",
                       "Primer name", "query_id", "expected_count", "latest_count",
-                      "diff", "Forward", "Reverse", "Probe", "subtype_filter"}
+                      "diff", "Forward", "Reverse", "Probe", "subtype_filter",
+                      "source", "pathoplexus_organism"}
 
 # Max-date columns to strip when monitoring (monitor always fetches up to the latest)
 _MAX_DATE_COLUMNS = {"max_collection_date", "max_release_date"}
@@ -323,6 +342,27 @@ def _parse_boolean(value) -> str | None:
     return None
 
 
+def _is_example_row(row: list[str]) -> bool:
+    """Whether column A marks a sheet row as a template example, which is skipped."""
+    return bool(row) and row[0].strip().lower() in ("example", "examples", "examples/definition")
+
+
+def _empty_sheet_message(csv_text: str) -> str:
+    """Why a mastersheet gave no rows to monitor, with what to change.
+
+    The usual cause is filling in one of the template's example rows: they are
+    skipped, and the sheet then loads nothing with no hint as to why.
+    """
+    rows = list(csv.reader(io.StringIO(csv_text)))[3:]
+    n_examples = sum(1 for r in rows if _is_example_row(r))
+    if n_examples:
+        return (f"No rows to monitor. All {n_examples} filled-in row(s) are marked "
+                "'example' in column A, and example rows are skipped. Clear that cell "
+                "on the rows you want to monitor (or add them as new rows below).")
+    return ("No rows to monitor. Each row needs a TaxID (NCBI) or a "
+            "pathoplexus_organism (Pathoplexus).")
+
+
 def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
     """Parse the mastersheet CSV and return (headers, data_rows).
 
@@ -339,7 +379,9 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
         print("Error: spreadsheet must have at least 4 rows.", file=sys.stderr)
         sys.exit(1)
 
-    headers = rows[1]
+    # Stripped: the published template shipped " subtype_filter" with a leading
+    # space, which then matched no known column and reached gget as a bad flag.
+    headers = [h.strip() for h in rows[1]]
 
     # Find TaxID column — gget arguments start here
     try:
@@ -360,7 +402,7 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
             continue
 
         # Skip example/template rows
-        if row[0].strip().lower() in ("example", "examples", "examples/definition"):
+        if _is_example_row(row):
             continue
 
         row_dict = {}
@@ -378,7 +420,8 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
             else:
                 row_dict[col] = ""
 
-        if _is_empty(row_dict.get("TaxID")):
+        # A row needs something to fetch: an NCBI TaxID or a Pathoplexus organism.
+        if _is_empty(row_dict.get("TaxID")) and _is_empty(row_dict.get("pathoplexus_organism")):
             continue
 
         data_rows.append(row_dict)
@@ -387,12 +430,12 @@ def _load_spreadsheet(csv_text: str) -> tuple[list[str], list[dict]]:
 
 
 def _build_gget_command(row: dict, output_dir: str) -> list[str] | None:
-    """Build a gget virus command from a spreadsheet row."""
+    """Build a gget virus command (via our wrapper) from a spreadsheet row."""
     taxid = row.get("TaxID")
     if _is_empty(taxid):
         return None
 
-    cmd = ["gget", "virus", str(taxid).strip(), "--out", output_dir]
+    cmd = [*GGET_VIRUS, str(taxid).strip(), "--out", output_dir]
 
     for col, value in row.items():
         if col in _METADATA_COLUMNS or col == "TaxID":
@@ -789,6 +832,140 @@ def _deduplicate_fasta(fasta_path) -> int:
 
 
 
+# Fetch overlap for repeat monitor runs, to avoid missing late-indexed sequences.
+_MONITOR_OVERLAP_DAYS = 7
+
+
+def _narrow_to_new_releases(row: dict, prev_date_str: str) -> str | None:
+    """Limit a repeat monitor fetch to what NCBI released since the last one.
+
+    Moves ``min_release_date`` up to the previous fetch date (``YYYYMMDD``) minus
+    an overlap, unless the row already asks for a later date, and returns the
+    value used (None if ``prev_date_str`` is not a date). Only the release date:
+    sequences are deposited months or years after collection, so also moving
+    ``min_collection_date`` filtered out nearly every new sequence. The user's
+    own collection-date bounds are left as they are.
+    """
+    try:
+        prev_date = datetime.strptime(prev_date_str, "%Y%m%d")
+    except ValueError:
+        return None
+    cutoff = (prev_date - timedelta(days=_MONITOR_OVERLAP_DAYS)).strftime("%Y-%m-%d")
+    orig = str(row.get("min_release_date", "")).strip()
+    # Use whichever is later: spreadsheet value or cutoff
+    if not orig or orig < cutoff:
+        row["min_release_date"] = cutoff
+    return row["min_release_date"]
+
+
+def _no_new_releases_result(target_name: str, prev_acc_file: Path, date_dir: Path) -> dict:
+    """Fetch result for a repeat run where nothing passed gget's filters.
+
+    That is a quiet day -- NCBI released nothing in the window -- not a failure.
+    The previous accession list is carried forward into ``date_dir`` so the next
+    run narrows from today and still recognises sequences already reported.
+    """
+    (date_dir / f"{target_name}_accessions.txt").write_text(prev_acc_file.read_text())
+    return {
+        "target_name": target_name,
+        "status": "success",
+        "fasta_path": None,
+        "new_fasta_path": None,
+        "metadata_path": None,
+        "new_accessions": set(),
+        "revised_accessions": set(),
+        "total_count": 0,
+        "new_count": 0,
+        "revised_count": 0,
+        "is_first_fetch": False,
+    }
+
+
+def _fetch_source(row: dict) -> str:
+    """Which database a target row is fetched from. Defaults to NCBI."""
+    source = str(row.get("source", "")).strip().lower() or "ncbi"
+    if source not in ("ncbi", "pathoplexus"):
+        raise ValueError(f"unknown source {source!r} (expected 'ncbi' or 'pathoplexus')")
+    return source
+
+
+def _pathoplexus_fetch(
+    row: dict, target_name: str, date_dir: Path, prev_acc: set[str], is_first: bool
+) -> dict:
+    """Fetch one target from Pathoplexus, in the shape ``_monitor_fetch`` returns.
+
+    Pathoplexus does its own diffing -- it pulls the matching accessions first
+    and downloads only the unseen ones -- so unlike the gget path there is never
+    a full FASTA to filter down.
+    """
+    organism = str(row.get("pathoplexus_organism", "")).strip()
+    if not organism:
+        print("  Skipping (no pathoplexus_organism)")
+        return {"target_name": target_name, "status": "error"}
+
+    # Spreadsheets use "Gene Segment"; the GUI's manual setup writes "segment".
+    segment = str(row.get("Gene Segment") or row.get("segment") or "").strip()
+    if segment.lower() in ("", "non-segmented", "main"):
+        segment = None
+
+    filters = {k: v for k, v in row.items() if k not in _METADATA_COLUMNS and k != "TaxID"}
+    try:
+        result = pathoplexus.fetch(
+            organism, filters, date_dir / ".pathoplexus_tmp",
+            known_accessions=prev_acc, segment=segment)
+    except pathoplexus.PathoplexusError as e:
+        print(f"  Error: {e}")
+        return {"target_name": target_name, "status": "error"}
+
+    current = result["all_accessions"]
+    new_acc, revised_acc = result["new_accessions"], result["revised_accessions"]
+    print(f"  {len(current)} sequence(s) match on Pathoplexus ({organism}"
+          f"{'/' + segment if segment else ''})")
+
+    if not current:
+        shutil.rmtree(date_dir / ".pathoplexus_tmp", ignore_errors=True)
+        if is_first:
+            print("  Warning: no sequences matched the fetch settings")
+            return {"target_name": target_name, "status": "no_output"}
+
+    # Keep the accession history even when nothing is new, so the next run still
+    # recognises everything already reported.
+    acc_file = date_dir / f"{target_name}_accessions.txt"
+    acc_file.write_text("\n".join(sorted(current)) + "\n" if current else "")
+
+    new_fasta = dated_meta = None
+    if result["fasta_path"]:
+        new_fasta = date_dir / f"{target_name}_new.fa"
+        shutil.move(str(result["fasta_path"]), str(new_fasta))
+        n_deduped = _deduplicate_fasta(new_fasta)
+        if n_deduped:
+            print(f"  Removed {n_deduped} duplicate sequence(s)")
+    if result["metadata_path"]:
+        dated_meta = date_dir / f"{target_name}_metadata.csv"
+        shutil.move(str(result["metadata_path"]), str(dated_meta))
+    shutil.rmtree(date_dir / ".pathoplexus_tmp", ignore_errors=True)
+
+    if is_first:
+        print(f"  First fetch — all {len(new_acc)} sequences are new")
+    else:
+        print(f"  New sequences: {len(new_acc)}, revised: {len(revised_acc)}")
+
+    return {
+        "target_name": target_name,
+        "status": "success",
+        "source": "pathoplexus",
+        "fasta_path": new_fasta,
+        "new_fasta_path": new_fasta,
+        "metadata_path": dated_meta,
+        "new_accessions": new_acc,
+        "revised_accessions": revised_acc,
+        "total_count": len(current),
+        "new_count": len(new_acc),
+        "revised_count": len(revised_acc),
+        "is_first_fetch": is_first,
+    }
+
+
 def _monitor_fetch(
     data_rows: list[dict],
     work_dir: Path,
@@ -814,8 +991,6 @@ def _monitor_fetch(
 
     results = {}
 
-    _OVERLAP_DAYS = 7  # Fetch overlap to avoid missing late-indexed sequences
-
     for target_name, rows in target_groups.items():
         # Use the first row to build gget command (same TaxID for same pathogen)
         # Strip max-date columns so monitor always fetches up to the latest
@@ -838,23 +1013,34 @@ def _monitor_fetch(
         )
 
         is_first = len(prev_acc_files) == 0
+        prev_acc = (set() if is_first
+                    else set(prev_acc_files[0].read_text().split()))
 
-        # For subsequent fetches, override min_release_date and
-        # min_collection_date to (prev_fetch_date - overlap) so we only
-        # download recent sequences instead of the entire history.
+        try:
+            source = _fetch_source(row)
+        except ValueError as e:
+            print(f"  Error: {e}")
+            results[target_name] = {"target_name": target_name, "status": "error"}
+            continue
+
+        if source == "pathoplexus":
+            if dry_run:
+                print(f"  Would fetch from Pathoplexus: "
+                      f"{row.get('pathoplexus_organism', '(no organism)')}")
+                results[target_name] = {"target_name": target_name, "status": "dry-run"}
+                continue
+            results[target_name] = _pathoplexus_fetch(
+                row, target_name, date_dir, prev_acc, is_first)
+            continue
+
+        # For subsequent fetches, only download what NCBI has published since
+        # the last one, instead of the entire history.
         if not is_first:
             prev_date_str = prev_acc_files[0].parent.name  # directory name is YYYYMMDD
-            try:
-                prev_date = datetime.strptime(prev_date_str, "%Y%m%d")
-                cutoff = (prev_date - timedelta(days=_OVERLAP_DAYS)).strftime("%Y-%m-%d")
-                for date_col in ("min_release_date", "min_collection_date"):
-                    orig = str(row.get(date_col, "")).strip()
-                    # Use whichever is later: spreadsheet value or cutoff
-                    if not orig or orig < cutoff:
-                        row[date_col] = cutoff
-                print(f"  Narrowing fetch window: min dates → {cutoff} (prev fetch: {prev_date_str})")
-            except ValueError:
-                pass  # Could not parse date from directory name; use original dates
+            cutoff = _narrow_to_new_releases(row, prev_date_str)
+            if cutoff:
+                print(f"  Narrowing fetch window: min_release_date → {cutoff} "
+                      f"(prev fetch: {prev_date_str})")
 
         if dry_run:
             cmd = _build_gget_command(row, str(date_dir / ".gget_tmp"))
@@ -888,9 +1074,17 @@ def _monitor_fetch(
         meta_files = list(gget_tmp.glob("*_metadata.csv"))
 
         if not fasta_files:
-            print(f"  Warning: no FASTA output")
-            results[target_name] = {"target_name": target_name, "status": "no_output"}
             shutil.rmtree(gget_tmp, ignore_errors=True)
+            if is_first:
+                # Nothing to compare against yet, so this is the user's query
+                # matching no sequences at all -- worth flagging.
+                print(f"  Warning: no sequences matched the fetch settings")
+                results[target_name] = {"target_name": target_name, "status": "no_output"}
+                continue
+            print(f"  No sequences released since the last fetch "
+                  f"({prev_acc_files[0].parent.name})")
+            results[target_name] = _no_new_releases_result(
+                target_name, prev_acc_files[0], date_dir)
             continue
 
         shutil.move(str(fasta_files[0]), str(dated_fasta))
@@ -908,20 +1102,22 @@ def _monitor_fetch(
         total_count = len(current_acc)
         print(f"  Fetched {total_count} unique sequences → {dated_fasta.name}")
 
+        # A re-deposited sequence comes back under a bumped version, so split
+        # those out rather than announcing them as discoveries.
+        new_acc, revised_acc = pathoplexus.classify(current_acc, prev_acc)
         if not is_first:
-            prev_acc = set(prev_acc_files[0].read_text().strip().split("\n"))
-            new_acc = current_acc - prev_acc
             print(f"  Previous: {prev_acc_files[0].parent.name} ({len(prev_acc)} accessions)")
-            print(f"  New sequences: {len(new_acc)}")
+            print(f"  New sequences: {len(new_acc)}, revised: {len(revised_acc)}")
         else:
-            new_acc = current_acc
             print(f"  First fetch — all {total_count} sequences are new")
 
-        # Write new-only FASTA
+        # Write new-only FASTA. Revisions go in too: a revision can change the
+        # sequence, so it has to be re-evaluated like anything else.
         new_fasta = None
-        if new_acc:
+        if new_acc or revised_acc:
             new_fasta = date_dir / f"{target_name}_new.fa"
-            n_written = _filter_fasta_by_accessions(dated_fasta, new_acc, new_fasta)
+            n_written = _filter_fasta_by_accessions(
+                dated_fasta, new_acc | revised_acc, new_fasta)
             print(f"  New sequences FASTA: {new_fasta.name} ({n_written} seqs)")
 
         # Save accession list for future comparison, then delete full FASTA
@@ -933,16 +1129,34 @@ def _monitor_fetch(
         results[target_name] = {
             "target_name": target_name,
             "status": "success",
+            "source": "ncbi",
             "fasta_path": new_fasta,
             "new_fasta_path": new_fasta,
             "metadata_path": dated_meta if dated_meta.exists() else None,
             "new_accessions": new_acc,
+            "revised_accessions": revised_acc,
             "total_count": total_count,
             "new_count": len(new_acc),
+            "revised_count": len(revised_acc),
             "is_first_fetch": is_first,
         }
 
     return results
+
+
+def _forget_unevaluated(date_dir: Path, target_name: str) -> None:
+    """Drop today's accession list for a target whose evaluation failed.
+
+    That list is what the next run diffs against, so keeping it would mark
+    sequences that were never evaluated as already seen -- they would never be
+    evaluated at all. Without it, the next run diffs against the previous list
+    (or none) and picks them up again.
+    """
+    (date_dir / f"{target_name}_accessions.txt").unlink(missing_ok=True)
+
+
+EVALUATE_FAILED_NOTE = ("Evaluate failed, so there is no report for this target. Its new "
+                        "sequences will be evaluated again on the next run.\n")
 
 
 def _build_pset_fa(rows: list[dict], output_path: Path) -> list[str]:
@@ -974,6 +1188,100 @@ def _build_pset_fa(rows: list[dict], output_path: Path) -> list[str]:
     return pair_ids
 
 
+# Columns of a mastersheet built in the GUI (manual setup). Metadata columns
+# must precede TaxID: everything from TaxID onwards becomes a gget argument.
+MANUAL_SHEET_HEADERS = [
+    "Target name", "Primer name", "Forward", "Reverse", "Probe", "subtype_filter",
+    "source", "pathoplexus_organism",
+    "TaxID", "host", "nuc_completeness", "geographic_location",
+    "min_collection_date", "max_collection_date", "min_release_date",
+    "min_seq_length", "max_seq_length", "max_ambiguous_chars", "segment", "refseq_only",
+]
+
+
+def _rows_to_sheet_csv(headers: list[str], rows: list[dict]) -> str:
+    """Write rows as mastersheet CSV text that ``_load_spreadsheet`` reads back.
+
+    Layout: category row, header row, description row, then one row per dict.
+    """
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow([""] * len(headers))
+    writer.writerow(headers)
+    writer.writerow(["examples/definition:"] + [""] * (len(headers) - 1))
+    for row in rows:
+        writer.writerow(["" if _is_empty(row.get(h)) else str(row.get(h)).strip()
+                         for h in headers])
+    return out.getvalue()
+
+
+def _parse_pset_fasta(text: str) -> list[dict]:
+    """Primer sets from a FASTA named ``<set>_for/_rev/_pro`` (or ``_f/_r/_p``).
+
+    Returns ``[{"name", "Forward", "Reverse", "Probe"}]`` for sets with both primers.
+    """
+    roles = {"f": "Forward", "for": "Forward", "r": "Reverse", "rev": "Reverse",
+             "p": "Probe", "pro": "Probe"}
+    sets: dict[str, dict] = {}
+    name = role = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(">"):
+            header = line[1:].split()[0] if line[1:].split() else ""
+            base, _, suffix = header.rpartition("_")
+            role = roles.get(suffix.lower()) if base else None
+            name = base if role else None
+            if name:
+                sets.setdefault(name, {"name": name, "Forward": "", "Reverse": "", "Probe": ""})
+                sets[name][role] = ""
+        elif name and line:
+            sets[name][role] += line.upper()
+    return [s for s in sets.values() if s["Forward"] and s["Reverse"]]
+
+
+def _add_primers_to_rows(rows: list[dict], primers: list[dict]) -> list[dict]:
+    """Attach extra primer sets to every target in ``rows``.
+
+    Each primer set becomes a new row copying its target's fetch settings.
+    Targets that gain primers drop their primer-less placeholder rows, and a
+    primer name already present for a target is not added twice.
+    """
+    if not primers:
+        return list(rows)
+    targets: dict[str, list[dict]] = {}
+    for row in rows:
+        targets.setdefault(_make_target_name(row), []).append(row)
+
+    out = []
+    for target_rows in targets.values():
+        kept = [r for r in target_rows
+                if not _is_empty(r.get("Forward")) and not _is_empty(r.get("Reverse"))]
+        names = {str(r.get("Primer name", "")).strip() for r in kept}
+        template = target_rows[0]
+        for p in primers:
+            if p["name"] in names:
+                continue
+            names.add(p["name"])
+            kept.append(dict(template, **{
+                "Primer name": p["name"], "Forward": p["Forward"],
+                "Reverse": p["Reverse"], "Probe": p.get("Probe", ""),
+            }))
+        out.extend(kept)
+    return out
+
+
+def _sheet_with_primers(csv_text: str, primers: list[dict]) -> str:
+    """Return mastersheet CSV text with ``primers`` added to every target."""
+    if not primers:
+        return csv_text
+    headers, rows = _load_spreadsheet(csv_text)
+    headers = list(headers)
+    for col in ("Primer name", "Forward", "Reverse", "Probe"):
+        if col not in headers:
+            headers.insert(headers.index("TaxID"), col)
+    return _rows_to_sheet_csv(headers, _add_primers_to_rows(rows, primers))
+
+
 def _get_new_seq_table(
     new_accessions: set[str], metadata_path: Path | None
 ) -> str:
@@ -993,23 +1301,66 @@ def _get_new_seq_table(
     if meta.empty:
         return f"{len(new_accessions)} new sequences (not found in metadata).\n"
 
-    # Select display columns
-    cols = ["accession", "Length", "Geographic Region", "Release date"]
+    # Select display columns. The last three only exist for Pathoplexus, where
+    # the restricted-data terms require the accession to be shown with a direct
+    # link to its source page and the terms kept alongside it.
+    cols = ["accession", "Length", "Geographic Region", "Release date",
+            "dataUseTerms", "dataUseTermsRestrictedUntil", "Pathoplexus URL"]
     available = [c for c in cols if c in meta.columns]
     display = meta[available].fillna("—")
 
-    lines = [f"{len(new_accessions)} new sequence(s):\n"]
+    # Width from content, so URLs are not truncated into dead links.
+    widths = {c: max(len(c), *(len(str(v)) for v in display[c])) for c in available}
 
-    # Header
-    header = "  ".join(f"{c:<20}" for c in available)
+    lines = [f"{len(new_accessions)} new sequence(s):\n"]
+    header = "  ".join(f"{c:<{widths[c]}}" for c in available)
     lines.append(header)
     lines.append("-" * len(header))
 
     for _, row in display.iterrows():
-        line = "  ".join(f"{str(row[c]):<20}" for c in available)
-        lines.append(line)
+        lines.append("  ".join(f"{str(row[c]):<{widths[c]}}" for c in available))
 
     return "\n".join(lines) + "\n"
+
+
+def _data_use_notice(accessions: set[str], metadata_path: Path | None) -> str:
+    """Terms notice for any restricted records in this batch.
+
+    Pathoplexus restricted data may be used by anyone who accepts its terms, but
+    passing it on means stating those terms wherever the data is shown. Returns
+    an empty string when nothing in the batch is restricted.
+    """
+    if not accessions or not metadata_path or not metadata_path.exists():
+        return ""
+
+    import pandas as pd
+    meta = pd.read_csv(metadata_path)
+    if "dataUseTerms" not in meta.columns:
+        return ""
+
+    restricted = meta[meta["accession"].isin(accessions)
+                      & (meta["dataUseTerms"] == "RESTRICTED")]
+    if restricted.empty:
+        return ""
+
+    urls = sorted(set(restricted["dataUseTermsUrl"].dropna()))
+    until = sorted(set(restricted["dataUseTermsRestrictedUntil"].dropna()))
+    notice = [
+        f"\nNOTE: {len(restricted)} of these sequences are Pathoplexus "
+        "Restricted-Use Data.",
+        "Using them means accepting the Data Use Terms: acknowledge the "
+        "submitters by",
+        "accession (or a SeqSet), link back to Pathoplexus, and keep the terms "
+        "with the data",
+        "if you pass it on.",
+    ]
+    if until:
+        # Each record has its own expiry; a batch can span dozens, so give the
+        # span rather than listing them.
+        span = until[0] if len(until) == 1 else f"between {until[0]} and {until[-1]}"
+        notice.append(f"Becomes Open Data {'on ' + span if len(until) == 1 else span}.")
+    notice.extend(f"Terms: {u}" for u in urls)
+    return "\n".join(notice) + "\n"
 
 
 def _read_excel_summary(xlsx_path: Path) -> str:
@@ -1086,7 +1437,7 @@ def _monitor_evaluate(
     started_at = time.time()
     rc = subprocess.run(
         ["snakemake", "-s", "Snakefile", "--cores", str(cores),
-         "--config"] + config_args,
+         "--resources", "gpu=1", "--config"] + config_args,
         cwd=str(eval_dir),
     ).returncode
 
@@ -1112,6 +1463,38 @@ def _monitor_evaluate(
         return None, warnings
 
 
+def _email_config(params: dict) -> tuple[str, str]:
+    """(sender, password) for report emails.
+
+    params.txt values win; otherwise ``PRIMERCAST_EMAIL_SENDER`` /
+    ``PRIMERCAST_EMAIL_PASSWORD`` (on Cloud Run, the password comes from Secret
+    Manager — see terraform/monitor.tf).
+    """
+    sender = str(params.get("EMAIL_SENDER", "")).strip() \
+        or os.environ.get("PRIMERCAST_EMAIL_SENDER", "").strip()
+    password = str(params.get("EMAIL_PASSWORD", "")).strip() \
+        or os.environ.get("PRIMERCAST_EMAIL_PASSWORD", "").strip()
+    return sender, password
+
+
+def _smtp_config(params: dict) -> tuple[str, int, str]:
+    """(host, port, login) of the SMTP server for report emails.
+
+    params.txt ``SMTP_HOST`` / ``SMTP_PORT`` / ``SMTP_USER`` win; otherwise
+    ``PRIMERCAST_SMTP_HOST`` / ``PRIMERCAST_SMTP_PORT`` / ``PRIMERCAST_SMTP_USER``.
+    Defaults to Gmail. An empty login means "log in as the sender" (Gmail);
+    relays have their own SMTP login (SendGrid, smtp.sendgrid.net:587: ``apikey``,
+    with the API key as the password).
+    """
+    def get(key: str) -> str:
+        return str(params.get(key, "")).strip() \
+            or os.environ.get(f"PRIMERCAST_{key}", "").strip()
+
+    host = get("SMTP_HOST") or "smtp.gmail.com"
+    port = int(get("SMTP_PORT") or 465)
+    return host, port, get("SMTP_USER")
+
+
 def _send_email(
     sender: str,
     password: str,
@@ -1119,12 +1502,25 @@ def _send_email(
     subject: str,
     body: str,
     attachments: list[Path] | None = None,
+    smtp: tuple[str, int, str] | None = None,
 ) -> bool:
-    """Send email via Gmail SMTP with optional attachments."""
+    """Send email over SMTP with optional attachments.
+
+    ``smtp`` is ``(host, port, login)`` (see ``_smtp_config``; defaults to the
+    environment). Port 465 uses implicit TLS, any other port STARTTLS.
+    """
+    host, port, login = smtp or _smtp_config({})
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
+    if host.lower().endswith("sendgrid.net"):
+        # SendGrid rewrites links for click tracking, which would route the
+        # private manage links through its redirect server.
+        msg["X-SMTPAPI"] = json.dumps({"filters": {
+            "clicktrack": {"settings": {"enable": 0}},
+            "opentrack": {"settings": {"enable": 0}},
+        }})
     msg.set_content(body)
 
     if attachments:
@@ -1139,8 +1535,14 @@ def _send_email(
             )
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender, password)
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=60)
+        else:
+            server = smtplib.SMTP(host, port, timeout=60)
+        with server:
+            if port != 465:
+                server.starttls()
+            server.login(login or sender, password)
             server.send_message(msg)
         print(f"Email sent to {', '.join(recipients)}")
         return True
@@ -1176,25 +1578,7 @@ def _install_cron(work_dir: Path, params_file: Path, schedule_email: str,
     schedule, description = _CRON_SCHEDULES.get(frequency, _CRON_SCHEDULES["monthly"])
     cron_line = f"{schedule} {cmd}  # adapt-monitor"
 
-    # Read existing crontab
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True
-        )
-        existing = result.stdout if result.returncode == 0 else ""
-    except FileNotFoundError:
-        existing = ""
-
-    # Remove any existing adapt-monitor line
-    lines = [l for l in existing.strip().split("\n") if "adapt-monitor" not in l]
-    lines.append(cron_line)
-
-    # Install new crontab
-    new_cron = "\n".join(lines) + "\n"
-    proc = subprocess.run(
-        ["crontab", "-"], input=new_cron, text=True
-    )
-    if proc.returncode == 0:
+    if _set_cron_line("adapt-monitor", cron_line):
         print(f"Cron job installed ({description} at midnight)")
         print(f"  {cron_line}")
     else:
@@ -1202,25 +1586,42 @@ def _install_cron(work_dir: Path, params_file: Path, schedule_email: str,
         sys.exit(1)
 
 
+def _set_cron_line(tag: str, line: str | None) -> bool:
+    """Replace the crontab line containing ``# <tag>`` with ``line`` (None removes it).
+
+    Returns False if crontab is unavailable or the update failed.
+    """
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        existing = result.stdout if result.returncode == 0 else ""
+        lines = [l for l in existing.strip().split("\n") if l and f"# {tag}" not in l]
+        if line:
+            lines.append(line)
+        new_cron = "\n".join(lines) + "\n" if lines else ""
+        return subprocess.run(["crontab", "-"], input=new_cron, text=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def _uninstall_cron():
     """Remove the adapt monitor cron job."""
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print("No crontab found.")
-            return
-        existing = result.stdout
-    except FileNotFoundError:
+    if _set_cron_line("adapt-monitor", None):
+        print("Cron job removed.")
+    else:
         print("crontab not available.")
-        return
 
-    lines = [l for l in existing.strip().split("\n") if "adapt-monitor" not in l]
-    new_cron = "\n".join(lines) + "\n" if lines else ""
 
-    subprocess.run(["crontab", "-"], input=new_cron, text=True)
-    print("Cron job removed.")
+def _install_dispatch_cron(store_dir: Path) -> bool:
+    """Install a daily cron line running ``adapt monitor-dispatch`` (local GUI schedules).
+
+    On Cloud Run, Cloud Scheduler triggers the dispatcher job instead.
+    """
+    adapt_path = shutil.which("adapt")
+    if not adapt_path:
+        return False
+    line = (f"0 0 * * * {adapt_path} monitor-dispatch --store-dir {store_dir.resolve()}"
+            f" >> {store_dir.resolve() / 'dispatch.log'} 2>&1  # primercast-monitor-dispatch")
+    return _set_cron_line("primercast-monitor-dispatch", line)
 
 
 def cmd_monitor(args):
@@ -1249,14 +1650,9 @@ def cmd_monitor(args):
     cores = args.cores
 
     # Email config
-    email_sender = str(params.get("EMAIL_SENDER", "")).strip()
-    email_password = str(params.get("EMAIL_PASSWORD", "")).strip()
-    email_recipients = [
-        e.strip() for e in str(params.get("EMAIL_RECIPIENTS", "")).split(",")
-        if e.strip()
-    ]
-    if args.email:
-        email_recipients = [args.email]
+    email_sender, email_password = _email_config(params)
+    recipients = args.email or str(params.get("EMAIL_RECIPIENTS", ""))
+    email_recipients = [e.strip() for e in recipients.split(",") if e.strip()]
 
     if args.skip_fetch:
         # --skip-fetch: reuse existing date directory, skip spreadsheet/fetch entirely
@@ -1297,15 +1693,22 @@ def cmd_monitor(args):
 
         target_groups = {t: [] for t in fetch_results}
     else:
-        # Normal flow: download spreadsheet and fetch
-        spreadsheet_url = args.url or str(params.get("SPREADSHEET_URL", "")).strip()
-        if not spreadsheet_url:
-            print("Error: no spreadsheet URL.", file=sys.stderr)
-            sys.exit(1)
+        # Normal flow: download spreadsheet (or read --csv) and fetch
+        if args.csv:
+            if not args.runid:
+                print("Error: --runid is required with --csv.", file=sys.stderr)
+                sys.exit(1)
+            spreadsheet_id = ""
+            csv_text = Path(args.csv).read_text(encoding="utf-8")
+        else:
+            spreadsheet_url = args.url or str(params.get("SPREADSHEET_URL", "")).strip()
+            if not spreadsheet_url:
+                print("Error: no spreadsheet URL.", file=sys.stderr)
+                sys.exit(1)
 
-        spreadsheet_id = _extract_spreadsheet_id(spreadsheet_url)
-        print(f"Downloading spreadsheet...")
-        csv_text = _download_spreadsheet_csv(spreadsheet_id)
+            spreadsheet_id = _extract_spreadsheet_id(spreadsheet_url)
+            print(f"Downloading spreadsheet...")
+            csv_text = _download_spreadsheet_csv(spreadsheet_id)
         _, data_rows = _load_spreadsheet(csv_text)
 
         # Filter by query IDs if specified
@@ -1314,7 +1717,8 @@ def cmd_monitor(args):
             data_rows = [r for r in data_rows if str(r.get("query_id", "")).strip() in query_ids]
 
         if not data_rows:
-            print("No rows to process.")
+            print(_empty_sheet_message(csv_text) if not args.query_ids
+                  else "No rows match the given query IDs.")
             return
 
         # Resolve run ID: explicit > derived from spreadsheet name
@@ -1351,10 +1755,11 @@ def cmd_monitor(args):
 
     # Step 2: Build pset.fa and evaluate for each target with new sequences
     email_body_parts = []
-    email_body_parts.append(f"ADAPT Monitor Report — {date_str}\n{'='*50}\n")
+    email_body_parts.append(f"PrimerCast Monitor Report — {date_str}\n{'='*50}\n")
 
     all_xlsx: list[Path] = []
     n_warnings = 0
+    problems: list[str] = []  # targets that failed, for the exit code and summary
 
     for target_name, rows in target_groups.items():
         result = fetch_results.get(target_name, {})
@@ -1362,24 +1767,48 @@ def cmd_monitor(args):
 
         email_body_parts.append(f"\n== {target_name} ==")
 
+        if status == "no_output":
+            email_body_parts.append(
+                "No sequences matched the fetch settings. Check the TaxID and "
+                "filters (dates, host, location, length).\n"
+            )
+            problems.append(f"{target_name} (no sequences matched)")
+            continue
         if status != "success":
             email_body_parts.append(f"Fetch failed (status: {status})\n")
+            problems.append(f"{target_name} (fetch failed)")
+            continue
+
+        if result["new_count"] == 0 and result["total_count"] == 0:
+            # Repeat run where NCBI released nothing in the fetch window.
+            email_body_parts.append("No new sequences since the last check.\n")
             continue
 
         new_count = result["new_count"]
         total_count = result["total_count"]
         new_acc = result["new_accessions"]
+        revised_acc = result.get("revised_accessions") or set()
         metadata_path = result.get("metadata_path")
 
-        email_body_parts.append(
-            f"{new_count} new sequence(s) detected ({total_count} total)\n"
-        )
+        headline = f"{new_count} new sequence(s) detected ({total_count} total)"
+        if revised_acc:
+            headline += f", plus {len(revised_acc)} revised"
+        email_body_parts.append(headline + "\n")
 
-        # New sequence table
-        seq_table = _get_new_seq_table(new_acc, metadata_path)
-        email_body_parts.append(seq_table)
+        email_body_parts.append(_get_new_seq_table(new_acc, metadata_path))
 
-        if new_count == 0:
+        # Revisions are kept apart from discoveries. Pathoplexus re-ingests its
+        # whole archive from time to time, which bumps hundreds of versions at
+        # once; folded into the headline that is indistinguishable from an
+        # outbreak. They are still re-evaluated below.
+        if revised_acc:
+            email_body_parts.append(
+                "\nRevised (re-deposited under a new version, re-evaluated below):\n"
+                + _get_new_seq_table(revised_acc, metadata_path))
+
+        email_body_parts.append(_data_use_notice(new_acc | revised_acc, metadata_path))
+
+        if new_count == 0 and not revised_acc:
             continue
 
         # Determine target FASTA for evaluate
@@ -1433,17 +1862,22 @@ def cmd_monitor(args):
                 summary_text = _read_excel_summary(xlsx)
                 email_body_parts.append(summary_text)
         else:
-            email_body_parts.append("Evaluate failed.\n")
+            email_body_parts.append(EVALUATE_FAILED_NOTE)
+            problems.append(f"{target_name} (evaluate failed)")
+            if not args.skip_fetch:  # --skip-fetch reuses an earlier run's history
+                _forget_unevaluated(date_dir, target_name)
         if eval_warnings:
             n_warnings += len(eval_warnings)
             email_body_parts.append("\nWarnings:")
             email_body_parts.extend(f"  - {m}" for m in eval_warnings)
 
     # Step 3: Send email
+    if args.manage_url:
+        email_body_parts.append(f"\n{'-'*50}\nManage or stop this monitor: {args.manage_url}")
     email_body = "\n".join(email_body_parts)
 
     if email_sender and email_password and email_recipients:
-        subject = f"[ADAPT Monitor] {date_str} — {len(target_groups)} target(s)"
+        subject = f"[PrimerCast Monitor] {date_str} — {len(target_groups)} target(s)"
         _send_email(
             sender=email_sender,
             password=email_password,
@@ -1451,24 +1885,50 @@ def cmd_monitor(args):
             subject=subject,
             body=email_body,
             attachments=all_xlsx if all_xlsx else None,
+            smtp=_smtp_config(params),
         )
     else:
         if not email_sender:
             print("\nEmail not configured (set EMAIL_SENDER, EMAIL_PASSWORD, "
-                  "EMAIL_RECIPIENTS in params.txt)")
+                  "EMAIL_RECIPIENTS in params.txt, or PRIMERCAST_EMAIL_SENDER / "
+                  "PRIMERCAST_EMAIL_PASSWORD)")
 
     if n_warnings:
         print(f"\nMonitor finished with {n_warnings} warning(s); review them "
               f"before using the results.")
-    else:
+    elif not problems:
         print("\nMonitor complete.")
+
+    if problems:
+        from primercast.monitor_schedule import PARTIAL_EXIT_CODE
+        # The dispatcher reads this line into the schedule's history.
+        print(f"\nTargets with problems: {', '.join(problems)}")
+        sys.exit(PARTIAL_EXIT_CODE)
+
+
+def cmd_monitor_dispatch(args):
+    """Run every due monitor schedule from the schedule store (see monitor_schedule)."""
+    from primercast import monitor_schedule
+
+    store = monitor_schedule.get_store(Path(args.store_dir))
+    results = monitor_schedule.dispatch(
+        store,
+        cores=args.cores,
+        purge_after_days=args.purge_after_days,
+        dry_run=args.dry_run,
+        schedule_id=args.schedule_id,
+    )
+    failed = [r for r in results if not r.ok]
+    print(f"\nDispatch finished: {len(results) - len(failed)} ok, {len(failed)} failed.")
+    if failed:
+        sys.exit(1)
 
 
 def main():
     """Main entry point for the adapt CLI."""
     parser = argparse.ArgumentParser(
         prog="adapt",
-        description="ADAPT PCR primer design pipeline",
+        description="PrimerCast PCR primer design pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1510,6 +1970,9 @@ Examples:
 
   # Remove cron job
   adapt monitor --unschedule
+
+  # Run all due scheduled monitors (Cloud Run Job / daily cron)
+  adapt monitor-dispatch
 """,
     )
     parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
@@ -1530,7 +1993,7 @@ Examples:
     p_design.add_argument("--probe", action="store_true", help="Enable probe design")
     p_design.add_argument("--multiplex", action="store_true", help="Enable multiplex mode")
     p_design.add_argument("--runid", help="Run ID for output directory (default: timestamp)")
-    p_design.add_argument("--cores", type=int, default=os.cpu_count() or 1, help="Number of cores (default: all)")
+    p_design.add_argument("--cores", type=int, default=available_cores(), help="Number of cores (default: all)")
     p_design.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
     p_design.set_defaults(func=cmd_design)
 
@@ -1542,7 +2005,7 @@ Examples:
     )
     p_eval.add_argument("--params", default="params.txt", help="Parameters file (default: params.txt)")
     p_eval.add_argument("--runid", help="Run ID for output directory (default: timestamp)")
-    p_eval.add_argument("--cores", type=int, default=os.cpu_count() or 1, help="Number of cores (default: all)")
+    p_eval.add_argument("--cores", type=int, default=available_cores(), help="Number of cores (default: all)")
     p_eval.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
 
     # Primer input: either --pset or --for/--rev/--pro
@@ -1590,8 +2053,13 @@ Examples:
     p_monitor.add_argument("--workdir", default="monitor",
                            help="Working directory for monitor data (default: monitor/)")
     p_monitor.add_argument("--runid", help="Run ID to group results (default: derived from spreadsheet name)")
-    p_monitor.add_argument("--email", help="Recipient email (overrides EMAIL_RECIPIENTS in params.txt)")
-    p_monitor.add_argument("--cores", type=int, default=os.cpu_count() or 1,
+    p_monitor.add_argument("--csv", help="Local spreadsheet CSV to use instead of downloading "
+                                         "(requires --runid)")
+    p_monitor.add_argument("--email", help="Recipient email(s), comma-separated "
+                                           "(overrides EMAIL_RECIPIENTS in params.txt)")
+    p_monitor.add_argument("--manage-url", dest="manage_url",
+                           help="Link appended to the report email for managing the schedule")
+    p_monitor.add_argument("--cores", type=int, default=available_cores(),
                            help="Number of cores (default: all)")
     p_monitor.add_argument("--skip-fetch", action="store_true",
                            help="Skip fetch step and use existing files in date directory")
@@ -1601,6 +2069,28 @@ Examples:
     p_monitor.add_argument("--unschedule", action="store_true",
                            help="Remove monthly cron job")
     p_monitor.set_defaults(func=cmd_monitor)
+
+    # --- monitor-dispatch subcommand ---
+    p_dispatch = subparsers.add_parser(
+        "monitor-dispatch",
+        help="Run all due scheduled monitors",
+        description="Run every due monitor schedule from the schedule store: the GCS "
+                    "bucket in PRIMERCAST_MONITOR_BUCKET, or --store-dir locally. "
+                    "Run daily (Cloud Scheduler on Cloud Run, cron locally).",
+    )
+    p_dispatch.add_argument("--store-dir", default="monitor_schedules",
+                            help="Local schedule store when PRIMERCAST_MONITOR_BUCKET is "
+                                 "unset (default: monitor_schedules/)")
+    p_dispatch.add_argument("--cores", type=int, default=available_cores(),
+                            help="Number of cores (default: all)")
+    p_dispatch.add_argument("--purge-after-days", type=int, default=90,
+                            help="Delete data of schedules stopped this many days ago "
+                                 "(default: 90)")
+    p_dispatch.add_argument("--dry-run", action="store_true", help="List due schedules only")
+    p_dispatch.add_argument("--schedule-id", default=None,
+                            help="Run only this schedule, now, even if not due (a new "
+                                 "schedule's first run); skips the purge")
+    p_dispatch.set_defaults(func=cmd_monitor_dispatch)
 
     args = parser.parse_args()
 

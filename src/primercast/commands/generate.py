@@ -130,7 +130,8 @@ def generate_primers_multi(
                 if dG >= min_dg:
                     tm, gc = tm_gc_passed[pseq]
                     features[pseq]["Tm"] = round(tm, 1)
-                    features[pseq]["GC"] = round(gc, 2)
+                    # Keep model input precision consistent with prepare-features.
+                    features[pseq]["GC"] = gc
                     features[pseq]["len"] = len(pseq)
                     features[pseq]["dG"] = round(dG, 1)
                     features[pseq]["rep_count"] = counts.get(pseq, 1)
@@ -143,7 +144,8 @@ def generate_primers_multi(
     if diag is not None:
         def _record(name, counts, params, hint=""):
             diag.record(name, min(counts), params,
-                        breakdown={"forward": counts[0], "reverse": counts[1]}, hint=hint)
+                        breakdown={"forward": counts[0], "reverse": counts[1]}, hint=hint,
+                        unit="primers")
 
         _record(
             "Tiling (primer windows without N)", [len(forps), len(revps)],
@@ -187,7 +189,8 @@ def run(args):
 
     diag = StageDiagnostics("generate", target=args.name)
     if not target_seqs:
-        diag.record("Target sequences", 0, hint=f"{args.target_seqs} contains no sequences.")
+        diag.record("Target sequences", 0, hint=f"{args.target_seqs} contains no sequences.",
+                    unit="sequences")
     else:
         for_filt, rev_filt, features = generate_primers_multi(
             target_seqs, step, min_pri_len, max_pri_len, min_amp_len, max_amp_len,

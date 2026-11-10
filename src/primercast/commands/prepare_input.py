@@ -48,6 +48,12 @@ amplicons and computes amplicon-level features.
         "--fail-if-empty", action="store_true",
         help="Exit with an explanation if no primer pairs form (used for on-target references)",
     )
+    parser.add_argument(
+        "--exact", action="store_true",
+        help="Keep only perfect alignments (no mismatches, no indels). Standard design "
+             "passes this for its on-target reference, where every primer was tiled from "
+             "that sequence and so has exactly one true binding site.",
+    )
     parser.set_defaults(func=run)
 
 
@@ -73,18 +79,14 @@ def run(args):
     diag = StageDiagnostics(
         "prepare_input", target=ref_name, unit="primer pairs",
         fatal=bool(getattr(args, "fail_if_empty", False)),
+        offtarget=args.reftype == "off",
     )
     print(f"Preparing ML input from {args.mapped}...")
     start_time = time.time()
     nlines = 0
 
-    # Load reference sequences and build GC prefix sums
-    tarseqs = {s.id: str(s.seq) for s in SeqIO.parse(args.reference, "fasta")}
-    gc_prefix = {}
-    for sid, seq in tarseqs.items():
-        arr = np.frombuffer(seq.upper().encode(), dtype='uint8')
-        gc = (arr == ord('G')) | (arr == ord('C'))
-        gc_prefix[sid] = np.concatenate([[0], np.cumsum(gc)])
+    # Reference sequences, uppercased once for the amplicon GC counts below.
+    tarseqs = {s.id: str(s.seq).upper() for s in SeqIO.parse(args.reference, "fasta")}
 
     # Primer feature table
     feats = pd.read_csv(args.pri_features, index_col=0)
@@ -116,6 +118,7 @@ def run(args):
         diag.record(
             f"Primer alignments to {ref_name}", 0,
             hint="No primer aligned to this reference (bowtie2 found no hits).",
+            unit="primers",
         )
         diag.finish(args.ml_input)
         sys.exit()
@@ -136,6 +139,41 @@ def run(args):
     maptbl['mm'] = maptbl['pseq'].str.len() - maptbl['match'].str.count(r'\|') - maptbl['indel']
     maptbl = maptbl.join(feats[['forrev', 'len', 'Tm', 'GC']], on='pname')
 
+    def _n_primers(df, forrev=None):
+        if forrev is not None:
+            df = df[df['forrev'] == forrev]
+        return df['pname'].nunique()
+
+    n_aligned = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
+    diag.record(
+        f"Primer alignments to {ref_name}", min(n_aligned),
+        breakdown={"forward": n_aligned[0], "reverse": n_aligned[1]},
+        hint="Pairs need at least one forward and one reverse primer that align.",
+        unit="primers",
+    )
+
+    # getattr, like fail_if_empty above: quick-design calls run() in-process with
+    # a Namespace it builds by hand, so only the required arguments are
+    # guaranteed to be there. A bare args.exact crashed every multi-sequence
+    # target. False is also the right value for those callers -- quick design
+    # tiles from one representative and aligns against every variant, where a
+    # mismatched alignment is real coverage, not a chance match.
+    if getattr(args, "exact", False):
+        # Standard design tiles its primers out of this one sequence, so each has
+        # exactly one true binding site and every imperfect alignment is a chance
+        # match elsewhere on the genome. Drop them before pairing, not after: the
+        # loop below crosses every forward alignment with every reverse one, so
+        # the spare hits would multiply.
+        maptbl = maptbl[(maptbl['mm'] == 0) & (maptbl['indel'] == 0)]
+        n_exact = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
+        diag.record(
+            "Exact binding sites", min(n_exact),
+            breakdown={"forward": n_exact[0], "reverse": n_exact[1]},
+            hint="Primers are tiled from the target, so only a perfect alignment is a real "
+                 "binding site.",
+            unit="primers",
+        )
+
     drop_cols = ['orientation', 'forrev']
 
     if args.reftype == 'on':
@@ -149,23 +187,13 @@ def run(args):
         minl, maxl = min_off_len, max_off_len
         lfunc = min
 
-    def _n_primers(df, forrev=None):
-        if forrev is not None:
-            df = df[df['forrev'] == forrev]
-        return df['pname'].nunique()
-
-    n_aligned = (_n_primers(maptbl, 'f'), _n_primers(maptbl, 'r'))
-    diag.record(
-        f"Primer alignments to {ref_name}", min(n_aligned),
-        breakdown={"forward": n_aligned[0], "reverse": n_aligned[1]},
-        hint="Pairs need at least one forward and one reverse primer that align.",
-    )
     n_oriented = (_n_primers(fors), _n_primers(revs))
     if args.reftype == 'on':
         diag.record(
             "Binding orientation", min(n_oriented),
             breakdown={"forward": n_oriented[0], "reverse": n_oriented[1]},
             hint="Forward primers must bind the + strand and reverse primers the - strand.",
+            unit="primers",
         )
 
     revs['pseq'] = revs['pseq'].apply(reverse_complement_dna)
@@ -269,11 +297,14 @@ def run(args):
                 starts_by_r[r_id].append(st_f)
                 amplens_by_r[r_id].add(al)
 
-                pfx = gc_prefix.get(t_f)
-                if pfx is not None:
-                    amp_start = st_f - 1
-                    amp_end = min(int(v_starts[j]) + int(v_lens[j]), len(pfx) - 1)
-                    gc_count = int(pfx[amp_end] - pfx[amp_start])
+                seq = tarseqs.get(t_f)
+                if seq is not None:
+                    # Counted on the amplicon itself. Per-target GC prefix sums
+                    # cost 8 bytes per base of every target -- 5.8 GB for 24k
+                    # SARS-CoV-2 genomes, which got this step killed on an 8 GiB
+                    # monitor job.
+                    amp = seq[st_f - 1:int(v_starts[j]) + int(v_lens[j])]
+                    gc_count = amp.count('G') + amp.count('C')
                     tms_by_r[r_id].append(_gc_tm(gc_count, al))
 
         if not targets_by_r:

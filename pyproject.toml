@@ -33,7 +33,7 @@ adapt = "primercast.adapt_cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-primercast = ["data/*.pth", "data/*.joblib"]
+primercast = ["data/*.pth", "data/*.joblib", "data/Snakefile.template"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

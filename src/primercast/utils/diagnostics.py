@@ -9,6 +9,8 @@ later step crash on an empty file) with a message naming the filter that
 removed the last candidate and the params that control it.
 
 The GUI and CLI find these files under the run directory with ``explain_run``.
+``run_funnels`` reads every funnel of a run, including successful ones, so the
+GUI and CLI can show where filters narrowed the candidates.
 Evaluate mode never stops on these: ``run_warnings`` instead reports on-target
 evaluations with zero predicted coverage, and rescue re-evaluations (whose
 summary is written to ``<eval>.rescue.json``), as warnings.
@@ -19,6 +21,7 @@ This module depends only on the standard library.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +31,8 @@ SUFFIX = ".diagnostics.json"
 RESCUE_SUFFIX = ".rescue.json"
 # Exit code used when a step stops because a filter removed every candidate.
 NO_CANDIDATES_EXIT_CODE = 3
+# Quick design's per-batch prepare-input funnels; quick design sums them into its own.
+_BATCH_FILE = re.compile(r"batch_\d+\.input" + re.escape(SUFFIX) + "$")
 
 # Human-readable step names, in pipeline order (used to report the earliest
 # failing step first).
@@ -53,13 +58,15 @@ class StageDiagnostics:
 
     ``fatal`` marks steps whose output must be non-empty for the run to
     continue (e.g. on-target pairing). Off-target steps set it to False: no
-    off-target amplicons is the desired outcome, not a failure.
+    off-target amplicons is the desired outcome, not a failure. They also set
+    ``offtarget``, which keeps them out of ``run_funnels``.
     """
 
     stage: str
     target: str = ""
     fatal: bool = True
     unit: str = "candidates"
+    offtarget: bool = False
     steps: list[dict[str, Any]] = field(default_factory=list)
     # Extra step-specific data saved alongside the funnel (e.g. per-pair coverage).
     details: dict[str, Any] = field(default_factory=dict)
@@ -71,11 +78,18 @@ class StageDiagnostics:
         params: dict[str, Any] | None = None,
         breakdown: dict[str, int] | None = None,
         hint: str = "",
+        unit: str = "",
+        summarize: bool = True,
     ) -> int:
         """Record how many candidates remain after ``filter_name``.
 
         ``breakdown`` splits the count (e.g. forward vs reverse primers);
         ``remaining`` should then be the bottleneck (a pair needs both).
+        ``unit`` marks a step that counts something other than the stage's
+        unit (e.g. primers in a primer-pair funnel); counts are only compared
+        between steps of the same unit. ``summarize=False`` leaves a step out of
+        loss summaries: a deliberate top-N cut, or a repeat of an earlier
+        step's result.
         Returns ``remaining`` so calls can be used inline.
         """
         entry: dict[str, Any] = {"filter": filter_name, "remaining": int(remaining)}
@@ -85,6 +99,10 @@ class StageDiagnostics:
             entry["breakdown"] = {k: int(v) for k, v in breakdown.items()}
         if hint:
             entry["hint"] = hint
+        if unit:
+            entry["unit"] = unit
+        if not summarize:
+            entry["summarize"] = False
         self.steps.append(entry)
         return int(remaining)
 
@@ -109,6 +127,8 @@ class StageDiagnostics:
             "empty": self.empty,
             "steps": self.steps,
         }
+        if self.offtarget:
+            data["offtarget"] = True
         if self.details:
             data["details"] = self.details
         return data
@@ -289,6 +309,107 @@ def run_warnings(run_dir: str | Path, since: float | None = None) -> list[RunWar
                 found.append(RunWarning(kind=kind, target=data.get("target", ""),
                                         message=message, steps=data.get("steps") or [],
                                         path=path))
+    return found
+
+
+def step_baselines(steps: list[dict[str, Any]]) -> list[int | None]:
+    """For each step, the count of the previous step in the same unit.
+
+    None when there is no earlier step in that unit, or when the count went up:
+    a filter only removes candidates, so a larger count is a different set
+    (e.g. quick design's probe steps count only the pairs that have a probe).
+    """
+    last: dict[str, int] = {}
+    baselines: list[int | None] = []
+    for step in steps:
+        unit = step.get("unit", "")
+        remaining = step.get("remaining", 0)
+        before = last.get(unit)
+        baselines.append(before if before is not None and remaining <= before else None)
+        last[unit] = remaining
+    return baselines
+
+
+def funnel_losses(steps: list[dict[str, Any]]) -> list[tuple[dict[str, Any], int]]:
+    """``(step, count before it)`` for filter steps that removed candidates.
+
+    Ordered by the fraction removed, largest first. Steps recorded with
+    ``summarize=False`` are left out.
+    """
+    losses = [
+        (step, before)
+        for step, before in zip(steps, step_baselines(steps))
+        if before and step.get("summarize", True) and step.get("remaining", 0) < before
+    ]
+    losses.sort(key=lambda sb: (sb[0]["remaining"] / sb[1], -(sb[1] - sb[0]["remaining"])))
+    return losses
+
+
+def format_losses(data: dict[str, Any], max_items: int = 3) -> str:
+    """One line naming the filters that removed the most candidates ("" if none)."""
+    losses = funnel_losses(data.get("steps") or [])[:max_items]
+    if not losses:
+        return ""
+    label = data.get("stage_label") or STAGE_LABELS.get(data.get("stage", ""), "")
+    target = data.get("target")
+    where = f"{label} ({target})" if target else label
+    parts = [
+        f"{step['filter']} {before:,} -> {step['remaining']:,} "
+        f"(-{(before - step['remaining']) / before:.0%})"
+        for step, before in losses
+    ]
+    return f"{where}: " + "; ".join(parts)
+
+
+@dataclass
+class Funnel:
+    """One step's funnel from a run directory, for display after any run."""
+
+    stage: str
+    stage_label: str
+    target: str
+    unit: str
+    steps: list[dict[str, Any]]
+    summary: str  # biggest losses, "" if no filter removed anything
+    path: Path
+
+
+def run_funnels(run_dir: str | Path, since: float | None = None) -> list[Funnel]:
+    """Every on-target funnel in a run, earliest step first.
+
+    Unlike ``explain_run`` this includes steps that kept candidates, so a
+    successful run can still show which filters narrowed the results.
+    Off-target funnels and quick design's per-batch funnels are skipped.
+    ``since`` and error handling work as in ``explain_run``.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return []
+    order = list(STAGE_LABELS)
+    found: list[Funnel] = []
+    for path in sorted(run_dir.rglob(f"*{SUFFIX}")):
+        if _BATCH_FILE.search(path.name):
+            continue
+        try:
+            if since is not None and path.stat().st_mtime < since:
+                continue
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("offtarget") or not data.get("steps"):
+            continue
+        stage = data.get("stage", "")
+        found.append(Funnel(
+            stage=stage,
+            stage_label=data.get("stage_label") or STAGE_LABELS.get(stage, stage),
+            target=data.get("target", ""),
+            unit=data.get("unit") or "candidates",
+            steps=data["steps"],
+            summary=format_losses(data),
+            path=path,
+        ))
+    found.sort(key=lambda f: (order.index(f.stage) if f.stage in order else len(order),
+                              f.target))
     return found
 
 

@@ -39,6 +39,57 @@ resource "google_cloud_run_v2_service" "app" {
         value = "prod"
       }
 
+      # Scheduled monitors (see monitor.tf / src/primercast/monitor_schedule.py).
+      env {
+        name  = "PRIMERCAST_MONITOR_BUCKET"
+        value = google_storage_bucket.monitor.name
+      }
+      env {
+        name  = "PRIMERCAST_MONITOR_PREFIX"
+        value = "prod"
+      }
+      env {
+        name  = "PRIMERCAST_MONITOR_TZ"
+        value = var.monitor_time_zone
+      }
+      # The first run of a new schedule executes on the monitor job, not here.
+      env {
+        name  = "PRIMERCAST_MONITOR_JOB"
+        value = "projects/${var.project_id}/locations/${var.region}/jobs/${local.monitor_jobs.prod.name}"
+      }
+      env {
+        name  = "PRIMERCAST_PUBLIC_URL"
+        value = var.custom_domain != "" ? "https://${var.custom_domain}" : ""
+      }
+      env {
+        name  = "PRIMERCAST_EMAIL_SENDER"
+        value = var.monitor_email_sender
+      }
+      env {
+        name  = "PRIMERCAST_SMTP_HOST"
+        value = var.monitor_smtp_host
+      }
+      env {
+        name  = "PRIMERCAST_SMTP_PORT"
+        value = tostring(var.monitor_smtp_port)
+      }
+      env {
+        name  = "PRIMERCAST_SMTP_USER"
+        value = var.monitor_smtp_user
+      }
+      dynamic "env" {
+        for_each = var.monitor_email_enabled ? [1] : []
+        content {
+          name = "PRIMERCAST_EMAIL_PASSWORD"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.monitor_smtp_key.secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       resources {
         limits = {
           cpu    = var.cloud_run_cpu
@@ -62,10 +113,17 @@ resource "google_cloud_run_v2_service" "app" {
       client,
       client_version,
       template[0].containers[0].image,
+      # Service-level scaling block (not template.scaling) drifts to an empty
+      # manual count via gcloud deploys; updating it only spawns a no-op revision.
+      scaling,
     ]
   }
 
-  depends_on = [google_project_service.services]
+  # The revision must be able to read the SMTP-key secret when it is created.
+  depends_on = [
+    google_project_service.services,
+    google_secret_manager_secret_iam_member.monitor_smtp_key,
+  ]
 }
 
 # Public site: ingress=ALL above lets anyone reach the service; this binding

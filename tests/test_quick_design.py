@@ -49,3 +49,10 @@ def test_positions_respect_amplicon_range_and_sort_order():
 
 def test_top_n_zero_is_unlimited():
     assert len(_score(_msa(), top_n=0)) > len(_score(_msa(), top_n=20))
+
+
+def test_min_interior_leaves_room_between_primers():
+    positions = _score(_msa(), min_interior=31)
+    assert positions
+    for fwd_start, fwd_len, rev_start, _, _ in positions:
+        assert rev_start - (fwd_start + fwd_len) >= 31

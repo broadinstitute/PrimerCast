@@ -99,7 +99,7 @@ Key sections in `params.txt`:
 - **Probe generation** — Probe length, Tm, homopolymer, 5' G avoidance
 - **Probe mode** — Mismatch tolerance, amplicon buffer, probes per pair
 - **Amplicon** — Min/max amplicon and off-target lengths
-- **Email** — Gmail sender, app password, and recipients (for `adapt monitor`)
+- **Email** — sender, SMTP password/key, and recipients (for `adapt monitor`)
 
 ### Design Primers
 
@@ -221,7 +221,17 @@ EMAIL_PASSWORD = xxxx xxxx xxxx xxxx
 EMAIL_RECIPIENTS = recipient1@example.com,recipient2@example.com
 ```
 
-The sender must be a Gmail account with [App Passwords](https://support.google.com/accounts/answer/185833) enabled (requires 2-Step Verification). The password is a 16-character app password, not the account password.
+By default mail goes through Gmail (`smtp.gmail.com:465`): the sender must be a Gmail account with [App Passwords](https://support.google.com/accounts/answer/185833) enabled (requires 2-Step Verification), and the password is a 16-character app password, not the account password.
+
+To use another SMTP relay such as [Brevo](https://www.brevo.com/), add:
+
+```
+SMTP_HOST = smtp-relay.brevo.com
+SMTP_PORT = 587
+SMTP_USER = 1a2b3c001@smtp-brevo.com
+```
+
+`SMTP_USER` is the relay's SMTP login (left empty, the sender address is used), `EMAIL_PASSWORD` is the SMTP key, and `EMAIL_SENDER` must be a verified sender in that service. Port 465 uses implicit TLS; other ports use STARTTLS. The same settings can come from `PRIMERCAST_SMTP_HOST` / `PRIMERCAST_SMTP_PORT` / `PRIMERCAST_SMTP_USER`.
 
 #### Monitor data structure
 

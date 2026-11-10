@@ -41,6 +41,7 @@ MAX_MESSAGE_CHARS = 5000
 MAX_STATE_VALUE_CHARS = 10_000
 # Large, regenerable artifacts: listed in the manifest but not bundled.
 SKIP_SUFFIXES = (".bt2", ".bt2l")
+# Lowercase; compared against `Path.suffix.lower()` (see resolve_input_files).
 FASTA_SUFFIXES = (".fa", ".fasta", ".fna")
 _SECRET_KEY_RE = re.compile(r"password|secret|token|credential", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -104,17 +105,34 @@ def resolve_input_files(
     containing path separators are ignored. ``extra_files`` are only included
     when they resolve inside ``extra_allowed_dir``.
     """
+    # Index both directories by stem rather than rebuilding `name + suffix`
+    # per target: extensions are matched case-insensitively, so a hand-placed
+    # `virusA.FA` still reaches the bundle. Leaving it out would drop exactly
+    # the input a report about that target needs.
+    by_stem: dict[str, list[tuple[Path, str]]] = {}
+    for directory, suffixes, prefix in (
+        (target_seqs_dir / "original", FASTA_SUFFIXES, "inputs/original"),
+        (target_seqs_dir / "msa", (".aln",), "inputs/msa"),
+    ):
+        if not directory.is_dir():
+            continue
+        entries = [
+            p for p in directory.iterdir()
+            if p.is_file() and p.suffix.lower() in suffixes
+        ]
+        # Deterministic order regardless of iterdir(): suffix order first, as
+        # when these were looked up one suffix at a time.
+        entries.sort(key=lambda p: (suffixes.index(p.suffix.lower()), p.name))
+        for path in entries:
+            by_stem.setdefault(path.stem, []).append(
+                (path, f"{prefix}/{path.name}"))
+
     found: dict[Path, str] = {}
     for name in dict.fromkeys(target_names):
         if not name or "/" in name or "\\" in name or name.startswith("."):
             continue
-        for suffix in FASTA_SUFFIXES:
-            path = target_seqs_dir / "original" / f"{name}{suffix}"
-            if path.is_file():
-                found.setdefault(path, f"inputs/original/{path.name}")
-        aln = target_seqs_dir / "msa" / f"{name}.aln"
-        if aln.is_file():
-            found.setdefault(aln, f"inputs/msa/{aln.name}")
+        for path, archive_name in by_stem.get(name, ()):
+            found.setdefault(path, archive_name)
 
     if extra_allowed_dir is not None:
         allowed = extra_allowed_dir.resolve()

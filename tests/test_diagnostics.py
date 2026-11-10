@@ -25,8 +25,12 @@ from primercast.utils.diagnostics import (
     append_step,
     diagnostics_path,
     explain_run,
+    format_losses,
     format_message,
+    funnel_losses,
+    run_funnels,
     run_warnings,
+    step_baselines,
 )
 
 
@@ -126,6 +130,77 @@ def test_explain_run_since_ignores_older_files(tmp_path):
 
 def test_explain_run_missing_dir(tmp_path):
     assert explain_run(tmp_path / "missing") == []
+
+
+# ---------------------------------------------------------------------------
+# run_funnels: where filters narrowed a run, including successful ones
+# ---------------------------------------------------------------------------
+
+def _quick_diag():
+    diag = StageDiagnostics("quick_design", target="virusA", unit="primer pairs")
+    diag.record("Sequences in alignment", 50, unit="sequences")
+    diag.record("Amplicon positions", 100)
+    diag.record("Primer Tm / GC", 40)
+    diag.record("Top pairs by position score", 10, summarize=False)
+    diag.record("Primer alignments", 8, unit="primers")
+    diag.record("Primer pairing", 10)
+    diag.record("Probe candidates", 2000, unit="probes")
+    diag.record("Probe inside amplicon", 5)
+    return diag
+
+
+def test_step_baselines_compare_only_within_a_unit():
+    steps = _quick_diag().steps
+    assert step_baselines(steps) == [None, None, 100, 40, None, 10, None, 10]
+
+
+def test_step_baselines_treat_a_larger_count_as_a_different_set():
+    steps = [{"filter": "Pairs", "remaining": 6}, {"filter": "With a probe", "remaining": 3},
+             {"filter": "All pairs again", "remaining": 6}]
+    assert step_baselines(steps) == [None, 6, None]
+
+
+def test_funnel_losses_skip_unsummarized_steps_and_rank_by_fraction():
+    losses = funnel_losses(_quick_diag().steps)
+    assert [(step["filter"], before) for step, before in losses] == [
+        ("Primer Tm / GC", 100), ("Probe inside amplicon", 10)]
+    assert format_losses(_quick_diag().to_dict()) == (
+        "Quick design (virusA): Primer Tm / GC 100 -> 40 (-60%); "
+        "Probe inside amplicon 10 -> 5 (-50%)")
+
+
+def test_format_losses_empty_when_nothing_removed():
+    diag = StageDiagnostics("filter", target="virusA")
+    diag.record("Scored primer pairs", 4)
+    diag.record("Coverage", 4)
+    assert format_losses(diag.to_dict()) == ""
+
+
+def test_run_funnels_lists_successful_steps_and_skips_offtarget_and_batches(tmp_path):
+    run = tmp_path / "run"
+    (run / "_virusA").mkdir(parents=True)
+    _quick_diag().write(run / "_virusA" / "virusA.virusA.eval")
+    _write_diag(run / "_virusA" / "batch_0.input", "prepare_input", "virusA", [("Amplicon length", 3)])
+    _write_diag(run / "virusA_final.csv", "build_output", "virusA", [("On-target", 5), ("Top", 5)])
+    _write_diag(run / "virusA_init.fa", "generate", "virusA", [("Tiling", 9), ("Tm / GC", 6)])
+    off = StageDiagnostics("prepare_input", target="human", fatal=False, offtarget=True)
+    off.record("Amplicon length", 0)
+    off.write(run / "pset.human.input")
+    (run / "broken.input.diagnostics.json").write_text("{not json")
+
+    funnels = run_funnels(run)
+    assert [(f.stage, f.target) for f in funnels] == [
+        ("generate", "virusA"), ("quick_design", "virusA"), ("build_output", "virusA")]
+    assert funnels[0].summary == "Primer generation (virusA): Tm / GC 9 -> 6 (-33%)"
+    assert funnels[2].summary == ""
+    assert run_funnels(tmp_path / "missing") == []
+
+
+def test_run_funnels_since_ignores_older_files(tmp_path):
+    path = _write_diag(tmp_path / "old_init.fa", "generate", "old", [("Tiling", 4)])
+    os.utime(path, (1_000, 1_000))
+    assert run_funnels(tmp_path, since=2_000) == []
+    assert len(run_funnels(tmp_path)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +437,19 @@ def test_adapt_cli_prints_warnings(tmp_path, capsys):
     assert adapt_cli._print_run_warnings(tmp_path) == 1
     err = capsys.readouterr().err
     assert "WARNINGS:" in err and "Rescue re-evaluation was triggered for virusA" in err
+
+
+def test_adapt_cli_prints_funnel_summary_after_success(tmp_path, capsys):
+    def fake_snakemake(cmd, cwd):
+        _write_diag(tmp_path / "virusA_filt.fa", "filter", "virusA",
+                    [("Scored primer pairs", 10), ("Coverage", 4)])
+        return argparse.Namespace(returncode=0)
+
+    with patch.object(adapt_cli.subprocess, "run", side_effect=fake_snakemake):
+        assert adapt_cli._run_snakemake(tmp_path, [], cores=1, dry_run=False) == 0
+    err = capsys.readouterr().err
+    assert "Where filters narrowed the candidates:" in err
+    assert "Primer pair filtering (virusA): Coverage 10 -> 4 (-60%)" in err
 
 
 @pytest.mark.parametrize("warn", [True, False])

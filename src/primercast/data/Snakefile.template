@@ -55,6 +55,25 @@ from pathlib import Path
 import shlex
 import shutil
 
+# NOTE on `threads:` below. Snakemake does not reliably hold this workflow to
+# the --cores budget: with 4 targets it runs all 4 evaluate jobs at once even
+# though each declares threads == MAX_CORES (measured on snakemake 9.16.3,
+# 8 cores). Lowering the declared threads therefore does NOT buy extra overlap
+# -- the overlap already happens -- it only makes each job slower. Measured on
+# a 4-target design: threads=MAX_CORES 176s, MAX_CORES//2 200s, 2 229s, with
+# peak RSS within 10% across all three. So leave these at MAX_CORES, and bound
+# the real risk (several runs sharing one box) with gui/run_gate.py instead.
+#
+# `resources:` IS honoured, which is what GPU_COST below relies on.
+
+# Two evaluate jobs must not share one GPU. This only binds when the caller
+# passes --resources gpu=N (the GUI and `adapt` pass gpu=1); where there is no
+# GPU each job costs 0, leaving them free to overlap on CPU. Without this the
+# gpu resource was dead config -- declared on the rule, never given a limit, so
+# snakemake left it unconstrained. Checking for nvidia-smi keeps this cheap;
+# importing torch at parse time would not be.
+GPU_COST = 1 if shutil.which("nvidia-smi") else 0
+
 ############################################
 # Normalize FASTA file extensions
 ############################################
@@ -439,7 +458,7 @@ if PROBE_MODE:
             probe_csv=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe.csv",
             probe_pair_csv=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe_pair_assignments.csv"
         threads:
-            min(4, MAX_CORES)
+            MAX_CORES
         shell:
             "primercast quick-design "
             "--target '{input.target}' --msa '{input.msa}' "
@@ -463,7 +482,7 @@ else:
             fasta=f"{RUN_DIR}/{{virus}}_init.fa",
             features=f"{RUN_DIR}/{{virus}}_init.feat"
         threads:
-            min(4, MAX_CORES)
+            MAX_CORES
         shell:
             "primercast quick-design "
             "--target '{input.target}' --msa '{input.msa}' "
@@ -634,7 +653,7 @@ rule align:
         mapOption="--mp 2,2 --np 2 --rdg 4,4 --rfg 4,4 -L 6 -N 1 --score-min L,-0.6,-0.6"
     shell:
         "bowtie2 -x '{params.reference}' -U '{input.fasta}' -f "
-        "-p {threads} -k 50000 {params.mapOption} "
+        "-p {threads} --reorder -k 50000 {params.mapOption} "
         "--no-hd --no-unal -S '{output}'"
 
 
@@ -660,7 +679,7 @@ rule align_probes:
         mapOption="--mp 3,3 --np 2 --rdg 6,4 --rfg 6,4 -L 6 -N 1 --score-min L,-0.6,-0.6"
     shell:
         "bowtie2 -x '{params.reference}' -U '{input.fasta}' -f "
-        "-p {threads} -k 50000 {params.mapOption} "
+        "-p {threads} --reorder -k 50000 {params.mapOption} "
         "--no-hd --no-unal -S '{output}'"
 
 
@@ -782,12 +801,25 @@ rule prepare_input:
         # Design on-target pairing must yield pairs; stop with an explanation if
         # not. Off-target references are expected to yield none, and evaluate
         # mode still reports (0 coverage, with a warning) instead of stopping.
-        fail_arg=lambda wc: "--fail-if-empty" if wc.virus == wc.target else ""
+        fail_arg=lambda wc: "--fail-if-empty" if wc.virus == wc.target else "",
+        # Standard design targets hold one sequence (STANDARD_TARGETS above) and
+        # `generate` tiles the primers straight out of it, so a primer's perfect
+        # alignment is its only real binding site. bowtie2 is run permissively
+        # enough to also report ~6-mismatch chance matches, and pairing crosses
+        # every forward alignment with every reverse one, so those inflate the
+        # candidate table several-fold and are scored as if real. Keep the
+        # tolerance everywhere it means something: off-target references need it
+        # to catch near-miss cross-reactivity, and evaluate mode scores primers
+        # that were not tiled from the reference at all.
+        exact_arg=lambda wc: (
+            "--exact" if (not EVALUATE and wc.virus == wc.target) else ""
+        )
     shell:
         "primercast prepare-input "
         "--in '{input.mapped}' {params.prev_arg} --out '{output}' "
         "--ref '{input.ref}' --reftype {params.ref_type} "
-        "--features '{input.features}' --params '{PARAMS}' {params.fail_arg}"
+        "--features '{input.features}' --params '{PARAMS}' "
+        "{params.fail_arg} {params.exact_arg}"
 
 
 rule evaluate:
@@ -800,9 +832,9 @@ rule evaluate:
     output:
         f"{RUN_DIR}/_{{target}}/{{virus}}.{{target}}.eval"
     threads:
-        min(2, MAX_CORES)
+        MAX_CORES
     resources:
-        gpu=1
+        gpu=GPU_COST
     params:
         ref_type=lambda wc: "on" if (wc.virus == wc.target or (EVALUATE and wc.target == PRIMARY_TARGET)) else "off",
         # Design: stop if no target is predicted to amplify. Evaluate mode
@@ -856,7 +888,11 @@ rule rescue_evaluate:
             if EVALUATE and EVAL_HAS_PROBE else ""
         )
     threads:
-        min(4, MAX_CORES)
+        MAX_CORES
+    resources:
+        # Shells out to `primercast evaluate`, so it contends for the GPU just
+        # like rule evaluate does.
+        gpu=GPU_COST
     shell:
         "primercast rescue-evaluate "
         "--eval '{input.eval}' --report-dir '{params.report_dir}' "
@@ -875,18 +911,27 @@ if PROBE_MODE:
             init=f"{RUN_DIR}/{{virus}}_init.fa",
             probe_mapping=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe.csv",
             probe_seqs=f"{RUN_DIR}/{{virus}}_probe.fa",
-            probe_pair_csv=f"{RUN_DIR}/_{{virus}}/{{virus}}.{{virus}}.probe_pair_assignments.csv"
+            # Only quick design writes pair assignments; standard mode uses .eval.full.
+            probe_pair_csv=lambda wc: (
+                f"{RUN_DIR}/_{wc.virus}/{wc.virus}.{wc.virus}.probe_pair_assignments.csv"
+                if wc.virus in QUICK_SET else []
+            )
         output:
             fasta=f"{RUN_DIR}/{{virus}}_filt.fa",
             csv=f"{RUN_DIR}/{{virus}}_filt.csv",
             probe_csv=f"{RUN_DIR}/{{virus}}_filt_probes.csv",
             probe_fasta=f"{RUN_DIR}/{{virus}}_filt_probes.fa"
+        params:
+            pair_arg=lambda wc, input: (
+                f"--probe-pair-csv {shlex.quote(str(input.probe_pair_csv))}"
+                if input.probe_pair_csv else ""
+            )
         shell:
             "primercast filter --init '{input.init}' --scores '{input.res}' "
             "--out '{output.fasta}' --params '{PARAMS}' "
             "--probe-mapping '{input.probe_mapping}' "
             "--probe-seqs '{input.probe_seqs}' "
-            "--probe-pair-csv '{input.probe_pair_csv}' "
+            "{params.pair_arg} "
             "--probe-out '{output.probe_csv}' && "
             "touch '{output.probe_fasta}'"
 else:
