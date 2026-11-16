@@ -46,7 +46,7 @@ resource "google_cloud_run_v2_service" "staging" {
           cpu    = var.cloud_run_cpu
           memory = var.cloud_run_memory
         }
-        cpu_idle          = false
+        cpu_idle          = true # request-based billing, as prod (cloud_run.tf)
         startup_cpu_boost = true
       }
     }
