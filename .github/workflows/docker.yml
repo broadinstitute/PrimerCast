@@ -369,7 +369,7 @@ jobs:
             --concurrency=80 \
             --min-instances=0 \
             --max-instances=5 \
-            --no-cpu-throttling \
+            --cpu-throttling \
             --cpu-boost \
             --session-affinity \
             --timeout=3600 \

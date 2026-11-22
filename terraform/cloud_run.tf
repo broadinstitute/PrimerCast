@@ -95,11 +95,13 @@ resource "google_cloud_run_v2_service" "app" {
           cpu    = var.cloud_run_cpu
           memory = var.cloud_run_memory
         }
-        # CPU always allocated (not throttled between requests): the pipeline
-        # runs snakemake as a subprocess whose work must keep progressing while
-        # the Streamlit request that launched it is in flight. (carmen can idle-
-        # throttle because it barely computes; this app cannot.)
-        cpu_idle          = false
+        # CPU only while a request is open (request-based billing). A Streamlit
+        # session's websocket is one long request, so a run launched from the
+        # page keeps full CPU for as long as the page is open, background tabs
+        # included. What is no longer billed is the ~15 min an instance idles
+        # after each hit; in Nov 2026 that was ~85% of the bill, nearly all
+        # from crawlers and scanners. Monitor runs are a separate job (monitor.tf).
+        cpu_idle          = true
         startup_cpu_boost = true
       }
     }
